@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行时数据 / 隐私 / 密钥（开源务必保留这些规则）----
+config/auth.json
+config/config.json
+config/mcp.json
+config/apps.json
+data/
+logs/
+output.txt
+generated/
+agent_workspace/
+archive/
+.env
+*.db
+
+# ---- 内部工作记录（不公开）----
+工作文档
+
+# ---- 打包产物 ----
+/build/
+/dist/
+*.zip
+
+# ---- 编辑器 ----
+.vscode/
+
+# ---- Live2D 资源 ----
+# 仅上传免费模型「大肥鱼」；Cubism Core / Framework / 引擎 / 示例模型(Hiyori,Mao) 有再分发限制，不上传。
+# 若之后想公开自己的前端页面(html/js)，在下面追加对应的 ! 白名单即可。
+/assets/web_resources/*
+!/assets/web_resources/dist/
+/assets/web_resources/dist/*
+!/assets/web_resources/dist/Resources/
+/assets/web_resources/dist/Resources/*
+!/assets/web_resources/dist/Resources/大肥鱼/

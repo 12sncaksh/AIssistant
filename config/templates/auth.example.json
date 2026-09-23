@@ -1,0 +1,8 @@
+{
+  "api_key": "your-model-api-key",
+  "amap_api_key": "your-amap-web-service-key",
+  "tavily_api_key": "your-tavily-key",
+  "xfyun_appid": "your-xfyun-appid",
+  "xfyun_api_key": "your-xfyun-api-key",
+  "xfyun_api_secret": "your-xfyun-api-secret"
+}

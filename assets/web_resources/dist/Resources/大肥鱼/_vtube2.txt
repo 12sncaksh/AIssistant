@@ -1,0 +1,78 @@
+=== ParameterSettings (23) ===
+{"Folder": "", "Name": "Face Left/Right Rotation", "Input": "MousePositionX", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -30.0, "OutputRangeUpper": 15.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamAngleX", "Smoothing": 31, "Minimized": false}
+{"Folder": "", "Name": "Face Up/Down Rotation", "Input": "MousePositionY", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -25.0, "OutputRangeUpper": 30.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamAngleY", "Smoothing": 32, "Minimized": false}
+{"Folder": "", "Name": "Face Lean Rotation", "Input": "MousePositionX", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -20.0, "OutputRangeUpper": 20.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamAngleZ", "Smoothing": 85, "Minimized": false}
+{"Folder": "", "Name": "Body Rotation X", "Input": "FaceAngleX", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": -10.0, "OutputRangeUpper": 10.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBodyAngleX", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "Body Rotation Y", "Input": "FaceAngleY", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": -10.0, "OutputRangeUpper": 10.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBodyAngleY", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "Body Rotation Z", "Input": "FaceAngleZ", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": -10.0, "OutputRangeUpper": 10.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBodyAngleZ", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "Eye Open Left", "Input": "", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": 0.0, "OutputRangeUpper": 1.899999976158142, "ClampInput": false, "ClampOutput": false, "UseBlinking": true, "UseBreathing": false, "OutputLive2D": "ParamEyeLOpen", "Smoothing": 10, "Minimized": false}
+{"Folder": "", "Name": "Eye Open Right", "Input": "", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": 0.0, "OutputRangeUpper": 1.899999976158142, "ClampInput": false, "ClampOutput": false, "UseBlinking": true, "UseBreathing": false, "OutputLive2D": "ParamEyeROpen", "Smoothing": 10, "Minimized": false}
+{"Folder": "", "Name": "Eye X", "Input": "MousePositionX", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamEyeBallX", "Smoothing": 0, "Minimized": false}
+{"Folder": "", "Name": "Eye Y", "Input": "MousePositionY", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -0.30000001192092896, "OutputRangeUpper": 0.5, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamEyeBallY", "Smoothing": 0, "Minimized": false}
+{"Folder": "", "Name": "Brow Height Left", "Input": "Brows", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBrowLY", "Smoothing": 10, "Minimized": false}
+{"Folder": "", "Name": "Brow Form Left", "Input": "", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBrowLForm", "Smoothing": 15, "Minimized": false}
+{"Folder": "", "Name": "Brow Height Right", "Input": "", "InputRangeLower": -30.0, "InputRangeUpper": 30.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBrowRY", "Smoothing": 10, "Minimized": false}
+{"Folder": "", "Name": "Brow Form Right", "Input": "Brows", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBrowRForm", "Smoothing": 15, "Minimized": false}
+{"Folder": "", "Name": "Mouth Smile", "Input": "MouthSmile", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamMouthForm", "Smoothing": 0, "Minimized": false}
+{"Folder": "", "Name": "Mouth Open", "Input": "VoiceVolume", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": 0.0, "OutputRangeUpper": 2.0999999046325684, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamMouthOpenY", "Smoothing": 0, "Minimized": false}
+{"Folder": "", "Name": "Auto Breath", "Input": "", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": 0.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": true, "OutputLive2D": "ParamBreath", "Smoothing": 0, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "MousePositionX", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -30.0, "OutputRangeUpper": 30.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "pointX", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "MousePositionY", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -30.0, "OutputRangeUpper": 30.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "pointY", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "MousePositionX", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -10.0, "OutputRangeUpper": 10.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "danbaoX", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "MousePositionY", "InputRangeLower": -1.0, "InputRangeUpper": 1.0, "OutputRangeLower": -10.0, "OutputRangeUpper": 10.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "danbaoY", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "TongueOut", "InputRangeLower": 0.0, "InputRangeUpper": 1.0, "OutputRangeLower": 0.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamCheek79", "Smoothing": 20, "Minimized": false}
+{"Folder": "", "Name": "", "Input": "MouthX", "InputRangeLower": -0.20000000298023224, "InputRangeUpper": 0.20000000298023224, "OutputRangeLower": -1.0, "OutputRangeUpper": 1.0, "ClampInput": false, "ClampOutput": false, "UseBlinking": false, "UseBreathing": false, "OutputLive2D": "ParamBrowRForm2", "Smoothing": 20, "Minimized": false}
+
+=== Hotkeys (52) ===
+点菜按下                   "ToggleExpression"
+撤回                     "ToggleExpression"
+橡皮                     "ToggleExpression"
+画笔                     "ToggleExpression"
+蛋包饭                    "ToggleExpression"
+MoeMoeQ~               "ToggleExpression"
+挤番茄酱动画                 "TriggerAnimation"
+自拍手机                   "TriggerAnimation"
+快速自拍                   "TriggerAnimation"
+自拍动画                   "TriggerAnimation"
+冒爱心动画                  "ToggleExpression"
+喵喵手~喵~动画               "ToggleExpression"
+双手比耶                   "ToggleExpression"
+兔兔贴纸                   "ToggleExpression"
+吐魂                     "ToggleExpression"
+呆呆眼                    "ToggleExpression"
+哭                      "ToggleExpression"
+圆眼镜                    "ToggleExpression"
+墨镜                     "ToggleExpression"
+开心兴奋                   "ToggleExpression"
+心跳                     "ToggleExpression"
+悲伤                     "ToggleExpression"
+情绪花花                   "ToggleExpression"
+感叹号                    "ToggleExpression"
+方眼镜                    "ToggleExpression"
+星星眼                    "ToggleExpression"
+晕晕                     "ToggleExpression"
+椭圆眼镜                   "ToggleExpression"
+流汗                     "ToggleExpression"
+爱心眼                    "ToggleExpression"
+猫猫贴纸                   "ToggleExpression"
+生气                     "ToggleExpression"
+脸红                     "ToggleExpression"
+蝴蝶结贴纸                  "ToggleExpression"
+调皮                     "ToggleExpression"
+闭眼口水                   "ToggleExpression"
+问号                     "ToggleExpression"
+阴暗                     "ToggleExpression"
+按键归位                   "RemoveAllExpressions"
+使巴菲消失                  "ToggleExpression"
+魔爪                     "ToggleExpression"
+魔爪换色                   "ToggleExpression"
+头箍                     "ToggleExpression"
+吐舌                     "ToggleExpression"
+重锤出击                   "TriggerAnimation"
+泡泡糖                    "TriggerAnimation"
+手机换色                   "ToggleExpression"
+深色桌布                   "ToggleExpression"
+鲸鱼                     "ToggleExpression"
+鲸鱼喷水                   "TriggerAnimation"
+单边马尾                   "ToggleExpression"
+鲸鱼放桌上                  "ToggleExpression"

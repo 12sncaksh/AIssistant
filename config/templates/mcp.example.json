@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "demo": {
+      "command": "python",
+      "args": [
+        "mcp_servers\\demo_server.py"
+      ],
+      "enabled": false
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\你的用户名\\Documents"
+      ],
+      "autoApprove": false
+    },
+    "windows-cli": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-windows-cli"
+      ],
+      "env": {
+        "HTTP_PROXY": ""
+      },
+      "autoApprove": true
+    },
+    "remote-example": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      },
+      "enabled": false
+    }
+  }
+}

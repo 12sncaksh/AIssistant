@@ -1,0 +1,20 @@
+{
+  "apps": [
+    {
+      "name": "计算器",
+      "path": "calc.exe"
+    },
+    {
+      "name": "记事本",
+      "path": "notepad.exe"
+    },
+    {
+      "name": "设备管理器",
+      "path": "devmgmt.msc"
+    },
+    {
+      "name": "网页浏览器",
+      "path": "https://www.bing.com"
+    }
+  ]
+}
