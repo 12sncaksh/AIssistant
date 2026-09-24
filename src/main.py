@@ -2201,7 +2201,11 @@ class APICallThread(QThread):
         if MCPManager.is_mcp_tool(tool_name):
             result = MCPManager.call_tool(tool_name, arguments)
         else:
-            result = ActionHandler.execute_tool(tool_name, arguments)
+            ActionHandler.set_timeout_confirm_callback(self._request_continue_waiting)
+            try:
+                result = ActionHandler.execute_tool(tool_name, arguments)
+            finally:
+                ActionHandler.set_timeout_confirm_callback(None)
         duration_ms = int((time.perf_counter() - started) * 1000)
         if tool_name in {
             "inspect_screen", "inspect_foreground_window", "inspect_screen_region", "inspect_accessibility", "mouse_move", "mouse_click",
@@ -2543,6 +2547,15 @@ class APICallThread(QThread):
         has_text_protocol = bool(parse_text_tool_calls(original_content)[0])
         normalized["content"] = "" if "DSML" in original_content or has_text_protocol else self._strip_dsml_protocol_text(original_content)
         return normalized
+
+    def _request_continue_waiting(self, command, elapsed, timeout):
+        """命令超时后询问用户是否继续等待；返回 True 表示再等一个超时周期。"""
+        call_id = f"__timeout_wait__{id(self)}_{elapsed}"
+        return self._request_confirmation(call_id, "__timeout_wait__", {
+            "command": str(command),
+            "elapsed": elapsed,
+            "timeout": timeout,
+        })
 
     def _request_confirmation(self, call_id, tool_name, arguments):
         event = threading.Event()
@@ -4980,7 +4993,8 @@ class ChatInputTextEdit(QTextEdit):
 
 
 SCREENSHOT_FALLBACK_MAX_SIDE = 1600
-ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+ATTACHMENT_MAX_MB = ATTACHMENT_MAX_BYTES // (1024 * 1024)
 
 
 class ScreenCaptureOverlay(QWidget):
@@ -6615,8 +6629,8 @@ class MainWindow(QMainWindow):
                 break
             try:
                 size = os.path.getsize(path)
-                if size > 200 * 1024:
-                    QMessageBox.warning(self, "文件过大", f"「{name}」超过 200KB（{size // 1024}KB），已跳过。")
+                if size > ATTACHMENT_MAX_BYTES:
+                    QMessageBox.warning(self, "文件过大", f"「{name}」超过 {ATTACHMENT_MAX_MB}MB（{size / (1024 * 1024):.1f}MB），已跳过。")
                     continue
                 if ext not in text_exts and not self._is_text_file(path):
                     QMessageBox.warning(self, "无法读取", f"「{name}」不是文本文件或无法读取，已跳过。")
@@ -6689,7 +6703,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "截图失败", f"保存截图失败：{exc}")
             return
         if not data_url:
-            QMessageBox.warning(self, "截图过大", "截图压缩后仍超过 8MB，请缩小框选范围后重试。")
+            QMessageBox.warning(self, "截图过大", f"截图压缩后仍超过 {ATTACHMENT_MAX_MB}MB，请缩小框选范围后重试。")
             return
         name = os.path.basename(saved_path)
         self._pending_image_attachments.append({
@@ -6753,7 +6767,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "粘贴失败", f"保存剪贴板图片失败：{exc}")
             return
         if not data_url:
-            QMessageBox.warning(self, "图片过大", "剪贴板图片压缩后仍超过 8MB，请改用「添加图片」选择文件。")
+            QMessageBox.warning(self, "图片过大", f"剪贴板图片压缩后仍超过 {ATTACHMENT_MAX_MB}MB，请改用「添加图片」选择文件。")
             return
         name = os.path.basename(saved_path)
         self._pending_image_attachments.append({
@@ -6784,7 +6798,7 @@ class MainWindow(QMainWindow):
             try:
                 size = os.path.getsize(path)
                 if size > ATTACHMENT_MAX_BYTES:
-                    QMessageBox.warning(self, "图片过大", f"「{name}」超过 8MB，已跳过。")
+                    QMessageBox.warning(self, "图片过大", f"「{name}」超过 {ATTACHMENT_MAX_MB}MB，已跳过。")
                     continue
                 with open(path, "rb") as image_file:
                     encoded = base64.b64encode(image_file.read()).decode("ascii")
@@ -7072,7 +7086,15 @@ class MainWindow(QMainWindow):
                                "点击 Yes 后任务会自动继续，不需要再回聊天框回复确认。\n\n"
                                "确认开始本次视觉键鼠任务吗？",
         }
-        if MCPManager.is_mcp_tool(tool_name):
+        is_timeout = tool_name == "__timeout_wait__"
+        if is_timeout:
+            prompt = (
+                f"命令执行超过 {arguments.get('timeout', 0)} 秒仍无响应"
+                f"（已累计等待 {arguments.get('elapsed', 0)} 秒）。\n\n"
+                f"命令：\n{arguments.get('command', '')}\n\n"
+                f"是否继续等待？继续将再等 {arguments.get('timeout', 0)} 秒；结束将终止该命令。"
+            )
+        elif MCPManager.is_mcp_tool(tool_name):
             # 外部 MCP 工具的来源和参数都摊给用户看，别只丢一个英文函数名
             _mcp_server = MCPManager.server_of(tool_name) or "未知"
             prompt = (
@@ -7086,7 +7108,8 @@ class MainWindow(QMainWindow):
             prompt = prompt.replace("{command}", str(arguments.get("command", "")))
         elif tool_name == "write_file":
             prompt = prompt.replace("{path}", str(arguments.get("path", ""))).replace("{content}", str(arguments.get("content", "")))
-        self._pending_permission = {"title": "AI 操作授权", "message": prompt}
+        title = "命令超时" if is_timeout else "AI 操作授权"
+        self._pending_permission = {"title": title, "message": prompt}
         if self.pet_window:
             self.pet_window.notify_permission_request(prompt.split("\n", 1)[0])
 
@@ -7096,11 +7119,14 @@ class MainWindow(QMainWindow):
 
         dialog = QMessageBox()
         dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("AI 操作授权")
+        dialog.setWindowTitle(title)
         dialog.setText(prompt)
         dialog.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
+        if is_timeout:
+            dialog.button(QMessageBox.StandardButton.Yes).setText("继续等待")
+            dialog.button(QMessageBox.StandardButton.No).setText("结束")
         dialog.setDefaultButton(QMessageBox.StandardButton.No)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         dialog.setWindowFlags(
@@ -7547,7 +7573,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "关于AI助手",
-                          "Aissist v1.101.4-test (PyQt6版本)\n"
+                          "Aissist v1.101.5-test (PyQt6版本)\n"
                           "功能：多会话聊天、图片/文件附件、视觉键鼠、UI Automation、Live2D、语音输入与回复\n"
                           "技术栈：Python + PyQt6 + OpenAI兼容API + Live2D + edge-tts")
 

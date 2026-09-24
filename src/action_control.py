@@ -27,6 +27,8 @@ try:
 except ImportError:
     NVML_AVAILABLE = False
 
+COMMAND_TIMEOUT_SECONDS = 120
+
 class ActionHandler:
     _apps = None          # 缓存 { "应用名称": "启动路径" }
     _base_dir = (
@@ -43,6 +45,7 @@ class ActionHandler:
     _auth_config = None   # { "amap_api_key": "...", "tavily_api_key": "..." }
     _agent_workspace = None  # 当前子agent隔离工作区（None=主循环不限制）
     _amap_api_key = ""    # 显式配置（GUI/环境变量），优先于 auth.json
+    _timeout_confirm_callback = None  # 命令超时时询问用户是否继续等待的回调
 
     @classmethod
     def load_apps(cls, config_path=None):
@@ -923,6 +926,23 @@ class ActionHandler:
         cls._agent_workspace = workspace
 
     @classmethod
+    def set_timeout_confirm_callback(cls, callback):
+        """设置命令超时续等确认回调：callback(command, elapsed, timeout) -> bool。"""
+        cls._timeout_confirm_callback = callback
+
+    @classmethod
+    def _confirm_continue_waiting(cls, command, elapsed, timeout):
+        """命令超时后询问用户是否继续等待；无回调时按原超时行为处理。"""
+        callback = cls._timeout_confirm_callback
+        if callback is None:
+            return False
+        try:
+            return bool(callback(command, elapsed, timeout))
+        except Exception:
+            logging.warning("命令超时续等确认回调失败", exc_info=True)
+            return False
+
+    @classmethod
     def _resolve_agent_path(cls, path: str):
         """子agent工作区路径解析：有工作区时相对路径落到工作区内，工作区外绝对路径拒绝。返回 (解析后路径, 错误信息)。"""
         workspace = cls._agent_workspace
@@ -970,7 +990,7 @@ class ActionHandler:
         return found
 
     @staticmethod
-    def _run_command(command: str, timeout: int = 30, cwd: str | None = None):
+    def _run_command(command: str, timeout: int = COMMAND_TIMEOUT_SECONDS, cwd: str | None = None):
         """执行 PowerShell 命令，返回 (成功, 消息, 数据)。带超时和输出截断。"""
         blocked_reason = ActionHandler._check_command_blocked(command)
         if blocked_reason:
@@ -984,18 +1004,30 @@ class ActionHandler:
                 ), None
         import subprocess
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                capture_output=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=cwd,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except subprocess.TimeoutExpired:
-            return False, "命令执行超时（超过 {timeout} 秒），已终止。".format(timeout=timeout), None
         except Exception as e:
             return False, "命令执行失败: {e}".format(e=e), None
-        raw = (proc.stdout or b"") + ((b"\n" + proc.stderr) if proc.stderr else b"")
+        waited = 0
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                waited += timeout
+                if not ActionHandler._confirm_continue_waiting(command, waited, timeout):
+                    try:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    except Exception:
+                        stdout, stderr = b"", b""
+                    return False, "命令执行超时（已等待 {waited} 秒且用户选择结束），已终止。".format(waited=waited), None
+        raw = (stdout or b"") + ((b"\n" + stderr) if stderr else b"")
         output = None
         for enc in ("utf-8", "gbk"):
             try:
@@ -1216,7 +1248,7 @@ class ActionHandler:
                 command = str(arguments.get("command", "")).strip()
                 if not command:
                     return cls._result(False, "命令不能为空。")
-                success, msg, data = cls._run_command(command, 30, cwd=cls._agent_workspace or None)
+                success, msg, data = cls._run_command(command, COMMAND_TIMEOUT_SECONDS, cwd=cls._agent_workspace or None)
                 return cls._result(success, msg, data)
 
             if tool_name == "read_file":

@@ -1,4 +1,4 @@
-# Aissist · 小柚
+# AIssistant · 小柚
 
 > Windows 桌面 AI 助手兼桌宠：PyQt6 + Live2D + 大模型聊天 + 结构化工具调用 + MCP 扩展 + 语音交互。
 
@@ -53,7 +53,7 @@ scripts\run.bat            :: 隐藏启动
 本仓库**不包含 Live2D Cubism Core / Framework**（属 Live2D 专有许可，不可随仓库分发）。
 要启用 Live2D 桌宠，请自行从 [Live2D 官网](https://www.live2d.com/) 获取 **Cubism SDK for Web**，
 把 `Core/` 与 `Framework/` 放到 `assets/web_resources/dist/` 下（前端页面会从该目录加载引擎）。
-仓库内仅保留免费模型「大肥鱼」，其版权归原作者，请遵守其许可。
+仓库内仅保留免费模型「大肥鱼」，其版权归原作者[氵六青的个人空间](https://space.bilibili.com/11272072)，请遵守其许可。
 
 ## MCP 工具
 
@@ -64,7 +64,7 @@ scripts\run.bat            :: 隐藏启动
 
 ## 打包免安装版
 
-在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissist_v1.101.4_test_portable.zip`。
+在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissist_v1.101.5_test_portable.zip`。
 
 ## 项目结构
 

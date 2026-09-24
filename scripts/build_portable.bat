@@ -56,16 +56,16 @@ copy /y "config\templates\mcp.example.json" "dist\Aissist\config\templates\mcp.e
 echo [6/6] Creating ZIP package...
 where tar.exe >nul 2>nul
 if errorlevel 1 goto tar_missing
-if exist Aissist_v1.101.4_test_portable.zip del /q Aissist_v1.101.4_test_portable.zip
-tar.exe -a -c -f "Aissist_v1.101.4_test_portable.zip" -C "dist" "Aissist"
+if exist Aissist_v1.101.5_test_portable.zip del /q Aissist_v1.101.5_test_portable.zip
+tar.exe -a -c -f "Aissist_v1.101.5_test_portable.zip" -C "dist" "Aissist"
 if errorlevel 1 goto package_failed
-if not exist "Aissist_v1.101.4_test_portable.zip" goto package_failed
+if not exist "Aissist_v1.101.5_test_portable.zip" goto package_failed
 rem verify the archive can be opened and is free of local chat history
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; try { $z=[System.IO.Compression.ZipFile]::OpenRead('Aissist_v1.101.4_test_portable.zip'); $names=@($z.Entries.FullName); $z.Dispose() } catch { Write-Host 'ZIP check failed: archive cannot be opened.'; Write-Host $_.Exception.Message; exit 1 }; if ($names.Count -lt 1000) { Write-Host 'ZIP check failed: too few entries.'; exit 1 }; if (-not ($names -match '^Aissist[\\/]Aissist\.exe$')) { Write-Host 'ZIP check failed: Aissist/Aissist.exe is missing.'; exit 1 }; $leak=@($names -like '*chat_history.db'); if ($leak.Count -gt 0) { Write-Host 'ZIP check failed: chat history database was packaged.'; exit 1 }; Write-Host ('ZIP check OK: ' + $names.Count + ' entries, no chat history.')"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; try { $z=[System.IO.Compression.ZipFile]::OpenRead('Aissist_v1.101.5_test_portable.zip'); $names=@($z.Entries.FullName); $z.Dispose() } catch { Write-Host 'ZIP check failed: archive cannot be opened.'; Write-Host $_.Exception.Message; exit 1 }; if ($names.Count -lt 1000) { Write-Host 'ZIP check failed: too few entries.'; exit 1 }; if (-not ($names -match '^Aissist[\\/]Aissist\.exe$')) { Write-Host 'ZIP check failed: Aissist/Aissist.exe is missing.'; exit 1 }; $leak=@($names -like '*chat_history.db'); if ($leak.Count -gt 0) { Write-Host 'ZIP check failed: chat history database was packaged.'; exit 1 }; Write-Host ('ZIP check OK: ' + $names.Count + ' entries, no chat history.')"
 if errorlevel 1 goto package_failed
 
 echo.
-echo Build complete: Aissist_v1.101.4_test_portable.zip
+echo Build complete: Aissist_v1.101.5_test_portable.zip
 pause
 exit /b 0
 
