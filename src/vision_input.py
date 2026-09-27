@@ -64,7 +64,7 @@ class VisionInputController:
             ):
                 cls._escape_thread = threading.Thread(
                     target=cls._watch_q,
-                    name="AissistQWatcher",
+                    name="AissistantQWatcher",
                     daemon=True,
                 )
                 cls._escape_thread.start()
@@ -277,7 +277,7 @@ class VisionInputController:
                 if response is not None:
                     response.close()
 
-        threading.Thread(target=request_worker, name="AissistVisionRequest", daemon=True).start()
+        threading.Thread(target=request_worker, name="AissistantVisionRequest", daemon=True).start()
         while True:
             if cls.is_cancelled():
                 return None, "cancelled"
@@ -320,7 +320,7 @@ class VisionInputController:
                 '"recommended_action":"下一步动作",'
                 '"blocking_dialog":{"present":false,"label":"","reason":""}}。'
                 "blocking_dialog 只有在清楚看到阻塞目标应用的外部确认弹窗时才设为 present=true；"
-                "不要把 Aissist 自己的 AI 操作授权弹窗当成目标，也不要在看不清时猜测。"
+                "不要把 Aissistant 自己的 AI 操作授权弹窗当成目标，也不要在看不清时猜测。"
                 "如果找不到目标，targets 返回空数组，并说明原因。"
             )
             payload = {

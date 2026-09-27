@@ -86,8 +86,8 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="Aissist",
-    icon=str(ROOT / "assets" / "Aissist.ico"),
+    name="Aissistant",
+    icon=str(ROOT / "assets" / "Aissistant.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -100,5 +100,5 @@ coll = COLLECT(
     a.datas,
     a.zipfiles,
     a.zipped_data,
-    name="Aissist",
+    name="Aissistant",
 )

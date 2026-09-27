@@ -77,7 +77,7 @@ class InputGuard:
                 cls._mouse_callback_error_logged = False
                 cls._thread = threading.Thread(
                     target=cls._hook_thread_main,
-                    name="AissistInputGuard",
+                    name="AissistantInputGuard",
                     daemon=True,
                 )
                 cls._thread.start()

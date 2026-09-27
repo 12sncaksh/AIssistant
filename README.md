@@ -9,6 +9,7 @@
 - MCP（Model Context Protocol）扩展：支持 stdio 本地 server 与远程 HTTP/SSE server，工具自动并入工具表
 - 语音：sherpa-onnx 唤醒「小柚」、讯飞语音听写、edge-tts 语音回复
 - Live2D 桌宠：无边框置顶、拖拽、系统托盘、模型切换
+- 聊天界面：用户与 AI 全局头像更换、Markdown 排版、代码块复制；可通过“视图 → 聊天外观...”统一设置背景、气泡配色与透明度、代码块配色与字体、聊天正文字体
 - 电脑管家：健康体检、磁盘只读扫描
 - 可打包为免安装 exe
 
@@ -46,7 +47,7 @@ scripts\run.bat            :: 隐藏启动
 | `config/apps.json` | 常用应用快捷方式 | 否（已忽略） |
 | `config/mcp.json` | MCP server 配置 | 否（已忽略） |
 
-优先级：设置窗口中已保存的值 → 对应 JSON 文件 → 程序默认值。
+优先级：设置窗口中已保存的值 → 对应 JSON 文件 → 程序默认值。头像文件保存在运行时 `data/avatars/`，QSettings 仅保存路径。
 
 ## Live2D 资源
 
@@ -59,12 +60,12 @@ scripts\run.bat            :: 隐藏启动
 
 完整说明见 `docs/MCP_INTEGRATION.md`。查看已接入的工具：
 
-- 菜单「设置 → MCP 工具管理」（只读窗口）
+- 菜单「设置 → MCP 工具管理」（查看状态并即时启用/禁用 server）
 - 或命令行 `python scripts\list_mcp_tools.py`
 
 ## 打包免安装版
 
-在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissist_v1.101.5_test_portable.zip`。
+在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v1.102.1_test_portable.zip`。
 
 ## 项目结构
 

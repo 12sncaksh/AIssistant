@@ -1,6 +1,6 @@
 """MCP（Model Context Protocol）客户端。
 
-把外部 MCP server 提供的工具接进 Aissist 的工具表：
+把外部 MCP server 提供的工具接进 Aissistant 的工具表：
 - 工具名统一 mcp__<server>__<tool>，避免和内置工具撞名；
 - 工具表在 ActionHandler.get_tool_definitions() 末尾合并；
 - 调用在 APICallThread._execute_tool_call 里按前缀分发回来。
@@ -271,6 +271,117 @@ class MCPManager:
         with cls._lock:
             cls._config = None
 
+    @staticmethod
+    def _is_spec_enabled(spec: dict) -> bool:
+        return (spec or {}).get("enabled") is not False
+
+    @staticmethod
+    def _has_endpoint(spec: dict) -> bool:
+        return bool(
+            str((spec or {}).get("command") or "").strip()
+            or str((spec or {}).get("url") or "").strip()
+        )
+
+    @classmethod
+    def is_server_enabled(cls, server_name: str) -> bool:
+        spec = cls.load_config().get(str(server_name or ""))
+        return bool(spec is not None and cls._is_spec_enabled(spec))
+
+    @classmethod
+    def set_server_enabled(cls, server_name: str, enabled: bool) -> None:
+        """写回 mcp.json，并立即启动或停止对应 server。"""
+        server_name = str(server_name or "").strip()
+        if not server_name:
+            raise ValueError("MCP server 名称不能为空")
+
+        path = cls.config_path()
+        temp_path = path + ".tmp"
+        with cls._lock:
+            try:
+                with open(path, "r", encoding="utf-8-sig") as handle:
+                    document = json.load(handle)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError("找不到 MCP 配置文件：%s" % path) from exc
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("无法读取 MCP 配置：%s" % exc) from exc
+
+            servers = document.get("mcpServers") if isinstance(document, dict) else None
+            spec = servers.get(server_name) if isinstance(servers, dict) else None
+            if not isinstance(spec, dict):
+                raise ValueError("MCP 配置中不存在 server：%s" % server_name)
+
+            if enabled and not cls._has_endpoint(spec):
+                raise ValueError("MCP server 缺少 command/url：%s" % server_name)
+
+            spec["enabled"] = bool(enabled)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(document, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                os.replace(temp_path, path)
+            except OSError as exc:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+                raise OSError("写入 MCP 配置失败：%s" % exc) from exc
+
+            cls._config = None
+            cls.load_config()
+
+        if enabled:
+            cls.start_server(server_name)
+        else:
+            cls.stop_server(server_name)
+
+    @classmethod
+    def start_server(cls, server_name: str) -> None:
+        """启动一个已配置且已启用的 server；重复调用不会创建第二个 runner。"""
+        server_name = str(server_name or "").strip()
+        with cls._lock:
+            if cls._shutdown:
+                raise RuntimeError("MCPManager 已关闭")
+            spec = cls.load_config().get(server_name)
+            if not isinstance(spec, dict):
+                raise ValueError("MCP 配置中不存在 server：%s" % server_name)
+            if not cls._is_spec_enabled(spec):
+                raise ValueError("MCP server 尚未启用：%s" % server_name)
+            if not cls._has_endpoint(spec):
+                raise ValueError("MCP server 缺少 command/url：%s" % server_name)
+
+            existing = cls._runners.get(server_name)
+            if existing is not None and existing.is_alive():
+                return
+            if existing is not None:
+                cls._runners.pop(server_name, None)
+
+            runner = _ServerRunner(server_name, spec)
+            cls._runners[server_name] = runner
+            cls._started = True
+            runner.start()
+
+        threading.Thread(
+            target=cls._wait_all_ready,
+            name="mcp-ready-watch-%s" % server_name,
+            daemon=True,
+        ).start()
+
+    @classmethod
+    def stop_server(cls, server_name: str) -> None:
+        """立即移出工具表，在后台停止进程，避免阻塞 UI 线程。"""
+        server_name = str(server_name or "").strip()
+        with cls._lock:
+            runner = cls._runners.pop(server_name, None)
+            cls.refresh()
+        if runner is not None:
+            threading.Thread(
+                target=runner.stop,
+                name="mcp-stop-%s" % server_name,
+                daemon=True,
+            ).start()
+
     # ---------- 启停 ----------
     @classmethod
     def ensure_started(cls) -> None:
@@ -425,15 +536,30 @@ class MCPManager:
         except Exception:
             pass
         with cls._lock:
-            return [
-                {
-                    "name": name,
-                    "ready": runner.session is not None,
-                    "tools": len(runner.tools),
-                    "error": str(runner.error) if runner.error else "",
-                }
-                for name, runner in cls._runners.items()
-            ]
+            servers = dict(cls.load_config())
+            runners = dict(cls._runners)
+
+        result = []
+        for name, spec in servers.items():
+            enabled = cls._is_spec_enabled(spec)
+            runner = runners.get(name)
+            error = str(runner.error) if runner is not None and runner.error else ""
+            if enabled and not cls._has_endpoint(spec):
+                error = "缺少 command/url"
+            result.append({
+                "name": name,
+                "enabled": enabled,
+                "running": runner is not None,
+                "ready": bool(
+                    enabled
+                    and runner is not None
+                    and runner.session is not None
+                    and runner.error is None
+                ),
+                "tools": len(runner.tools) if runner is not None else 0,
+                "error": error,
+            })
+        return result
 
     @classmethod
     def server_tools(cls, server_name: str) -> list:

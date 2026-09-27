@@ -46,7 +46,11 @@ import json
 # PyQt6 导入
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtCore import QUrl
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QUrl, QSettings, Qt, QTimer, QSize, QPointF, QEvent, QPoint, QRect, QRectF
+from PyQt6.QtCore import (
+    QThread, pyqtSignal, pyqtSlot, QUrl, QSettings, Qt, QTimer, QSize,
+    QPointF, QEvent, QPoint, QRect, QRectF, QPropertyAnimation, QEasingCurve,
+    QAbstractAnimation,
+)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QListWidget, QListWidgetItem, QSlider,
@@ -54,9 +58,12 @@ from PyQt6.QtWidgets import (
     QLabel, QSplitter, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,QFileDialog, QInputDialog, QListView, QRubberBand,
     QMenuBar, QMenu, QStatusBar, QSizePolicy, QGroupBox, QComboBox, QCheckBox, QTextBrowser, QAbstractItemView, QProgressBar,
     QToolButton, QStackedWidget, QFrame, QStyle,
-    QSystemTrayIcon
+    QSystemTrayIcon, QFontComboBox, QSpinBox, QColorDialog,
 )
-from PyQt6.QtGui import QTextOption, QIcon, QPixmap, QImage, QPainter, QColor, QFont, QLinearGradient, QPainterPath, QPen
+from PyQt6.QtGui import (
+    QTextOption, QIcon, QPixmap, QImage, QImageReader, QTextDocument,
+    QPainter, QColor, QFont, QLinearGradient, QPainterPath, QPen, QPalette, QActionGroup,
+)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtCore import QMetaObject   # 如果你保留 invokeMethod 方式则需要，改用信号则不需要
@@ -83,9 +90,384 @@ def get_resource_path(*parts):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
 
 
+AVATAR_OUTPUT_SIDE = 512
+AVATAR_MAX_SOURCE_SIDE = 4096
+AVATAR_MAX_FILE_BYTES = 20 * 1024 * 1024
+
+
+def get_default_avatar_path(avatar_kind):
+    '''返回用户或 AI 助手的内置默认头像。'''
+    filename = 'user.png' if avatar_kind == 'user' else 'mao.png'
+    return get_resource_path('assets', 'web_resources', filename)
+
+
+def get_avatar_storage_dir():
+    '''头像属于运行时数据，不能写入只读的 assets 目录。'''
+    path = os.path.join(get_runtime_dir(), 'data', 'avatars')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def resolve_avatar_path(value):
+    '''把 QSettings 中的项目相对路径解析为绝对路径。'''
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    if not os.path.isabs(value):
+        value = os.path.join(get_runtime_dir(), value)
+    return os.path.abspath(value)
+
+
+def serialize_avatar_path(path):
+    '''项目目录内的头像保存为相对路径，方便便携版整体移动。'''
+    abs_path = os.path.abspath(str(path or ''))
+    runtime_dir = os.path.abspath(get_runtime_dir())
+    try:
+        relative = os.path.relpath(abs_path, runtime_dir)
+    except ValueError:
+        return abs_path
+    if relative != '..' and not relative.startswith('..' + os.sep):
+        return relative.replace(os.sep, '/')
+    return abs_path
+
+
+def load_avatar_source_pixmap(file_path):
+    '''读取头像源图；超大图片在解码阶段就缩小，避免占用过多内存。'''
+    file_path = os.path.abspath(str(file_path or ''))
+    if not os.path.isfile(file_path):
+        return QPixmap()
+    try:
+        if os.path.getsize(file_path) > AVATAR_MAX_FILE_BYTES:
+            return QPixmap()
+    except OSError:
+        return QPixmap()
+
+    reader = QImageReader(file_path)
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid() and max(source_size.width(), source_size.height()) > AVATAR_MAX_SOURCE_SIDE:
+        reader.setScaledSize(
+            source_size.scaled(
+                QSize(AVATAR_MAX_SOURCE_SIDE, AVATAR_MAX_SOURCE_SIDE),
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+        )
+    image = reader.read()
+    return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+
+
+def save_avatar_pixmap(pixmap, avatar_kind):
+    '''把裁剪后的头像原子写入 data/avatars，并返回实际文件路径。'''
+    if pixmap.isNull():
+        raise ValueError('头像图片无效')
+    avatar_kind = 'assistant' if avatar_kind == 'assistant' else 'user'
+    scaled = pixmap.scaled(
+        AVATAR_OUTPUT_SIDE,
+        AVATAR_OUTPUT_SIDE,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    image = scaled.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+    target_path = os.path.join(
+        get_avatar_storage_dir(),
+        f'{avatar_kind}_{uuid.uuid4().hex}.png',
+    )
+    temp_path = target_path + '.tmp'
+    if not image.save(temp_path, 'PNG'):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise OSError('头像保存失败')
+    os.replace(temp_path, target_path)
+    return target_path
+
+
+def make_circular_avatar(pixmap, size):
+    '''把任意比例头像裁成指定尺寸的圆形，用于聊天气泡预览。'''
+    size = max(1, int(size))
+    if pixmap.isNull():
+        return QPixmap()
+    canvas = QPixmap(size, size)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    clip_path = QPainterPath()
+    clip_path.addEllipse(0.5, 0.5, max(1.0, size - 1.0), max(1.0, size - 1.0))
+    painter.setClipPath(clip_path)
+    scaled = pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    draw_x = (size - scaled.width()) // 2
+    draw_y = (size - scaled.height()) // 2
+    painter.drawPixmap(draw_x, draw_y, scaled)
+    painter.end()
+    return canvas
+
+
+def clamp_chat_font_size(value, default=10):
+    try:
+        return max(8, min(32, int(float(value))))
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp_opacity(value, default=0.85):
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+DEFAULT_BUBBLE_USER_COLOR = "#E3F2FD"
+DEFAULT_BUBBLE_ASSISTANT_COLOR = "#F0F0F0"
+DEFAULT_CODE_BLOCK_COLOR = "#0F172A"
+
+
+def normalize_hex_color(value, default):
+    color = QColor(str(value or "").strip())
+    return color.name().upper() if color.isValid() else str(default).upper()
+
+
+def color_to_rgba(value, opacity):
+    color = QColor(normalize_hex_color(value, "#000000"))
+    alpha = clamp_opacity(opacity)
+    return f"rgba({color.red()},{color.green()},{color.blue()},{alpha:.3f})"
+
+
+def contrast_text_color(value):
+    color = QColor(normalize_hex_color(value, "#FFFFFF"))
+    luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+    return "#111827" if luminance >= 150 else "#F8FAFC"
+
+
+# ======================== 界面主题（暗色/明色） ========================
+# 暗色取值与旧版硬编码颜色逐字一致，切回暗色观感不变。
+UI_THEMES = {
+    "dark": {
+        "window_bg": "#1f1f1f",
+        "panel_bg": "#252525",
+        "panel_border": "#444444",
+        "brand_text": "#eeeeee",
+        "label_text": "#d7d7d7",
+        "input_bg": "#303030",
+        "input_border": "#4b4b4b",
+        "input_focus_border": "#6688aa",
+        "item_text": "#eeeeee",
+        "item_hover": "#383838",
+        "item_selected_bg": "#34495e",
+        "item_selected_text": "#ffffff",
+        "separator": "#4b4b4b",
+        "accent_bg": "#29465f",
+        "accent_fg": "#52a9ff",
+        "accent_hover": "#345a79",
+        "accent_pressed": "#223d53",
+        "content_border": "#46515f",
+        "composer_bg": "rgba(45, 45, 45, 235)",
+        "composer_border": "#555",
+        "composer_text": "#eeeeee",
+        "placeholder": "#929292",
+        "tool_color": "#d8d8d8",
+        "tool_hover": "#484848",
+        "combo_bg": "#363636",
+        "combo_text": "#dddddd",
+        "send_bg": "#e7edf2",
+        "send_fg": "#252a2e",
+        "stop_bg": "#d85c5c",
+        "stop_fg": "#ffffff",
+        "hint_text": "#aeb8c2",
+        "splitter_handle": "#1f1f1f",
+        "splitter_hover": "#4c7396",
+        "canvas_bg": "#1f1f1f",
+        "scroll_track": "#262626",
+        "scroll_handle": "#4a4a4a",
+        "scroll_handle_hover": "#5f5f5f",
+        "menu_bg": "#1e1e1e",
+        "menu_text": "#ffffff",
+        "menu_border": "#3c3c3c",
+    },
+    "light": {
+        "window_bg": "#f5f6f8",
+        "panel_bg": "#ffffff",
+        "panel_border": "#d9dde3",
+        "brand_text": "#1f2937",
+        "label_text": "#4b5563",
+        "input_bg": "#ffffff",
+        "input_border": "#cbd5e1",
+        "input_focus_border": "#3b82f6",
+        "item_text": "#1f2937",
+        "item_hover": "#eef2f7",
+        "item_selected_bg": "#dbeafe",
+        "item_selected_text": "#1d4ed8",
+        "separator": "#e5e7eb",
+        "accent_bg": "#dbeafe",
+        "accent_fg": "#1d4ed8",
+        "accent_hover": "#c7dbfd",
+        "accent_pressed": "#b9d2fb",
+        "content_border": "#d9dde3",
+        "composer_bg": "rgba(255, 255, 255, 240)",
+        "composer_border": "#d9dde3",
+        "composer_text": "#1f2937",
+        "placeholder": "#9aa3af",
+        "tool_color": "#4b5563",
+        "tool_hover": "#eceff3",
+        "combo_bg": "#ffffff",
+        "combo_text": "#374151",
+        "send_bg": "#2563eb",
+        "send_fg": "#ffffff",
+        "stop_bg": "#dc2626",
+        "stop_fg": "#ffffff",
+        "hint_text": "#6b7280",
+        "splitter_handle": "#e5e8ed",
+        "splitter_hover": "#b9c6d6",
+        "canvas_bg": "#f7f8fa",
+        "scroll_track": "#eef1f5",
+        "scroll_handle": "#c4cbd6",
+        "scroll_handle_hover": "#aab4c3",
+        "menu_bg": "#ffffff",
+        "menu_text": "#1f2937",
+        "menu_border": "#d9dde3",
+    },
+}
+
+
+# 应用级调色板：之前没写样式表的控件（菜单栏、状态栏、滚动条、右键菜单、
+# 提示气泡、各类对话框）全部吃系统调色板，系统是深色主题时明色界面就会留一圈深色。
+UI_THEME_PALETTES = {
+    "dark": {
+        "WindowText": "#ffffff",
+        "Button": "#3c3c3c",
+        "Light": "#787878",
+        "Midlight": "#5a5a5a",
+        "Dark": "#1e1e1e",
+        "Mid": "#282828",
+        "Text": "#ffffff",
+        "BrightText": "#256bb1",
+        "ButtonText": "#ffffff",
+        "Base": "#2d2d2d",
+        "AlternateBase": "#071421",
+        "Window": "#1e1e1e",
+        "Shadow": "#000000",
+        "Highlight": "#163f69",
+        "HighlightedText": "#ffffff",
+        "Link": "#256bb1",
+        "LinkVisited": "#1e5993",
+        "ToolTipBase": "#3c3c3c",
+        "ToolTipText": "#d4d4d4",
+        "PlaceholderText": "#969696",
+    },
+    "light": {
+        "WindowText": "#1f2937",
+        "Button": "#ffffff",
+        "Light": "#ffffff",
+        "Midlight": "#f2f4f7",
+        "Dark": "#c7ced8",
+        "Mid": "#d9dde3",
+        "Text": "#1f2937",
+        "BrightText": "#ffffff",
+        "ButtonText": "#1f2937",
+        "Base": "#ffffff",
+        "AlternateBase": "#f3f4f6",
+        "Window": "#f5f6f8",
+        "Shadow": "#9aa3af",
+        "Highlight": "#dbeafe",
+        "HighlightedText": "#1d4ed8",
+        "Link": "#2563eb",
+        "LinkVisited": "#7c3aed",
+        "ToolTipBase": "#ffffff",
+        "ToolTipText": "#1f2937",
+        "PlaceholderText": "#9aa3af",
+    },
+}
+
+
+def normalize_ui_theme(name):
+    key = str(name or "").strip().lower()
+    return key if key in UI_THEMES else "dark"
+
+
+def get_ui_theme_palette(name):
+    return UI_THEMES[normalize_ui_theme(name)]
+
+
+def build_ui_palette(name):
+    """按主题构建应用级调色板，避免系统深色主题渗进菜单栏、状态栏和滚动条。"""
+    values = UI_THEME_PALETTES[normalize_ui_theme(name)]
+    palette = QPalette()
+    for role_name, color in values.items():
+        role = getattr(QPalette.ColorRole, role_name, None)
+        if role is not None:
+            palette.setColor(role, QColor(color))
+    return palette
+
+
+def build_scrollbar_stylesheet(palette):
+    """统一下拉条外观：不写样式时滚动条会跟着系统主题画成黑条。"""
+    return (
+        "QScrollBar:vertical { background: %(scroll_track)s; width: 10px; margin: 0px; border: none; }"
+        "QScrollBar:horizontal { background: %(scroll_track)s; height: 10px; margin: 0px; border: none; }"
+        "QScrollBar::handle { background: %(scroll_handle)s; border-radius: 5px; }"
+        "QScrollBar::handle:vertical { min-height: 30px; }"
+        "QScrollBar::handle:horizontal { min-width: 30px; }"
+        "QScrollBar::handle:hover { background: %(scroll_handle_hover)s; }"
+        "QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; background: none; border: none; }"
+        "QScrollBar::add-page, QScrollBar::sub-page { background: none; }"
+    ) % palette
+
+
+def style_popup_menu(menu, theme="dark"):
+    """弹出菜单要显式上色：桌宠窗口的 background:transparent 会顺着父样式表把菜单刷黑。"""
+    menu.setStyleSheet(
+        "QMenu { background: %(menu_bg)s; color: %(menu_text)s; "
+        "border: 1px solid %(menu_border)s; padding: 4px 2px; }"
+        "QMenu::item { padding: 6px 22px 6px 14px; border-radius: 4px; }"
+        "QMenu::item:selected { background: %(item_selected_bg)s; color: %(item_selected_text)s; }"
+        "QMenu::separator { height: 1px; background: %(separator)s; margin: 4px 8px; }"
+        % get_ui_theme_palette(theme)
+    )
+    return menu
+
+
+def apply_native_window_frame_theme(window, theme):
+    """让 Windows 原生标题栏和窗口边框跟随界面主题；非 Windows 直接跳过。"""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        hwnd = int(window.winId())
+        dark = ctypes.c_int(1 if normalize_ui_theme(theme) == "dark" else 0)
+        for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE，旧系统用 19
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_uint(attribute),
+                ctypes.byref(dark),
+                ctypes.sizeof(dark),
+            )
+            if result == 0:
+                break
+    except Exception:
+        logging.debug("设置窗口边框主题失败", exc_info=True)
+
+
+def contrast_secondary_text_color(value):
+    color = QColor(normalize_hex_color(value, "#FFFFFF"))
+    luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+    return "#475569" if luminance >= 150 else "#CBD5E1"
+
+
+def chat_font_style(font_family, font_size):
+    family = str(font_family or "").strip().replace('"', "")
+    family_rule = f'font-family:"{family}";' if family else ""
+    return f'{family_rule}font-size:{clamp_chat_font_size(font_size)}pt;'
+
+
 def get_app_icon():
     """读取应用图标；开发运行和 one-dir 打包都从程序资源目录加载。"""
-    icon_path = get_resource_path("assets", "Aissist.ico")
+    icon_path = get_resource_path("assets", "Aissistant.ico")
     if not os.path.exists(icon_path):
         return QIcon()
     icon = QIcon(icon_path)
@@ -185,6 +567,7 @@ def sanitize_reply_text(text: str) -> str:
     text = strip_internal_reasoning(text)
     text = strip_text_tool_protocol(text)
     text = DSML_TAG_PATTERN.sub("", text)
+    text = MARKDOWN_FENCE_PATTERN.sub(lambda match: match.group("code"), text)
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
     text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
     text = re.sub(r"`([^`]*)`", r"\1", text)
@@ -194,6 +577,138 @@ def sanitize_reply_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.replace("*", "").replace("`", "")
     return text.strip()
+
+
+MARKDOWN_FENCE_PATTERN = re.compile(
+    r"^(?P<indent>[ \t]{0,3})(?P<fence>`{3,}|~{3,})[ \t]*(?P<language>[^\n]*)\n"
+    r"(?P<code>.*?)(?:^(?P=indent)[ \t]*(?P=fence)[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def markdown_to_plain_text(text):
+    """把 Markdown 转成适合历史记录和 TTS 的纯文本，不读取格式符号。"""
+    text = strip_internal_reasoning(str(text or ""))
+    text = MARKDOWN_FENCE_PATTERN.sub(lambda match: match.group("code"), text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$", "", text, flags=re.MULTILINE)
+    text = text.replace("|", " ")
+    text = re.sub(r"(\*\*|__|~~|`|\*|_)", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def pet_bubble_text(text):
+    """Remove fenced code, then convert Markdown to plain pet-bubble text."""
+    without_code = MARKDOWN_FENCE_PATTERN.sub("", str(text or ""))
+    return markdown_to_plain_text(without_code)
+
+
+def _sanitize_markdown_segment(markdown_text):
+    """移除 Markdown 图片和危险链接，避免 Qt 富文本加载本地资源。"""
+    markdown_text = re.sub(
+        r'<(https?://[^>\s]+)>',
+        lambda match: f'[{match.group(1)}]({match.group(1)})',
+        markdown_text,
+        flags=re.IGNORECASE,
+    )
+    markdown_text = re.sub(r'</?[A-Za-z][^>]*>', '', markdown_text)
+    markdown_text = re.sub(
+        r"!\[([^\]]*)\]\([^)]+\)",
+        lambda match: match.group(1),
+        markdown_text,
+    )
+
+    def replace_link(match):
+        label = match.group(1)
+        target = match.group(2).strip()
+        if re.match(r"^https?://", target, re.IGNORECASE):
+            return match.group(0)
+        return label
+
+    return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, markdown_text)
+
+
+def _markdown_segment_to_html(markdown_text):
+    if not str(markdown_text or "").strip():
+        return ""
+    document = QTextDocument()
+    document.setMarkdown(_sanitize_markdown_segment(markdown_text))
+    rendered = document.toHtml()
+    body_match = re.search(r"<body[^>]*>(.*)</body>", rendered, re.IGNORECASE | re.DOTALL)
+    return body_match.group(1) if body_match else rendered
+
+
+def render_markdown_to_html(
+    markdown_text,
+    code_blocks=None,
+    code_font_family="Consolas",
+    code_font_size=10,
+    code_opacity=0.85,
+    code_color=DEFAULT_CODE_BLOCK_COLOR,
+):
+    """渲染受限 Markdown；围栏代码块由应用统一控制，不交给模型指定样式。"""
+    markdown_text = str(markdown_text or "")
+    code_blocks = code_blocks if code_blocks is not None else []
+    parts = []
+    cursor = 0
+    code_index = 0
+    code_opacity = clamp_opacity(code_opacity)
+    base_color = QColor(normalize_hex_color(code_color, DEFAULT_CODE_BLOCK_COLOR))
+    luminance = 0.299 * base_color.red() + 0.587 * base_color.green() + 0.114 * base_color.blue()
+    if luminance < 150:
+        header_color = base_color.lighter(125).name()
+        border_color = base_color.lighter(160).name()
+        code_text_color = "#E5E7EB"
+        language_color = "#93C5FD"
+        copy_color = "#DBEAFE"
+    else:
+        header_color = base_color.darker(112).name()
+        border_color = base_color.darker(135).name()
+        code_text_color = "#111827"
+        language_color = "#1D4ED8"
+        copy_color = "#1E3A8A"
+    header_rgba = color_to_rgba(header_color, code_opacity)
+    body_rgba = color_to_rgba(base_color.name(), code_opacity)
+    border_rgba = color_to_rgba(border_color, code_opacity)
+    for match in MARKDOWN_FENCE_PATTERN.finditer(markdown_text):
+        parts.append(_markdown_segment_to_html(markdown_text[cursor:match.start()]))
+        language = re.sub(r"[^A-Za-z0-9_+#.-]+", "", match.group("language").strip())[:24]
+        code = match.group("code").rstrip("\n")
+        code_blocks.append(code)
+        language_label = html.escape((language or "code").upper())
+        code_html = html.escape(code)
+        code_family = html.escape(str(code_font_family or "Consolas"), quote=True)
+        code_size = clamp_chat_font_size(code_font_size)
+        copy_url = f"codex-copy:{code_index}"
+        parts.append(
+            '<div style="margin:10px 0 12px 0;">'
+            '<table cellspacing="0" cellpadding="0" width="100%" '
+            f'style="background-color:{body_rgba}; border:1px solid {border_rgba}; '
+            'border-radius:12px;">'
+            '<tr>'
+            f'<td style="padding:7px 11px; background-color:{header_rgba}; '
+            f'color:{language_color}; font-family:Consolas,monospace; font-size:9pt;">'
+            f'{language_label}</td>'
+            f'<td align="right" style="padding:7px 11px; background-color:{header_rgba};">'
+            f'<a href="{copy_url}" style="color:{copy_color}; text-decoration:none; '
+            'font-size:9pt;">复制代码</a></td>'
+            '</tr>'
+            f'<tr><td colspan="2" style="padding:12px 14px; background-color:{body_rgba};">'
+            f'<pre style="font-family:\'{code_family}\',Consolas,monospace; '
+            f'font-size:{code_size}pt; color:{code_text_color}; line-height:145%; '
+            'white-space:pre-wrap; margin:0;">'
+            f'{code_html}</pre></td></tr></table></div>'
+        )
+        code_index += 1
+        cursor = match.end()
+    parts.append(_markdown_segment_to_html(markdown_text[cursor:]))
+    return "".join(parts)
 
 
 def strip_internal_reasoning(text: str) -> str:
@@ -326,6 +841,87 @@ class KaomojiStreamFilter:
             break
 
         return "".join(visible_parts)
+
+
+class PetSpeechStreamFilter:
+    """Strip fenced code and kaomoji protocol blocks from pet speech."""
+
+    def __init__(self):
+        self._line_buffer = ""
+        self._in_fence = False
+        self._fence_char = ""
+        self._fence_length = 0
+        self._kaomoji_filter = KaomojiStreamFilter()
+
+    def reset(self):
+        self._line_buffer = ""
+        self._in_fence = False
+        self._fence_char = ""
+        self._fence_length = 0
+        self._kaomoji_filter.reset()
+
+    @staticmethod
+    def _opening_fence(line):
+        return re.match(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$", line)
+
+    @staticmethod
+    def _closing_fence(line):
+        return re.match(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$", line)
+
+    @staticmethod
+    def _could_start_fence(line):
+        stripped = line.lstrip(" \t")
+        if len(line) - len(stripped) > 3 or not stripped:
+            return bool(stripped) or len(line) <= 3
+        first = stripped[0]
+        if first not in "`~":
+            return False
+        if stripped.startswith(first * 3):
+            return True
+        return all(char == first for char in stripped)
+
+    def _consume_line(self, line):
+        if self._in_fence:
+            closing = self._closing_fence(line)
+            if (
+                closing
+                and closing.group(1)[0] == self._fence_char
+                and len(closing.group(1)) >= self._fence_length
+            ):
+                self._in_fence = False
+            return ""
+
+        opening = self._opening_fence(line)
+        if opening:
+            fence = opening.group(1)
+            self._in_fence = True
+            self._fence_char = fence[0]
+            self._fence_length = len(fence)
+            return ""
+        return line + "\n"
+
+    def feed(self, chunk, final=False):
+        self._line_buffer += str(chunk or "")
+        visible_parts = []
+
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            visible_parts.append(self._consume_line(line))
+
+        if final:
+            if self._line_buffer:
+                visible_parts.append(self._consume_line(self._line_buffer))
+            self._line_buffer = ""
+            self._in_fence = False
+        elif (
+            not self._in_fence
+            and self._line_buffer
+            and not self._could_start_fence(self._line_buffer)
+        ):
+            visible_parts.append(self._line_buffer)
+            self._line_buffer = ""
+
+        return self._kaomoji_filter.feed("".join(visible_parts), final=final)
 
 
 def split_reply_and_sources(text: str) -> tuple[str, str]:
@@ -571,7 +1167,7 @@ def setup_logging():
         os.makedirs(log_dir, exist_ok=True)
     except OSError:
         try:
-            log_dir = os.path.join(os.path.expanduser("~"), ".aissist_logs")
+            log_dir = os.path.join(os.path.expanduser("~"), ".aissistant_logs")
             os.makedirs(log_dir, exist_ok=True)
         except OSError:
             log_dir = tempfile.gettempdir()
@@ -852,6 +1448,18 @@ class ConfigManager:
             mode if mode in {"fill", "fit", "stretch", "tile", "center"} else "stretch",
         )
 
+    def get_chat_background_opacity(self):
+        return clamp_opacity(self.settings.value("chat_bg_opacity", 1.0), 1.0)
+
+    def set_chat_background_opacity(self, value):
+        self.settings.setValue("chat_bg_opacity", clamp_opacity(value, 1.0))
+
+    def get_ui_theme(self):
+        return normalize_ui_theme(self.settings.value("ui_theme", "dark"))
+
+    def set_ui_theme(self, value):
+        self.settings.setValue("ui_theme", normalize_ui_theme(value))
+
     def get_legacy_system_prompt(self):
         prompt = self.settings.value("system_prompt", DEFAULT_SYSTEM_PROMPT)
         return str(prompt) if prompt is not None else DEFAULT_SYSTEM_PROMPT
@@ -935,6 +1543,94 @@ class ConfigManager:
 
     def set_bubble_opacity(self, value):
         self.settings.setValue("bubble_opacity", value)
+
+    def get_code_opacity(self):
+        if self.settings.contains("code_opacity"):
+            return clamp_opacity(self.settings.value("code_opacity", 0.85))
+        return clamp_opacity(self.get_bubble_opacity())
+
+    def set_code_opacity(self, value):
+        self.settings.setValue("code_opacity", clamp_opacity(value))
+
+    def get_bubble_user_color(self):
+        return normalize_hex_color(
+            self.settings.value("bubble_user_color", DEFAULT_BUBBLE_USER_COLOR),
+            DEFAULT_BUBBLE_USER_COLOR,
+        )
+
+    def set_bubble_user_color(self, value):
+        self.settings.setValue(
+            "bubble_user_color",
+            normalize_hex_color(value, DEFAULT_BUBBLE_USER_COLOR),
+        )
+
+    def get_bubble_assistant_color(self):
+        return normalize_hex_color(
+            self.settings.value("bubble_assistant_color", DEFAULT_BUBBLE_ASSISTANT_COLOR),
+            DEFAULT_BUBBLE_ASSISTANT_COLOR,
+        )
+
+    def set_bubble_assistant_color(self, value):
+        self.settings.setValue(
+            "bubble_assistant_color",
+            normalize_hex_color(value, DEFAULT_BUBBLE_ASSISTANT_COLOR),
+        )
+
+    def get_code_block_color(self):
+        return normalize_hex_color(
+            self.settings.value("code_block_color", DEFAULT_CODE_BLOCK_COLOR),
+            DEFAULT_CODE_BLOCK_COLOR,
+        )
+
+    def set_code_block_color(self, value):
+        self.settings.setValue(
+            "code_block_color",
+            normalize_hex_color(value, DEFAULT_CODE_BLOCK_COLOR),
+        )
+
+    # --- 全局头像 ---
+    @staticmethod
+    def _avatar_setting_key(avatar_kind):
+        return "avatar_assistant" if avatar_kind == "assistant" else "avatar_user"
+
+    def get_custom_avatar_path(self, avatar_kind):
+        value = self.settings.value(self._avatar_setting_key(avatar_kind), "")
+        path = resolve_avatar_path(value)
+        return path if path and os.path.isfile(path) else ""
+
+    def get_avatar_path(self, avatar_kind):
+        custom_path = self.get_custom_avatar_path(avatar_kind)
+        return custom_path or get_default_avatar_path(avatar_kind)
+
+    def set_avatar_path(self, avatar_kind, path):
+        self.settings.setValue(
+            self._avatar_setting_key(avatar_kind),
+            serialize_avatar_path(path),
+        )
+
+    def clear_avatar_path(self, avatar_kind):
+        self.settings.remove(self._avatar_setting_key(avatar_kind))
+
+    # --- 聊天字体 ---
+    def get_chat_font_family(self):
+        return str(self.settings.value("chat_font_family", "Microsoft YaHei UI") or "").strip()
+
+    def get_chat_font_size(self):
+        return clamp_chat_font_size(self.settings.value("chat_font_size", 10), 10)
+
+    def set_chat_font(self, font):
+        self.settings.setValue("chat_font_family", font.family())
+        self.settings.setValue("chat_font_size", clamp_chat_font_size(font.pointSize(), 10))
+
+    def get_code_font_family(self):
+        return str(self.settings.value("code_font_family", "Consolas") or "").strip()
+
+    def get_code_font_size(self):
+        return clamp_chat_font_size(self.settings.value("code_font_size", 10), 10)
+
+    def set_code_font(self, font):
+        self.settings.setValue("code_font_family", font.family())
+        self.settings.setValue("code_font_size", clamp_chat_font_size(font.pointSize(), 10))
 
     # --- 桌宠 Live2D ---
     def get_pet_model_scale(self):
@@ -1635,7 +2331,7 @@ class APICallThread(QThread):
                 return
             if not content.strip():
                 content = "我刚才没有组织出合适的回复，你可以再问我一次。"
-            if not self.config.get_roleplay_mode():
+            if self.config.get_roleplay_mode():
                 content = sanitize_reply_text(content)
             content = self._append_search_sources(content)
             self._set_plan_step("finalize", "整理最终答复", "completed", "已生成最终答复。")
@@ -1850,7 +2546,7 @@ class APICallThread(QThread):
                 if response is not None:
                     response.close()
 
-        threading.Thread(target=request_worker, name="AissistAPIRequest", daemon=True).start()
+        threading.Thread(target=request_worker, name="AissistantAPIRequest", daemon=True).start()
         while True:
             if not self.is_running:
                 raise APICallCancelled()
@@ -2679,7 +3375,7 @@ class APICallThread(QThread):
         retry_message = response["choices"][0]["message"]
         self._set_plan_step("datetime_retry", "修正日期时间答复", "completed", "已依据工具结果纠正日期或时间。")
         content = (retry_message.get("content") or "").strip()
-        return content if self.config.get_roleplay_mode() else sanitize_reply_text(content)
+        return sanitize_reply_text(content) if self.config.get_roleplay_mode() else strip_internal_reasoning(content)
 
     @staticmethod
     def _has_datetime_mismatch(content, datetime_data):
@@ -3077,6 +3773,8 @@ class ResizableBackgroundPanel(QWidget):
         super().__init__(parent)
         self._background_pixmap = QPixmap()
         self._background_mode = "stretch"
+        self._background_opacity = 1.0
+        self._base_color = QColor("#1f1f1f")
         self._scaled_cache = QPixmap()
         self._scaled_cache_key = None
         self.setAutoFillBackground(False)
@@ -3090,6 +3788,17 @@ class ResizableBackgroundPanel(QWidget):
         if mode not in {"fill", "fit", "stretch", "tile", "center"}:
             mode = "stretch"
         self._background_mode = mode
+        self.update()
+
+    def set_background_opacity(self, opacity):
+        """只调整背景图的不透明度，底色不受影响。"""
+        self._background_opacity = clamp_opacity(opacity, 1.0)
+        self.update()
+
+    def set_base_color(self, color):
+        """聊天区底色；随界面主题切换。"""
+        candidate = QColor(str(color or ""))
+        self._base_color = candidate if candidate.isValid() else QColor("#1f1f1f")
         self.update()
 
     def _scaled_background(self, size, aspect_mode):
@@ -3110,8 +3819,9 @@ class ResizableBackgroundPanel(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         target = self.rect()
-        painter.fillRect(target, QColor("#1f1f1f"))
+        painter.fillRect(target, self._base_color)
         if not self._background_pixmap.isNull() and target.width() > 0 and target.height() > 0:
+            painter.setOpacity(self._background_opacity)
             mode = self._background_mode
             if mode == "tile":
                 painter.drawTiledPixmap(target, self._background_pixmap)
@@ -3144,46 +3854,173 @@ class ResizableBackgroundPanel(QWidget):
                     painter.drawPixmap(target, scaled, source)
                 else:
                     painter.drawPixmap(target, scaled)
+            painter.setOpacity(1.0)
         painter.end()
         super().paintEvent(event)
 
 
+class SmoothChatListWidget(QListWidget):
+    """聊天列表滚轮缓动；触控板保持原生逐像素滚动。"""
+
+    WHEEL_PIXELS_PER_NOTCH = 72
+    MIN_ANIMATION_MS = 90
+    MAX_ANIMATION_MS = 180
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._wheel_pixel_remainder = 0.0
+        self._scroll_animation = QPropertyAnimation(
+            self.verticalScrollBar(),
+            b"value",
+            self,
+        )
+        self._scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.verticalScrollBar().setSingleStep(24)
+        self.verticalScrollBar().sliderPressed.connect(self._stop_smooth_scroll)
+
+    def _stop_smooth_scroll(self):
+        self._scroll_animation.stop()
+        self._wheel_pixel_remainder = 0.0
+
+    def scrollToBottom(self):
+        self._stop_smooth_scroll()
+        super().scrollToBottom()
+
+    def wheelEvent(self, event):
+        blocked_modifiers = (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.AltModifier
+        )
+        if event.modifiers() & blocked_modifiers:
+            super().wheelEvent(event)
+            return
+
+        pixel_delta = event.pixelDelta().y()
+        if pixel_delta:
+            self._stop_smooth_scroll()
+            scroll_bar = self.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.value() - pixel_delta)
+            event.accept()
+            return
+
+        angle_delta = event.angleDelta().y()
+        if not angle_delta:
+            super().wheelEvent(event)
+            return
+
+        self._wheel_pixel_remainder += (
+            -angle_delta * self.WHEEL_PIXELS_PER_NOTCH / 120.0
+        )
+        pixel_step = math.trunc(self._wheel_pixel_remainder)
+        if not pixel_step:
+            event.accept()
+            return
+        self._wheel_pixel_remainder -= pixel_step
+        self._animate_scroll_by(pixel_step)
+        event.accept()
+
+    def _animate_scroll_by(self, pixel_step):
+        scroll_bar = self.verticalScrollBar()
+        current_value = scroll_bar.value()
+        animation_running = (
+            self._scroll_animation.state() == QAbstractAnimation.State.Running
+        )
+        if animation_running:
+            base_value = int(self._scroll_animation.endValue())
+            if (base_value - current_value) * pixel_step < 0:
+                base_value = current_value
+        else:
+            base_value = current_value
+
+        target_value = max(
+            scroll_bar.minimum(),
+            min(scroll_bar.maximum(), base_value + pixel_step),
+        )
+        if animation_running and target_value == base_value:
+            return
+        if not animation_running and target_value == current_value:
+            return
+
+        distance = abs(target_value - current_value)
+        duration = min(
+            self.MAX_ANIMATION_MS,
+            max(self.MIN_ANIMATION_MS, int(70 + distance * 0.7)),
+        )
+        self._scroll_animation.stop()
+        self._scroll_animation.setDuration(duration)
+        self._scroll_animation.setStartValue(current_value)
+        self._scroll_animation.setEndValue(target_value)
+        self._scroll_animation.start()
+
+
 # ======================== 聊天消息气泡组件 ========================
+class ClickableAvatarLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event):
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class ChatMessageWidget(QWidget):
     MIN_BUBBLE_WIDTH = 140
     MAX_BUBBLE_WIDTH = 960
     BUBBLE_HORIZONTAL_PADDING = 28
     BUBBLE_VERTICAL_PADDING = 16
     HEIGHT_SAFETY = 4
+    avatar_clicked = pyqtSignal()
 
-    def __init__(self, message, is_user=True, opacity=0.85, parent=None, sources=None):
+    def __init__(
+        self,
+        message,
+        is_user=True,
+        opacity=0.85,
+        code_opacity=0.85,
+        bubble_color=None,
+        code_color=None,
+        parent=None,
+        sources=None,
+        avatar_path=None,
+        render_markdown=False,
+        font_family="Microsoft YaHei UI",
+        font_size=10,
+        code_font_family="Consolas",
+        code_font_size=10,
+    ):
         super().__init__(parent)
         self.is_user = is_user
+        self._opacity = clamp_opacity(opacity)
+        self._code_opacity = clamp_opacity(code_opacity)
+        default_bubble = DEFAULT_BUBBLE_USER_COLOR if is_user else DEFAULT_BUBBLE_ASSISTANT_COLOR
+        self.bubble_color = normalize_hex_color(bubble_color, default_bubble)
+        self.code_color = normalize_hex_color(code_color, DEFAULT_CODE_BLOCK_COLOR)
+        self._bubble_text_color = contrast_text_color(self.bubble_color)
         self.sources = sources or []
+        self.avatar_path = avatar_path or get_default_avatar_path("user" if is_user else "assistant")
+        self.render_markdown = bool(render_markdown)
+        self.font_family = font_family
+        self.font_size = clamp_chat_font_size(font_size)
+        self.code_font_family = code_font_family
+        self.code_font_size = clamp_chat_font_size(code_font_size)
+        self._code_blocks = []
         self._text = ""
+        self._last_layout_viewport_width = None
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(5, 5, 5, 5)
         self._layout.setSpacing(8)
 
         # 头像（使用图片文件）
-        self.avatar_label = QLabel()
-        if is_user:
-            img_path = get_resource_path("assets", "web_resources", "user.png")
-        else:
-            img_path = get_resource_path("assets", "web_resources", "mao.png")
-        
-        pixmap = QPixmap(img_path)
-        # 如果图片加载失败，可以回退到 emoji（可选）
-        if pixmap.isNull():
-            # 图片加载失败，回退到 emoji
-            self.avatar_label.setText("👤" if is_user else "🤖")
-            self.avatar_label.setStyleSheet("font-size: 24px; background-color: #0078D7; border-radius: 20px; padding: 6px; color: white;")
-            self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        else:
-            pixmap = pixmap.scaled(44, 44, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            self.avatar_label.setPixmap(pixmap)
-                
+        self.avatar_label = ClickableAvatarLabel()
         self.avatar_label.setFixedSize(44, 44)
+        self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.avatar_label.clicked.connect(self.avatar_clicked.emit)
+        self.set_avatar_path(self.avatar_path)
         self.list_item = None
 
         # 消息文本 (QTextBrowser 支持可点击链接)
@@ -3196,23 +4033,11 @@ class ChatMessageWidget(QWidget):
         self.message_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.message_text.document().setDocumentMargin(0)
-
-        base_style = """
-            QTextEdit {
-                border-radius: 10px;
-                padding: 6px 10px;
-                color: #000000;
-                background-color: %s;
-                border: none;
-                font-size: 14px;
-            }
-        """
-        if is_user:
-            bg_color = f"rgba(227, 242, 253, {opacity})"
-        else:
-            bg_color = f"rgba(240, 240, 240, {opacity})"
-        self.message_text.setStyleSheet(base_style % bg_color)
-        self.message_text.setOpenExternalLinks(True)
+        self.message_text.setFont(QFont(self.font_family, self.font_size))
+        self._apply_bubble_style(opacity)
+        self.message_text.setOpenLinks(False)
+        self.message_text.setOpenExternalLinks(False)
+        self.message_text.anchorClicked.connect(self._on_anchor_clicked)
 
         # 布局
         if is_user:
@@ -3228,29 +4053,76 @@ class ChatMessageWidget(QWidget):
         self.set_text(message)
 
     def update_opacity(self, opacity):
-        base_style = """
-            QTextEdit {
-                border-radius: 10px;
-                padding: 6px 10px;
-                color: #000000;
-                background-color: %s;
-                border: none;
-                font-size: 14px;
-            }
-        """
-        if self.is_user:
-            bg_color = f"rgba(227, 242, 253, {opacity})"
+        self._opacity = clamp_opacity(opacity)
+        self._apply_bubble_style(self._opacity)
+
+    def update_code_opacity(self, code_opacity):
+        self._code_opacity = clamp_opacity(code_opacity)
+        if self.render_markdown and self._code_blocks:
+            self.set_text(self._text)
+
+    def update_bubble_color(self, bubble_color):
+        default_bubble = DEFAULT_BUBBLE_USER_COLOR if self.is_user else DEFAULT_BUBBLE_ASSISTANT_COLOR
+        self.bubble_color = normalize_hex_color(bubble_color, default_bubble)
+        self._bubble_text_color = contrast_text_color(self.bubble_color)
+        self._apply_bubble_style(self._opacity)
+        self.set_text(self._text)
+
+    def update_code_color(self, code_color):
+        self.code_color = normalize_hex_color(code_color, DEFAULT_CODE_BLOCK_COLOR)
+        if self.render_markdown and self._code_blocks:
+            self.set_text(self._text)
+
+    def _apply_bubble_style(self, opacity):
+        bg_color = color_to_rgba(self.bubble_color, opacity)
+        self.message_text.setStyleSheet(
+            "QTextEdit {"
+            "border-radius:10px; padding:6px 10px;"
+            f"color:{self._bubble_text_color};"
+            f"background-color:{bg_color}; border:none;"
+            f"{chat_font_style(self.font_family, self.font_size)}"
+            "}"
+        )
+
+    def set_font_settings(
+        self,
+        font_family,
+        font_size,
+        code_font_family=None,
+        code_font_size=None,
+    ):
+        self.font_family = font_family
+        self.font_size = clamp_chat_font_size(font_size)
+        if code_font_family is not None:
+            self.code_font_family = code_font_family
+        if code_font_size is not None:
+            self.code_font_size = clamp_chat_font_size(code_font_size)
+        self.message_text.setFont(QFont(self.font_family, self.font_size))
+        self._apply_bubble_style(self._opacity)
+        self.set_text(self._text)
+
+    def set_avatar_path(self, avatar_path):
+        self.avatar_path = avatar_path or get_default_avatar_path("user" if self.is_user else "assistant")
+        pixmap = QPixmap(self.avatar_path)
+        circular = make_circular_avatar(pixmap, 44)
+        if circular.isNull():
+            self.avatar_label.clear()
+            self.avatar_label.setText("👤" if self.is_user else "🤖")
+            self.avatar_label.setStyleSheet(
+                "font-size:24px; background-color:#0078D7; border-radius:22px; color:white;"
+            )
         else:
-            bg_color = f"rgba(240, 240, 240, {opacity})"
-        self.message_text.setStyleSheet(base_style % bg_color)
+            self.avatar_label.setStyleSheet("")
+            self.avatar_label.setPixmap(circular)
 
     def set_text(self, text):
         self._text = text
-        if self.sources:
+        self._code_blocks = []
+        if self.sources or self.render_markdown:
             self.message_text.setHtml(self._build_html(text, self.sources))
         else:
             self.message_text.setPlainText(text)
-        self._sync_bubble_geometry()
+        self._sync_bubble_geometry(force=True)
         self.updateGeometry()
         if self.list_item:
             self.list_item.setSizeHint(self.sizeHint())
@@ -3267,12 +4139,22 @@ class ChatMessageWidget(QWidget):
                         break
 
     def _build_html(self, text, sources):
-        body = html.escape(text).replace("\n", "<br>")
-        parts = [f"<div>{body}</div>"]
+        if self.render_markdown:
+            body = render_markdown_to_html(
+                text,
+                self._code_blocks,
+                code_font_family=self.code_font_family,
+                code_font_size=self.code_font_size,
+                code_opacity=self._code_opacity,
+                code_color=self.code_color,
+            )
+        else:
+            body = html.escape(text).replace("\n", "<br>")
+        parts = [f'<div style="color:{self._bubble_text_color};">{body}</div>']
         if sources:
             parts.append(
                 "<div style='margin-top: 8px; padding-top: 6px; border-top: 1px solid #DDDDDD; "
-                "font-size: 12px; color: #666666;'>来源：</div>"
+                f"font-size: 12px; color: {self._bubble_text_color};'>来源：</div>"
             )
             for index, item in enumerate(sources, 1):
                 title = html.escape(str(item.get("title", "") or "链接"))
@@ -3283,13 +4165,30 @@ class ChatMessageWidget(QWidget):
                 )
         return "".join(parts)
 
+    def _on_anchor_clicked(self, url):
+        if url.scheme() in {"http", "https"}:
+            webbrowser.open(url.toString())
+            return
+        if url.scheme() != "codex-copy":
+            return
+        try:
+            index = int(url.path().strip("/") or url.host())
+            code = self._code_blocks[index]
+        except (ValueError, IndexError):
+            return
+        QApplication.clipboard().setText(code)
+
     def refresh_layout(self):
         self._sync_bubble_geometry()
         self.updateGeometry()
         if self.list_item:
             self.list_item.setSizeHint(self.sizeHint())
 
-    def _sync_bubble_geometry(self):
+    def _sync_bubble_geometry(self, force=False):
+        list_widget = self._find_list_widget()
+        viewport_width = list_widget.viewport().width() if list_widget else -1
+        if not force and viewport_width == self._last_layout_viewport_width:
+            return
         target_width = self._calculate_bubble_width(self._text)
         content_width = max(40, target_width - self.BUBBLE_HORIZONTAL_PADDING)
         self.message_text.setFixedWidth(target_width)
@@ -3300,9 +4199,16 @@ class ChatMessageWidget(QWidget):
         total_height = doc_height + self.BUBBLE_VERTICAL_PADDING + self.HEIGHT_SAFETY
         self.message_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setFixedHeight(total_height)
+        self._last_layout_viewport_width = viewport_width
 
     def _calculate_bubble_width(self, text):
         max_width = self._get_max_bubble_width()
+        if self.render_markdown:
+            document_width = math.ceil(self.message_text.document().idealWidth())
+            suggested_width = document_width + self.BUBBLE_HORIZONTAL_PADDING
+            if len(text) > 80:
+                suggested_width = max(suggested_width, int(max_width * 0.82))
+            return max(self.MIN_BUBBLE_WIDTH, min(int(suggested_width), max_width))
         metrics = QFontMetrics(self.message_text.font())
         lines = text.splitlines() or [""]
         longest_line_width = max(metrics.horizontalAdvance(line) for line in lines) if lines else 0
@@ -3347,14 +4253,33 @@ class TaskProgressWidget(QWidget):
     BUBBLE_HORIZONTAL_PADDING = 28
     BUBBLE_VERTICAL_PADDING = 16
     HEIGHT_SAFETY = 4
+    avatar_clicked = pyqtSignal()
 
-    def __init__(self, opacity=0.85, parent=None):
+    def __init__(
+        self,
+        opacity=0.85,
+        parent=None,
+        avatar_path=None,
+        font_family="Microsoft YaHei UI",
+        font_size=10,
+        bubble_color=DEFAULT_BUBBLE_ASSISTANT_COLOR,
+    ):
         super().__init__(parent)
+        self._opacity = clamp_opacity(opacity)
+        self.bubble_color = normalize_hex_color(
+            bubble_color,
+            DEFAULT_BUBBLE_ASSISTANT_COLOR,
+        )
+        self.font_family = font_family
+        self.font_size = clamp_chat_font_size(font_size)
         self._text = ""
+        self._task_state = {}
         self.list_item = None
         self._has_progress = False
         self._show_divider = False
         self._sync_pending = False
+        self._sync_force_requested = False
+        self._last_layout_viewport_width = None
         self._content_size = QSize(320, 64)
         self._progress_h = 0
         self._message_h = 0
@@ -3364,24 +4289,16 @@ class TaskProgressWidget(QWidget):
         self._layout.setSpacing(8)
 
         # 头像（与其他助手消息一致）
-        self.avatar_label = QLabel()
-        img_path = get_resource_path("assets", "web_resources", "mao.png")
-        pixmap = QPixmap(img_path)
-        if pixmap.isNull():
-            self.avatar_label.setText("🤖")
-            self.avatar_label.setStyleSheet("font-size: 24px; background-color: #0078D7; border-radius: 20px; padding: 6px; color: white;")
-            self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        else:
-            pixmap = pixmap.scaled(44, 44, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            self.avatar_label.setPixmap(pixmap)
+        self.avatar_label = ClickableAvatarLabel()
         self.avatar_label.setFixedSize(44, 44)
+        self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.avatar_label.clicked.connect(self.avatar_clicked.emit)
+        self.set_avatar_path(avatar_path or get_default_avatar_path("assistant"))
 
         # 气泡容器：统一浅灰圆角背景，与普通消息气泡一致
         self.bubble_container = QWidget()
         self.bubble_container.setObjectName("progressBubble")
-        self.bubble_container.setStyleSheet(
-            f"QWidget#progressBubble {{ background-color: rgba(240, 240, 240, {opacity}); border-radius: 10px; }}"
-        )
         self.bubble_layout = QVBoxLayout(self.bubble_container)
         self.bubble_layout.setContentsMargins(12, 10, 12, 10)
         self.bubble_layout.setSpacing(6)
@@ -3396,8 +4313,10 @@ class TaskProgressWidget(QWidget):
         self.progress_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.progress_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.progress_text.document().setDocumentMargin(0)
+        self.progress_text.setFont(QFont(self.font_family, self.font_size))
         self.progress_text.setStyleSheet(
-            "QTextEdit { border: none; background: transparent; color: #333333; font-size: 14px; padding: 0px; }"
+            "QTextEdit { border:none; background:transparent; color:#333333; padding:0px; "
+            f"{chat_font_style(self.font_family, self.font_size)}}}"
         )
         self.bubble_layout.addWidget(self.progress_text)
 
@@ -3418,32 +4337,91 @@ class TaskProgressWidget(QWidget):
         self.message_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.message_text.document().setDocumentMargin(0)
+        self.message_text.setFont(QFont(self.font_family, self.font_size))
         self.message_text.setStyleSheet(
-            "QTextEdit { border: none; background: transparent; color: #000000; font-size: 14px; padding: 0px; }"
+            "QTextEdit { border:none; background:transparent; color:#000000; padding:0px; "
+            f"{chat_font_style(self.font_family, self.font_size)}}}"
         )
         self.bubble_layout.addWidget(self.message_text)
 
         self._layout.addStretch(1)
         self._layout.addWidget(self.bubble_container, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         self._layout.addWidget(self.avatar_label)
+        self._apply_bubble_style(self._opacity)
 
-    def refresh_layout(self):
-        self._sync_geometry()
+    def _apply_bubble_style(self, opacity=None):
+        if opacity is not None:
+            self._opacity = clamp_opacity(opacity)
+        self._bubble_text_color = contrast_text_color(self.bubble_color)
+        self._secondary_text_color = contrast_secondary_text_color(self.bubble_color)
+        self.bubble_container.setStyleSheet(
+            "QWidget#progressBubble {"
+            f"background-color:{color_to_rgba(self.bubble_color, self._opacity)};"
+            "border-radius:10px;"
+            "}"
+        )
+        shared_style = chat_font_style(self.font_family, self.font_size)
+        text_style = (
+            "QTextEdit { border:none; background:transparent; padding:0px; "
+            f"color:{self._bubble_text_color}; {shared_style}"
+            "}"
+        )
+        self.progress_text.setFont(QFont(self.font_family, self.font_size))
+        self.progress_text.setStyleSheet(text_style)
+        self.message_text.setFont(QFont(self.font_family, self.font_size))
+        self.message_text.setStyleSheet(text_style)
+        self.divider.setStyleSheet(
+            f"background-color:{self._secondary_text_color}; border:none;"
+        )
+
+    def update_opacity(self, opacity):
+        self._apply_bubble_style(opacity)
+
+    def update_bubble_color(self, bubble_color):
+        self.bubble_color = normalize_hex_color(
+            bubble_color,
+            DEFAULT_BUBBLE_ASSISTANT_COLOR,
+        )
+        self._apply_bubble_style()
+        self.update_progress(self._task_state)
+
+    def set_avatar_path(self, avatar_path):
+        pixmap = QPixmap(avatar_path)
+        circular = make_circular_avatar(pixmap, 44)
+        if circular.isNull():
+            self.avatar_label.clear()
+            self.avatar_label.setText("🤖")
+            self.avatar_label.setStyleSheet(
+                "font-size:24px; background-color:#0078D7; border-radius:22px; color:white;"
+            )
+        else:
+            self.avatar_label.setStyleSheet("")
+            self.avatar_label.setPixmap(circular)
+
+    def refresh_layout(self, force=False):
+        self._sync_geometry(force=force)
         self.updateGeometry()
         if self.list_item:
             self.list_item.setSizeHint(self.sizeHint())
 
+    def set_font_settings(self, font_family, font_size):
+        self.font_family = font_family
+        self.font_size = clamp_chat_font_size(font_size)
+        self._apply_bubble_style()
+        self.refresh_layout(force=True)
+
     def set_text(self, text):
         self._text = text
         self.message_text.setPlainText(text)
-        self._sync_geometry()
+        self._sync_geometry(force=True)
         self.updateGeometry()
         if self.list_item:
             self.list_item.setSizeHint(self.sizeHint())
 
     def update_progress(self, task_state):
         # 带附件的消息不会生成任务状态，这里要容忍 None
-        steps = (task_state or {}).get("plan_steps", [])
+        self._task_state = task_state or {}
+        steps = self._task_state.get("plan_steps", [])
         self._has_progress = bool(steps)
         self._show_divider = bool(steps)
         if steps:
@@ -3454,14 +4432,16 @@ class TaskProgressWidget(QWidget):
                 title = html.escape(str(step.get("title", "")))
                 margin = ' style="margin-top: 6px;"' if i else ""
                 line = (
-                    f'<div{margin} style="font-size: 15px; font-weight: 600; color: #333333;">'
+                    f'<div{margin} style="font-size: 15px; font-weight: 600; '
+                    f'color: {self._bubble_text_color};">'
                     f"{icon} {title}</div>"
                 )
                 detail = str(step.get("detail", "") or "")
                 if detail and status in {"in_progress", "failed"}:
                     detail = html.escape(detail if len(detail) <= 60 else detail[:60] + "\u2026")
                     line += (
-                        '<div style="margin-top: 2px; font-size: 13px; font-weight: 400; color: #777777;">'
+                        '<div style="margin-top: 2px; font-size: 13px; font-weight: 400; '
+                        f'color: {self._secondary_text_color};">'
                         f"&nbsp;&nbsp;&nbsp;{detail}</div>"
                     )
                 blocks.append(line)
@@ -3472,9 +4452,13 @@ class TaskProgressWidget(QWidget):
             self.progress_text.setHtml("")
             self.progress_text.setVisible(False)
             self.divider.setVisible(False)
-        self._sync_geometry()
+        self._sync_geometry(force=True)
 
-    def _sync_geometry(self):
+    def _sync_geometry(self, force=False):
+        list_widget = self._find_list_widget()
+        viewport_width = list_widget.viewport().width() if list_widget else -1
+        if not force and viewport_width == self._last_layout_viewport_width:
+            return
         width = self._calculate_bubble_width()
         content_width = max(40, width - 24)
         self.bubble_container.setFixedWidth(width)
@@ -3498,6 +4482,7 @@ class TaskProgressWidget(QWidget):
         self.message_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setFixedHeight(self._message_h)
         self._update_content_size()
+        self._last_layout_viewport_width = viewport_width
         self.updateGeometry()
         if self.list_item:
             self.list_item.setSizeHint(self.sizeHint())
@@ -3532,7 +4517,8 @@ class TaskProgressWidget(QWidget):
         super().resizeEvent(event)
         self._schedule_sync()
 
-    def _schedule_sync(self):
+    def _schedule_sync(self, force=False):
+        self._sync_force_requested = self._sync_force_requested or force
         if self._sync_pending:
             return
         self._sync_pending = True
@@ -3540,7 +4526,9 @@ class TaskProgressWidget(QWidget):
 
     def _run_scheduled_sync(self):
         self._sync_pending = False
-        self._sync_geometry()
+        force = self._sync_force_requested
+        self._sync_force_requested = False
+        self._sync_geometry(force=force)
 
     def _calculate_bubble_width(self):
         max_width = self._get_max_bubble_width()
@@ -3633,7 +4621,13 @@ class CropImageLabel(QLabel):
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMouseTracking(True)
-        self.setStyleSheet("background-color: #1f1f1f; border: 1px solid #444;")
+        self.setStyleSheet(
+            "background-color: %s; border: 1px solid %s;"
+            % (
+                self.palette().color(QPalette.ColorRole.Window).name(),
+                self.palette().color(QPalette.ColorRole.Mid).name(),
+            )
+        )
         self.setMinimumSize(720, 460)
         self._update_scaled_pixmap()
 
@@ -3755,10 +4749,18 @@ class CropImageLabel(QLabel):
 
 
 class ImageCropDialog(QDialog):
-    def __init__(self, pixmap, target_size=None, parent=None):
+    def __init__(
+        self,
+        pixmap,
+        target_size=None,
+        parent=None,
+        title="裁剪聊天背景",
+        target_label="背景板",
+        minimum_size=(860, 620),
+    ):
         super().__init__(parent)
-        self.setWindowTitle("裁剪聊天背景")
-        self.setMinimumSize(860, 620)
+        self.setWindowTitle(title)
+        self.setMinimumSize(*minimum_size)
         self._result_pixmap = pixmap
         self.target_size = target_size or QSize()
         self.aspect_ratio = None
@@ -3768,7 +4770,10 @@ class ImageCropDialog(QDialog):
         layout = QVBoxLayout(self)
         helper_text = "拖拽框选要显示的区域，不框选则使用整张图片。"
         if self.aspect_ratio:
-            helper_text += f" 当前裁剪框会锁定为背景板比例 {self.target_size.width()}:{self.target_size.height()}。"
+            helper_text += (
+                f" 当前裁剪框会锁定为{target_label}比例 "
+                f"{self.target_size.width()}:{self.target_size.height()}。"
+            )
         layout.addWidget(QLabel(helper_text))
 
         self.crop_label = CropImageLabel(pixmap, self.aspect_ratio, self)
@@ -3798,6 +4803,488 @@ class ImageCropDialog(QDialog):
 
     def get_result_pixmap(self):
         return self._result_pixmap
+
+
+class SimpleFontDialog(QDialog):
+    """Font family and size picker without unsupported style/effect options."""
+
+    def __init__(self, current_font, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.family_combo = QFontComboBox()
+        self.family_combo.setCurrentFont(current_font)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(8, 32)
+        self.size_spin.setSuffix(" pt")
+        self.size_spin.setValue(clamp_chat_font_size(current_font.pointSize(), 10))
+        form.addRow("\u5b57\u4f53", self.family_combo)
+        form.addRow("\u5b57\u53f7", self.size_spin)
+        root.addLayout(form)
+
+        self.preview = QLabel("AaBbYyZz\n\u4f60\u597d\uff0cAI \u52a9\u624b")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(110)
+        self.preview.setStyleSheet(
+            "border:1px solid #cbd5e1; border-radius:6px; "
+            "background:#f8fafc; color:#111827;"
+        )
+        root.addWidget(self.preview)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.family_combo.currentFontChanged.connect(self._update_preview)
+        self.size_spin.valueChanged.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self, _value=None):
+        self.preview.setFont(self.selected_font())
+
+    def selected_font(self):
+        font = self.family_combo.currentFont()
+        font.setPointSize(self.size_spin.value())
+        return font
+
+
+class ChatAppearanceDialog(QDialog):
+    """统一预览并保存聊天背景、气泡、代码块和字体外观。"""
+
+    BACKGROUND_MODES = (
+        ("fill", "填充（保持比例，可能裁剪）"),
+        ("fit", "适应（保持比例，可能留边）"),
+        ("stretch", "拉伸（完整显示）"),
+        ("tile", "平铺"),
+        ("center", "居中"),
+    )
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent or owner)
+        self.owner = owner
+        self._original = owner._read_chat_appearance_state()
+        self.values = dict(self._original)
+        self.setWindowTitle("聊天外观")
+        self.setMinimumWidth(640)
+
+        root = QVBoxLayout(self)
+        tip = QLabel("修改会实时预览；点击“确定”后保存，取消则恢复原来的外观。")
+        tip.setStyleSheet("color:#64748b;")
+        root.addWidget(tip)
+
+        root.addWidget(self._build_background_group())
+        root.addWidget(self._build_bubble_group())
+        root.addWidget(self._build_code_group())
+        root.addWidget(self._build_text_group())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self._refresh_background_status()
+        for key in (
+            "bubble_user_color",
+            "bubble_assistant_color",
+            "code_block_color",
+        ):
+            self._refresh_color_button(key)
+        self._refresh_font_labels()
+
+    def _build_background_group(self):
+        group = QGroupBox("背景")
+        form = QFormLayout(group)
+        self.background_status = QLabel()
+        self.background_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        form.addRow("当前背景", self.background_status)
+
+        background_buttons = QHBoxLayout()
+        choose_button = QPushButton("选择背景...")
+        reset_button = QPushButton("恢复默认背景")
+        choose_button.clicked.connect(self._choose_background)
+        reset_button.clicked.connect(self._reset_background)
+        background_buttons.addWidget(choose_button)
+        background_buttons.addWidget(reset_button)
+        background_buttons.addStretch(1)
+        form.addRow("", background_buttons)
+
+        self.background_mode_combo = QComboBox()
+        for mode, label in self.BACKGROUND_MODES:
+            self.background_mode_combo.addItem(label, mode)
+        index = self.background_mode_combo.findData(self.values["background_mode"])
+        self.background_mode_combo.setCurrentIndex(max(0, index))
+        self.background_mode_combo.currentIndexChanged.connect(
+            self._on_background_mode_changed
+        )
+        form.addRow("显示模式", self.background_mode_combo)
+
+        self.background_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_opacity_slider.setRange(0, 100)
+        self.background_opacity_slider.setValue(
+            round(self.values["background_opacity"] * 100)
+        )
+        self.background_opacity_slider.setToolTip("调整聊天区背景图的不透明度")
+        self.background_opacity_label = QLabel(
+            f'{self.values["background_opacity"]:.2f}'
+        )
+        background_opacity_row = QHBoxLayout()
+        background_opacity_row.addWidget(self.background_opacity_slider, 1)
+        background_opacity_row.addWidget(self.background_opacity_label)
+        self.background_opacity_slider.valueChanged.connect(
+            self._on_background_opacity_changed
+        )
+        form.addRow("背景透明度", background_opacity_row)
+        return group
+
+    def _build_bubble_group(self):
+        group = QGroupBox("气泡")
+        form = QFormLayout(group)
+        self.color_buttons = {}
+        self.color_labels = {}
+        form.addRow("我的气泡颜色", self._build_color_row("bubble_user_color"))
+        form.addRow(
+            "AI 气泡颜色",
+            self._build_color_row("bubble_assistant_color"),
+        )
+        self.bubble_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bubble_opacity_slider.setRange(0, 100)
+        self.bubble_opacity_slider.setValue(round(self.values["bubble_opacity"] * 100))
+        self.bubble_opacity_label = QLabel(
+            f'{self.values["bubble_opacity"]:.2f}'
+        )
+        bubble_opacity_row = QHBoxLayout()
+        bubble_opacity_row.addWidget(self.bubble_opacity_slider, 1)
+        bubble_opacity_row.addWidget(self.bubble_opacity_label)
+        self.bubble_opacity_slider.valueChanged.connect(
+            self._on_bubble_opacity_changed
+        )
+        form.addRow("气泡透明度", bubble_opacity_row)
+        return group
+
+    def _build_code_group(self):
+        group = QGroupBox("代码块")
+        form = QFormLayout(group)
+        form.addRow("代码块颜色", self._build_color_row("code_block_color"))
+
+        self.code_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.code_opacity_slider.setRange(0, 100)
+        self.code_opacity_slider.setValue(round(self.values["code_opacity"] * 100))
+        self.code_opacity_label = QLabel(f'{self.values["code_opacity"]:.2f}')
+        code_opacity_row = QHBoxLayout()
+        code_opacity_row.addWidget(self.code_opacity_slider, 1)
+        code_opacity_row.addWidget(self.code_opacity_label)
+        self.code_opacity_slider.valueChanged.connect(
+            self._on_code_opacity_changed
+        )
+        form.addRow("代码块透明度", code_opacity_row)
+
+        self.code_font_label = QLabel()
+        code_font_button = QPushButton("选择字体...")
+        code_font_button.clicked.connect(
+            lambda: self._choose_font("code", "选择代码块字体")
+        )
+        code_font_row = QHBoxLayout()
+        code_font_row.addWidget(self.code_font_label, 1)
+        code_font_row.addWidget(code_font_button)
+        form.addRow("代码字体", code_font_row)
+        return group
+
+    def _build_text_group(self):
+        group = QGroupBox("正文")
+        form = QFormLayout(group)
+        self.chat_font_label = QLabel()
+        chat_font_button = QPushButton("选择字体...")
+        chat_font_button.clicked.connect(
+            lambda: self._choose_font("chat", "选择聊天正文字体")
+        )
+        chat_font_row = QHBoxLayout()
+        chat_font_row.addWidget(self.chat_font_label, 1)
+        chat_font_row.addWidget(chat_font_button)
+        form.addRow("聊天正文字体", chat_font_row)
+        return group
+
+    def _build_color_row(self, key):
+        row = QHBoxLayout()
+        button = QPushButton()
+        button.setFixedSize(54, 26)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(
+            lambda checked=False, color_key=key: self._choose_color(color_key)
+        )
+        value_label = QLabel()
+        value_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        row.addWidget(button)
+        row.addWidget(value_label)
+        row.addStretch(1)
+        self.color_buttons[key] = button
+        self.color_labels[key] = value_label
+        return row
+
+    def _refresh_color_button(self, key):
+        color = normalize_hex_color(self.values[key], DEFAULT_CODE_BLOCK_COLOR)
+        self.values[key] = color
+        self.color_buttons[key].setStyleSheet(
+            "QPushButton {"
+            f"background-color:{color};"
+            "border:1px solid #64748b; border-radius:5px;"
+            "}"
+        )
+        self.color_buttons[key].setToolTip(f"点击选择颜色，当前 {color}")
+        self.color_labels[key].setText(color)
+
+    def _refresh_background_status(self):
+        path = str(self.values.get("background_path") or "")
+        if path and os.path.isfile(path):
+            self.background_status.setText(os.path.basename(path))
+            self.background_status.setToolTip(path)
+        else:
+            self.values["background_path"] = ""
+            self.background_status.setText("默认背景")
+            self.background_status.setToolTip("")
+
+    def _refresh_font_labels(self):
+        self.chat_font_label.setText(
+            f'{self.values["chat_font_family"]}  {self.values["chat_font_size"]} pt'
+        )
+        self.code_font_label.setText(
+            f'{self.values["code_font_family"]}  {self.values["code_font_size"]} pt'
+        )
+
+    def _choose_color(self, key):
+        title = {
+            "bubble_user_color": "选择我的气泡颜色",
+            "bubble_assistant_color": "选择 AI 气泡颜色",
+            "code_block_color": "选择代码块颜色",
+        }.get(key, "选择颜色")
+        selected = QColorDialog.getColor(QColor(self.values[key]), self, title)
+        if not selected.isValid():
+            return
+        self.values[key] = selected.name().upper()
+        self._refresh_color_button(key)
+        self._preview()
+
+    def _choose_background(self):
+        path = self.owner.choose_chat_background()
+        if not path:
+            return
+        self.values["background_path"] = path
+        self._refresh_background_status()
+        self._preview()
+
+    def _reset_background(self):
+        self.values["background_path"] = ""
+        self._refresh_background_status()
+        self._preview()
+
+    def _on_background_mode_changed(self, _index):
+        self.values["background_mode"] = self.background_mode_combo.currentData()
+        self._preview()
+
+    def _on_background_opacity_changed(self, value):
+        self.values["background_opacity"] = value / 100.0
+        self.background_opacity_label.setText(
+            f'{self.values["background_opacity"]:.2f}'
+        )
+        self._preview()
+
+    def _on_bubble_opacity_changed(self, value):
+        self.values["bubble_opacity"] = value / 100.0
+        self.bubble_opacity_label.setText(f'{self.values["bubble_opacity"]:.2f}')
+        self._preview()
+
+    def _on_code_opacity_changed(self, value):
+        self.values["code_opacity"] = value / 100.0
+        self.code_opacity_label.setText(f'{self.values["code_opacity"]:.2f}')
+        self._preview()
+
+    def _choose_font(self, kind, title):
+        if kind == "code":
+            current_font = QFont(
+                self.values["code_font_family"],
+                self.values["code_font_size"],
+            )
+        else:
+            current_font = QFont(
+                self.values["chat_font_family"],
+                self.values["chat_font_size"],
+            )
+        dialog = SimpleFontDialog(current_font, title, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        font = dialog.selected_font()
+        prefix = "code" if kind == "code" else "chat"
+        self.values[f"{prefix}_font_family"] = font.family()
+        self.values[f"{prefix}_font_size"] = clamp_chat_font_size(
+            font.pointSize(),
+            10,
+        )
+        self._refresh_font_labels()
+        self._preview()
+
+    def _preview(self):
+        self.owner.preview_chat_appearance(self.values)
+
+
+class AvatarSettingsDialog(QDialog):
+    """集中设置用户和 AI 助手的全局聊天头像。"""
+    AVATAR_KINDS = (
+        ("user", "我的头像"),
+        ("assistant", "AI 助手头像"),
+    )
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self._pending_pixmaps = {}
+        self._reset_kinds = set()
+        self.avatar_labels = {}
+        self.avatar_status_labels = {}
+        self.setWindowTitle("头像与身份")
+        self.setMinimumWidth(620)
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("用户头像和 AI 助手头像均为全局设置，保存后立即生效。"))
+
+        avatar_row = QHBoxLayout()
+        for avatar_kind, title in self.AVATAR_KINDS:
+            group = QGroupBox(title)
+            group_layout = QVBoxLayout(group)
+            preview = QLabel()
+            preview.setFixedSize(144, 144)
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setStyleSheet(
+                "background:#edf2f7; border:1px solid #cbd5e1; border-radius:72px;"
+            )
+            group_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignHCenter)
+            status = QLabel()
+            status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            status.setStyleSheet("color:#64748b;")
+            group_layout.addWidget(status)
+
+            button_row = QHBoxLayout()
+            choose_button = QPushButton("更换图片")
+            reset_button = QPushButton("恢复默认")
+            choose_button.clicked.connect(
+                lambda checked=False, kind=avatar_kind: self._choose_avatar(kind)
+            )
+            reset_button.clicked.connect(
+                lambda checked=False, kind=avatar_kind: self._reset_avatar(kind)
+            )
+            button_row.addWidget(choose_button)
+            button_row.addWidget(reset_button)
+            group_layout.addLayout(button_row)
+            avatar_row.addWidget(group)
+            self.avatar_labels[avatar_kind] = preview
+            self.avatar_status_labels[avatar_kind] = status
+        root.addLayout(avatar_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._refresh_previews()
+
+    def _choose_avatar(self, avatar_kind):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择头像图片",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if not file_path:
+            return
+        pixmap = load_avatar_source_pixmap(file_path)
+        if pixmap.isNull():
+            QMessageBox.warning(
+                self,
+                "图片无效",
+                "无法加载所选图片，或文件超过 20MB，请换一张试试。",
+            )
+            return
+
+        title = "裁剪用户头像" if avatar_kind == "user" else "裁剪 AI 助手头像"
+        crop_dialog = ImageCropDialog(
+            pixmap,
+            target_size=QSize(AVATAR_OUTPUT_SIDE, AVATAR_OUTPUT_SIDE),
+            parent=self,
+            title=title,
+            target_label="头像",
+            minimum_size=(720, 560),
+        )
+        if crop_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        cropped = crop_dialog.get_result_pixmap()
+        if cropped.isNull():
+            QMessageBox.warning(self, "裁剪失败", "裁剪结果为空，请重新选择。")
+            return
+        self._pending_pixmaps[avatar_kind] = cropped
+        self._reset_kinds.discard(avatar_kind)
+        self._refresh_previews()
+
+    def _reset_avatar(self, avatar_kind):
+        self._pending_pixmaps.pop(avatar_kind, None)
+        self._reset_kinds.add(avatar_kind)
+        self._refresh_previews()
+
+    def _preview_pixmap(self, avatar_kind):
+        if avatar_kind in self._pending_pixmaps:
+            return self._pending_pixmaps[avatar_kind]
+        if avatar_kind in self._reset_kinds:
+            path = get_default_avatar_path(avatar_kind)
+        else:
+            path = self.config.get_avatar_path(avatar_kind)
+        return QPixmap(path)
+
+    def _refresh_previews(self):
+        for avatar_kind, title in self.AVATAR_KINDS:
+            pixmap = self._preview_pixmap(avatar_kind)
+            circular = make_circular_avatar(pixmap, 128)
+            label = self.avatar_labels[avatar_kind]
+            if circular.isNull():
+                label.clear()
+                label.setText("无法预览")
+            else:
+                label.setPixmap(circular)
+
+            if avatar_kind in self._pending_pixmaps:
+                status = "新头像将在保存后生效"
+            elif avatar_kind in self._reset_kinds:
+                status = "将恢复为默认头像"
+            elif self.config.get_custom_avatar_path(avatar_kind):
+                status = "当前使用自定义头像"
+            else:
+                status = "当前使用默认头像"
+            self.avatar_status_labels[avatar_kind].setText(status)
+
+    def accept(self):
+        for avatar_kind, _title in self.AVATAR_KINDS:
+            try:
+                pending = self._pending_pixmaps.get(avatar_kind)
+                if pending is not None:
+                    saved_path = save_avatar_pixmap(pending, avatar_kind)
+                    self.config.set_avatar_path(avatar_kind, saved_path)
+                elif avatar_kind in self._reset_kinds:
+                    self.config.clear_avatar_path(avatar_kind)
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "保存失败", f"无法保存头像：{error}")
+                return
+        super().accept()
 
 
 class PetWebView(QWebEngineView):
@@ -3968,10 +5455,11 @@ class PetSpeechBubble(QWidget):
         self.hide()
 
     def set_message(self, text, accent=None):
-        message = str(text or "").strip()
+        message = pet_bubble_text(text)
         if not message:
+            self._message = ""
             self.hide()
-            return
+            return False
         self._message = message
         if accent:
             self._accent = QColor(accent)
@@ -3987,6 +5475,7 @@ class PetSpeechBubble(QWidget):
         self.text_label.setText(message)
         self._update_layout()
         self.update()
+        return True
 
     def set_scale(self, scale):
         self._display_scale = max(0.7, min(1.4, float(scale)))
@@ -4244,6 +5733,7 @@ PET_DRAG_STAGE_SCRIPT = r"""
         model.setParameterValueByIndex(formIndex, -0.5 + 0.6 * clamp(mouth.open, 0, 1));
       }
     }
+    window.__petActivityPre && window.__petActivityPre(model, dt);
     } catch (err) { stageError("pre", err); }
   };
 
@@ -4257,9 +5747,10 @@ PET_DRAG_STAGE_SCRIPT = r"""
       for (let i = 0; i < list.length; i++) { ops[list[i]] = ops[list[i]] * propK; }
     }
 
+    const act = window.__petActivityPose ? window.__petActivityPose() : null;
     if (stage.phase === "idle" && propK === 1) {
       if (Math.abs(rot) < 0.05 && Math.abs(lift) < 0.05 && Math.abs(squash - 1) < 0.002) {
-        if (rot === 0 && lift === 0 && squash === 1) { return; }
+        if (!act && rot === 0 && lift === 0 && squash === 1) { return; }
         rot = 0;
         lift = 0;
         squash = 1;
@@ -4270,10 +5761,150 @@ PET_DRAG_STAGE_SCRIPT = r"""
     if (!canvas) { return; }
     if (baseTransform === null) { baseTransform = canvas.style.transform || ""; }
     canvas.style.transformOrigin = "50% 74%";
-    canvas.style.transform = baseTransform + " translateY(" + lift.toFixed(2) + "px) rotate(" + rot.toFixed(2) + "deg) scaleY(" + squash.toFixed(3) + ")";
+    const actLift = act ? act.lift : 0;
+    const actRot = act ? act.rot : 0;
+    const actScale = act ? act.scaleY : 1;
+    canvas.style.transform = baseTransform + " translateY(" + (lift + actLift).toFixed(2) + "px) rotate(" + (rot + actRot).toFixed(2) + "deg) scaleY(" + (squash * actScale).toFixed(3) + ")";
     } catch (err) { stageError("post", err); }
   };
-})();
+})();
+
+"""
+
+
+
+# ======================== 桌宠活动反馈（思考/工作/完成） ========================
+PET_ACTIVITY_ENABLED = True
+PET_ACTIVITY_DONE_MS = 1600          # 完成庆祝动作时长
+PET_ACTIVITY_HINT_MS = 4000          # 工作进度气泡停留时长
+PET_ACTIVITY_HINT_MIN_GAP = 1200     # 两条工作气泡之间的最小间隔（毫秒）
+PET_ACTIVITY_SCRIPT = r"""
+// 桌宠活动反馈层：思考/工作/完成时的轻量动作。
+// 只动眼神、眉毛、问号/星星与轻微位移；拖拽演出（phase != idle）时整层让位。
+(() => {
+  if (window.__petActivityReady) { return; }
+  window.__petActivityReady = true;
+
+  const state = { name: "idle", at: performance.now() };
+  window.__petActivityState = state;
+
+  window.__petActivitySet = function (name) {
+    const next = String(name || "idle");
+    if (next === state.name) { return; }
+    state.name = next;
+    state.at = performance.now();
+  };
+
+  // 点击桌宠不再暂停动作层：原生 TapBody 动作与眼神/问号轻微叠加可以接受
+
+  const PARAM_IDS = ["ParamEyeBallX", "ParamEyeBallY", "ParamEyeLOpen", "ParamEyeROpen",
+                     "ParamBrowLForm", "ParamBrowRForm", "ParamCheek74", "ParamCheek16"];
+  let indexModel = null;
+  let indexMap = null;
+
+  function indexes(model) {
+    if (indexModel === model && indexMap) { return indexMap; }
+    const ids = Array.from(model._model.parameters.ids);
+    const map = {};
+    for (let i = 0; i < PARAM_IDS.length; i++) { map[PARAM_IDS[i]] = ids.indexOf(PARAM_IDS[i]); }
+    indexModel = model;
+    indexMap = map;
+    return map;
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function approach(current, target, dt, rate) {
+    return current + (target - current) * Math.min(1, dt * rate);
+  }
+
+  const eased = { eyeX: 0, eyeY: 0, brow: 0, question: 0, star: 0, squint: 0 };
+  let lastTick = performance.now();
+
+  function write(model, map, id, value) {
+    const index = map[id];
+    if (index >= 0) { model.setParameterValueByIndex(index, value); }
+  }
+
+  window.__petActivityPre = function (model, dt) { try {
+    const now = performance.now();
+    dt = clamp(Number(dt) || (now - lastTick) / 1000, 0.001, 0.05);
+    lastTick = now;
+    const phase = (window.__petStage && window.__petStage.phase) || "idle";
+    if (phase !== "idle") { return; }
+
+    const name = state.name;
+    if (name === "done" && (now - state.at) / 1000 > 2.5) { window.__petActivitySet("idle"); }
+
+    const thinking = name === "thinking";
+    const working = name === "working" || name === "waiting";
+    const done = name === "done";
+    const wanted = {
+      eyeX: thinking ? -0.5 : 0,
+      eyeY: thinking ? 0.6 : 0,
+      brow: (thinking || done) ? 0.6 : 0,
+      question: ((thinking && (now % 3200) < 1100) || (working && (now % 2800) < 900)) ? 1 : 0,
+      star: done ? 1 : 0,
+      squint: working ? 1 : 0
+    };
+    eased.eyeX = approach(eased.eyeX, wanted.eyeX, dt, 5);
+    eased.eyeY = approach(eased.eyeY, wanted.eyeY, dt, 5);
+    eased.brow = approach(eased.brow, wanted.brow, dt, 5);
+    eased.question = approach(eased.question, wanted.question, dt, 6);
+    eased.star = approach(eased.star, wanted.star, dt, 8);
+    eased.squint = approach(eased.squint, wanted.squint, dt, 5);
+
+    const total = Math.abs(eased.eyeX) + Math.abs(eased.eyeY) + eased.brow
+      + eased.question + eased.star + eased.squint;
+    if (total < 0.004) { return; }
+
+    const map = indexes(model);
+    write(model, map, "ParamEyeBallX", eased.eyeX);
+    write(model, map, "ParamEyeBallY", eased.eyeY);
+    write(model, map, "ParamBrowLForm", eased.brow);
+    write(model, map, "ParamBrowRForm", eased.brow);
+    write(model, map, "ParamCheek74", eased.question);
+    write(model, map, "ParamCheek16", eased.star);
+    if (eased.squint > 0.004) {
+      const factor = 1 - 0.22 * eased.squint;
+      const eyeIds = ["ParamEyeLOpen", "ParamEyeROpen"];
+      for (let i = 0; i < eyeIds.length; i++) {
+        const index = map[eyeIds[i]];
+        if (index >= 0) {
+          const current = model.getParameterValueByIndex(index);
+          model.setParameterValueByIndex(index, current * factor);
+        }
+      }
+    }
+  } catch (err) { window.__petActivityErr = String((err && err.message) ? err.message : err); } };
+
+  let poseActive = false;
+  window.__petActivityPose = function () { try {
+    const now = performance.now();
+    const phase = (window.__petStage && window.__petStage.phase) || "idle";
+    const name = phase === "idle" ? state.name : "idle";
+    const elapsed = (now - state.at) / 1000;
+    let pose = null;
+    if (name === "thinking") {
+      pose = { lift: -1.5, rot: -2.4 + Math.sin(now / 900) * 1.1, scaleY: 1 };
+    } else if (name === "working" || name === "waiting") {
+      pose = { lift: Math.abs(Math.sin(now / 300)) * 6, rot: Math.sin(now / 650) * 1.5, scaleY: 1 };
+    } else if (name === "done" && elapsed < 1.6) {
+      const decay = Math.pow(1 - Math.min(1, elapsed / 1.6), 2);
+      pose = {
+        lift: -Math.abs(Math.sin(elapsed * Math.PI * 3.2)) * 8 * decay,
+        rot: Math.sin(elapsed * Math.PI * 4.0) * 4 * decay,
+        scaleY: 1 + 0.05 * decay * Math.sin(elapsed * Math.PI * 6.4)
+      };
+    }
+    if (pose) { poseActive = true; return pose; }
+    if (poseActive) { poseActive = false; return { lift: 0, rot: 0, scaleY: 1 }; }
+    return null;
+  } catch (err) {
+    window.__petActivityErr = String((err && err.message) ? err.message : err);
+    return null;
+  } };
+})();
+
 """
 
 
@@ -4299,10 +5930,19 @@ class DesktopPetWindow(QWidget):
         self.model_scale = self.chat_window.config.get_pet_model_scale()
         self._speech_queue = []
         self._speech_stream_buffer = ""
-        self._speech_markup_filter = KaomojiStreamFilter()
+        self._speech_markup_filter = PetSpeechStreamFilter()
         self._speech_stream_received = False
         self._speech_playing = False
         self._tts_speech_active = False
+        self._activity = "idle"
+        self._activity_done_timer = QTimer(self)
+        self._activity_done_timer.setSingleShot(True)
+        self._activity_done_timer.timeout.connect(self._pet_activity_done)
+        self._activity_hint_timer = QTimer(self)
+        self._activity_hint_timer.setSingleShot(True)
+        self._activity_hint_timer.timeout.connect(self._hide_activity_hint)
+        self._activity_hint_text = ""
+        self._activity_hint_at = 0.0
         self._kaomoji = "(｡•ᴗ•｡)"
         self._bubble_accent = "#64748B"
         self._mouth_words = []
@@ -4350,6 +5990,7 @@ class DesktopPetWindow(QWidget):
             QTimer.singleShot(400, self.load_live2d_model)
         self.webview.loadFinished.connect(lambda _ok: self._clear_canvas_scale())
         self.webview.loadFinished.connect(lambda _ok: self._install_pet_drag_stage())
+        self.webview.loadFinished.connect(lambda _ok: self._install_pet_activity())
 
     def load_live2d_model(self):
         if self.live2d_server:
@@ -4466,7 +6107,9 @@ class DesktopPetWindow(QWidget):
         self.speech_bubble.raise_()
 
     def _show_bubble(self, text):
-        self.speech_bubble.set_message(text, self._bubble_accent)
+        if not self.speech_bubble.set_message(text, self._bubble_accent):
+            self.speech_bubble.hide()
+            return
         if not self.isVisible():
             self.speech_bubble.hide()
             return
@@ -4483,6 +6126,8 @@ class DesktopPetWindow(QWidget):
             return
         self._speech_playing = False
         self._speech_stream_received = False
+        if self._activity_hint_text and self.speech_bubble._message == self._activity_hint_text:
+            return
         self.speech_bubble.hide()
 
     def _enqueue_speech(self, text):
@@ -4785,8 +6430,79 @@ class DesktopPetWindow(QWidget):
             return
         self._push_pet_drag_stage(phase, 0.0, 0.0)
 
+    def _install_pet_activity(self):
+        """思考/工作/完成反馈脚本：随页面加载重装，并重放当前状态。"""
+        if not PET_ACTIVITY_ENABLED or self.webview is None:
+            return
+        self.webview.page().runJavaScript(PET_ACTIVITY_SCRIPT)
+        self._push_pet_activity(self._activity)
+
+    def _push_pet_activity(self, name):
+        if not PET_ACTIVITY_ENABLED or self.webview is None:
+            return
+        script = "window.__petActivitySet && window.__petActivitySet(%s);" % json.dumps(name)
+        self.webview.page().runJavaScript(script)
+
+    def set_pet_activity(self, name, hint=None):
+        """设置桌宠活动反馈：idle / thinking / working / waiting / done。"""
+        name = str(name or "idle").strip() or "idle"
+        self._activity_done_timer.stop()
+        if name != self._activity:
+            self._activity = name
+            self._push_pet_activity(name)
+        if hint:
+            self.show_activity_hint(hint)
+        elif name not in ("working", "waiting"):
+            self._clear_activity_hint()
+        if name == "done":
+            self._activity_done_timer.start(PET_ACTIVITY_DONE_MS)
+
+    def show_activity_hint(self, text):
+        """工作进度用气泡播报；说话或口型进行中不抢气泡。"""
+        text = str(text or "").strip()
+        shown = pet_bubble_text(text) if text else ""
+        if not shown or not self.isVisible():
+            return
+        if (
+            self._tts_speech_active
+            or self._speech_playing
+            or self._speech_queue
+            or self._speech_stream_received
+        ):
+            return
+        if shown == self._activity_hint_text and self.speech_bubble.isVisible():
+            return
+        now = time.monotonic()
+        if now - self._activity_hint_at < PET_ACTIVITY_HINT_MIN_GAP / 1000.0:
+            return
+        self._activity_hint_text = shown
+        self._activity_hint_at = now
+        self._show_bubble(text)
+        self._activity_hint_timer.start(PET_ACTIVITY_HINT_MS)
+
+    def _pet_activity_done(self):
+        self.set_pet_activity("idle")
+
+    def _hide_activity_hint(self):
+        self._clear_activity_hint()
+
+    def _clear_activity_hint(self):
+        """只收自己播报的那条气泡，不误伤说话/颜文字气泡。"""
+        self._activity_hint_timer.stop()
+        owns_bubble = (
+            bool(self._activity_hint_text)
+            and self.speech_bubble._message == self._activity_hint_text
+        )
+        self._activity_hint_text = ""
+        if not owns_bubble:
+            return
+        if self._tts_speech_active or self._speech_playing or self._speech_queue:
+            return
+        self.speech_bubble.hide()
+
     def show_context_menu(self, global_pos):
         menu = QMenu(self)
+        style_popup_menu(menu, getattr(self.chat_window, "ui_theme", "dark"))
         if self.chat_window.isVisible():
             toggle_action = menu.addAction("隐藏聊天窗口")
         else:
@@ -4849,6 +6565,9 @@ class DesktopPetWindow(QWidget):
         return menu
 
     def _update_tray_menu_labels(self):
+        tray_menu = self._tray.contextMenu() if self._tray is not None else None
+        if tray_menu is not None:
+            style_popup_menu(tray_menu, getattr(self.chat_window, "ui_theme", "dark"))
         if self._tray_pet_action is None or self._tray_chat_action is None:
             return
         self._tray_pet_action.setText("隐藏桌宠" if self.isVisible() else "显示桌宠")
@@ -5256,6 +6975,10 @@ class MainWindow(QMainWindow):
         self.db = MessageDatabase()
         ActionHandler.load_apps()
         self.refresh_action_handler_config()
+        try:
+            MCPManager.ensure_started()
+        except Exception:
+            logging.warning("应用启动时启动 MCP server 失败", exc_info=True)
         print(f"已加载应用: {ActionHandler._apps}")
 
         self.roles = self.config.get_roles()
@@ -5277,7 +7000,16 @@ class MainWindow(QMainWindow):
         self.chat_stream_filter = KaomojiStreamFilter()
 
         self.bubble_opacity = self.config.get_bubble_opacity()
+        self.code_opacity = self.config.get_code_opacity()
+        self.background_opacity = self.config.get_chat_background_opacity()
+        self.bubble_user_color = self.config.get_bubble_user_color()
+        self.bubble_assistant_color = self.config.get_bubble_assistant_color()
+        self.code_block_color = self.config.get_code_block_color()
         self.chat_background_mode = self.config.get_chat_background_mode()
+        self.chat_font_family = self.config.get_chat_font_family()
+        self.chat_font_size = self.config.get_chat_font_size()
+        self.code_font_family = self.config.get_code_font_family()
+        self.code_font_size = self.config.get_code_font_size()
         self.tts_thread = None
         self._tts_threads = []
         self.stt_thread = None
@@ -5301,8 +7033,7 @@ class MainWindow(QMainWindow):
         self.motto_timer.start(3600000)
         self.init_menu()
         self.init_live2d_server()
-        saved_bg = self.config.settings.value("chat_bg_image", "")
-        self._apply_chat_background(saved_bg if saved_bg and os.path.exists(saved_bg) else None)
+        self._apply_chat_background(self._resolve_saved_chat_background())
         self.load_system_prompt()
         self.load_history_from_db()
         # 启动唤醒词常驻监听（麦克风）
@@ -5368,6 +7099,182 @@ class MainWindow(QMainWindow):
             if widget and isinstance(widget, ChatMessageWidget):
                 widget.update_opacity(opacity)
                 widget.refresh_layout()
+            elif isinstance(widget, TaskProgressWidget):
+                widget.update_opacity(opacity)
+                widget.refresh_layout()
+
+    def update_all_code_opacity(self, code_opacity):
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            widget = self.chat_list.itemWidget(item)
+            if widget and isinstance(widget, ChatMessageWidget):
+                widget.update_code_opacity(code_opacity)
+
+    def update_all_chat_colors(self):
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            widget = self.chat_list.itemWidget(item)
+            if isinstance(widget, ChatMessageWidget):
+                widget.update_bubble_color(
+                    self.bubble_user_color if widget.is_user else self.bubble_assistant_color
+                )
+                widget.update_code_color(self.code_block_color)
+                widget.refresh_layout()
+            elif isinstance(widget, TaskProgressWidget):
+                widget.update_bubble_color(self.bubble_assistant_color)
+                widget.refresh_layout()
+
+    def _is_chat_at_bottom(self, tolerance=24):
+        scroll_bar = self.chat_list.verticalScrollBar()
+        return scroll_bar.maximum() - scroll_bar.value() <= tolerance
+
+    def _read_chat_appearance_state(self):
+        background_path = str(self._resolve_saved_chat_background() or "")
+        return {
+            "background_path": background_path,
+            "background_mode": self.chat_background_mode,
+            "bubble_user_color": self.bubble_user_color,
+            "bubble_assistant_color": self.bubble_assistant_color,
+            "bubble_opacity": self.bubble_opacity,
+            "background_opacity": self.background_opacity,
+            "code_block_color": self.code_block_color,
+            "code_opacity": self.code_opacity,
+            "chat_font_family": self.chat_font_family,
+            "chat_font_size": self.chat_font_size,
+            "code_font_family": self.code_font_family,
+            "code_font_size": self.code_font_size,
+        }
+
+    def _apply_chat_appearance_state(self, values):
+        self.chat_background_mode = (
+            values.get("background_mode")
+            if values.get("background_mode") in {"fill", "fit", "stretch", "tile", "center"}
+            else "stretch"
+        )
+        self.bubble_user_color = normalize_hex_color(
+            values.get("bubble_user_color"), DEFAULT_BUBBLE_USER_COLOR
+        )
+        self.bubble_assistant_color = normalize_hex_color(
+            values.get("bubble_assistant_color"), DEFAULT_BUBBLE_ASSISTANT_COLOR
+        )
+        self.bubble_opacity = clamp_opacity(values.get("bubble_opacity"), 0.85)
+        self.code_block_color = normalize_hex_color(
+            values.get("code_block_color"), DEFAULT_CODE_BLOCK_COLOR
+        )
+        self.code_opacity = clamp_opacity(values.get("code_opacity"), 0.85)
+        self.background_opacity = clamp_opacity(values.get("background_opacity"), 1.0)
+        self.chat_font_family = str(
+            values.get("chat_font_family") or "Microsoft YaHei UI"
+        )
+        self.chat_font_size = clamp_chat_font_size(values.get("chat_font_size"), 10)
+        self.code_font_family = str(values.get("code_font_family") or "Consolas")
+        self.code_font_size = clamp_chat_font_size(values.get("code_font_size"), 10)
+
+        background_path = str(values.get("background_path") or "")
+        if not background_path or not os.path.isfile(background_path):
+            background_path = ""
+        self._apply_chat_background(background_path or None)
+        self._refresh_background_mode_actions()
+        self.update_all_chat_colors()
+        self.update_all_bubbles_opacity(self.bubble_opacity)
+        self.update_all_code_opacity(self.code_opacity)
+        self.update_all_text_font_widgets()
+
+    def preview_chat_appearance(self, values):
+        self._apply_chat_appearance_state(values)
+
+    def _save_chat_appearance_state(self, values):
+        self._apply_chat_appearance_state(values)
+        self.config.set_bubble_user_color(self.bubble_user_color)
+        self.config.set_bubble_assistant_color(self.bubble_assistant_color)
+        self.config.set_bubble_opacity(self.bubble_opacity)
+        self.config.set_code_block_color(self.code_block_color)
+        self.config.set_code_opacity(self.code_opacity)
+        self.config.set_chat_background_mode(self.chat_background_mode)
+        self.config.set_chat_background_opacity(self.background_opacity)
+        self.config.set_chat_font(QFont(self.chat_font_family, self.chat_font_size))
+        self.config.set_code_font(QFont(self.code_font_family, self.code_font_size))
+        background_path = str(values.get("background_path") or "")
+        if background_path and os.path.isfile(background_path):
+            self.config.settings.setValue(
+                "chat_bg_image", background_path.replace("\\", "/")
+            )
+        else:
+            self.config.settings.remove("chat_bg_image")
+
+    def show_chat_appearance_dialog(self):
+        dialog = ChatAppearanceDialog(self, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_chat_appearance_state(dialog.values)
+            self.status_bar.showMessage("聊天外观已更新", 2000)
+        else:
+            self._apply_chat_appearance_state(dialog._original)
+
+    def update_all_avatar_widgets(self):
+        user_avatar = self.config.get_avatar_path("user")
+        assistant_avatar = self.config.get_avatar_path("assistant")
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            widget = self.chat_list.itemWidget(item)
+            if isinstance(widget, ChatMessageWidget):
+                widget.set_avatar_path(user_avatar if widget.is_user else assistant_avatar)
+                widget.refresh_layout()
+            elif isinstance(widget, TaskProgressWidget):
+                widget.set_avatar_path(assistant_avatar)
+                widget.refresh_layout()
+
+    def show_avatar_dialog(self):
+        dialog = AvatarSettingsDialog(self.config, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.update_all_avatar_widgets()
+        self.status_bar.showMessage("头像已更新", 2000)
+
+    def update_all_text_font_widgets(self):
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            widget = self.chat_list.itemWidget(item)
+            if isinstance(widget, ChatMessageWidget):
+                widget.set_font_settings(
+                    self.chat_font_family,
+                    self.chat_font_size,
+                    self.code_font_family,
+                    self.code_font_size,
+                )
+            elif isinstance(widget, TaskProgressWidget):
+                widget.set_font_settings(self.chat_font_family, self.chat_font_size)
+
+    def show_chat_font_dialog(self):
+        current_font = QFont(self.chat_font_family, self.chat_font_size)
+        dialog = SimpleFontDialog(
+            current_font,
+            "\u9009\u62e9\u804a\u5929\u6b63\u6587\u5b57\u4f53",
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        font = dialog.selected_font()
+        self.chat_font_family = font.family()
+        self.chat_font_size = clamp_chat_font_size(font.pointSize(), 10)
+        self.config.set_chat_font(font)
+        self.update_all_text_font_widgets()
+        self.status_bar.showMessage("聊天正文字体已更新", 2000)
+
+    def show_code_font_dialog(self):
+        current_font = QFont(self.code_font_family, self.code_font_size)
+        dialog = SimpleFontDialog(
+            current_font,
+            "\u9009\u62e9\u4ee3\u7801\u5757\u5b57\u4f53",
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        font = dialog.selected_font()
+        self.code_font_family = font.family()
+        self.code_font_size = clamp_chat_font_size(font.pointSize(), 10)
+        self.config.set_code_font(font)
+        self.update_all_text_font_widgets()
+        self.status_bar.showMessage("代码块字体已更新", 2000)
 
     def refresh_all_message_widgets(self):
         for i in range(self.chat_list.count()):
@@ -5518,22 +7425,39 @@ class MainWindow(QMainWindow):
                 self.session_panel_width = max(220, min(380, sizes[0]))
                 self.config.settings.setValue("session_panel_width", self.session_panel_width)
             self.session_panel.hide()
-    
+
     def _generate_dynamic_system_prompt(self):
         """生成以工具调用为核心的系统提示词。"""
         apps_list = ActionHandler.get_available_apps()
         apps_str = "、".join(apps_list) if apps_list else "无"
 
         # 角色基本设定
-        role_description = self.roles.get(self.current_role_name, "你是一个AI助手，性格友好，乐于助人。") + "\n\n" + (
-            "所有回复都要像日常聊天一样自然，不分点、不罗列，想到哪说到哪。不要暴露自己是模型。"
-            "禁止使用任何非中文日常符号，比如星号*、下划线_之类的都不要出现。"
-            "你可以称呼用户为“大白鹅”"
-            "称呼不要过于频繁，保持自然即可。"
-)
+        roleplay_mode = self.config.get_roleplay_mode()
+        if roleplay_mode:
+            expression_rule = (
+                "所有回复都要像日常聊天一样自然，想到哪说到哪，不要暴露自己是模型。"
+                "禁止使用 Markdown、列表、标题、表格和代码块等复杂排版格式。"
+                "你可以称呼用户为“大白鹅”，但称呼不要过于频繁，保持自然即可。"
+            )
+            final_format_rule = "最终答复使用自然的中文纯文本，不要输出 Markdown 格式符号。"
+        else:
+            expression_rule = (
+                "回答保持自然、清楚，不要暴露自己是模型。"
+                "你可以根据内容自由使用 Markdown 排版；代码请使用带语言名称的围栏代码块，"
+                "但不要为了排版而堆砌标题、列表或表格。"
+                "你可以称呼用户为“大白鹅”，但称呼不要过于频繁，保持自然即可。"
+            )
+            final_format_rule = (
+                "最终答复可按需使用 Markdown、表格或带语言名称的围栏代码块，"
+                "代码内容不得声称已经执行，除非确实调用过工具。"
+            )
+        role_description = self.roles.get(
+            self.current_role_name,
+            "你是一个AI助手，性格友好，乐于助人。",
+        ) + "\n\n" + expression_rule
         prompt = role_description + """
         【颜文字输出】
-        所有的颜文字，应当使用以下格式输出：<kaomoji>标签</kaomoji> 
+        所有的颜文字，应当使用以下格式输出：<kaomoji>标签</kaomoji>
         例如：“今天的阳光真好呀，心情都变好了～ <kaomoji>(｡•̀ᴗ•́｡)</kaomoji>”
         """
         prompt += f"""
@@ -5552,14 +7476,14 @@ class MainWindow(QMainWindow):
         - 用户问电脑卡不卡、要不要清理、电脑状态是否健康时，先用 health_check 工具做体检，再用通俗语言解读并给出具体建议。
         - 用户想清理磁盘、找大文件、看临时文件占用时，用 disk_scan 工具做只读扫描，列举结果并给出建议；不要删除任何文件，也不要建议执行删除命令。
         - 工具执行完成后，再基于工具返回结果自然回复用户。
-        - 最终答复必须是纯中文自然文本，禁止输出 Markdown 格式符号，例如 **、__、`、#、-、数字列表。
+        - {final_format_rule}
         """
         return prompt
 
     def _format_assistant_text(self, text):
         text = str(text or "")
         text = strip_internal_reasoning(text)
-        return text if self.config.get_roleplay_mode() else sanitize_reply_text(text)
+        return sanitize_reply_text(text) if self.config.get_roleplay_mode() else text
 
     def _get_default_system_prompt(self):
         return self._generate_dynamic_system_prompt() + "\n\n" + SYSTEM_SAFETY_RULES
@@ -5585,10 +7509,11 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("AI桌面助手 - 支持Live2D模型")
         self.setMinimumSize(1000, 700)
+        self.ui_theme = normalize_ui_theme(self.config.get_ui_theme())
 
         central = QWidget()
         central.setObjectName("mainCentral")
-        central.setStyleSheet("#mainCentral { background-color: #1f1f1f; }")
+        self.central_widget = central
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(6, 6, 6, 6)
@@ -5598,9 +7523,6 @@ class MainWindow(QMainWindow):
         self.session_panel.setObjectName("sessionPanel")
         self.session_panel.setMinimumWidth(220)
         self.session_panel.setMaximumWidth(380)
-        self.session_panel.setStyleSheet(
-            "#sessionPanel { background-color: #252525; border-right: 1px solid #444444; }"
-        )
         session_layout = QVBoxLayout(self.session_panel)
         session_layout.setContentsMargins(12, 12, 12, 12)
         session_layout.setSpacing(10)
@@ -5613,61 +7535,38 @@ class MainWindow(QMainWindow):
             brand_icon.setPixmap(app_icon)
         brand_icon.setFixedSize(28, 28)
         brand_layout.addWidget(brand_icon)
-        brand_title = QLabel("Aissist")
-        brand_title.setStyleSheet("color: #eeeeee; font-size: 19px; font-weight: 700;")
-        brand_layout.addWidget(brand_title)
+        self.brand_title = QLabel("Aissistant")
+        brand_layout.addWidget(self.brand_title)
         brand_layout.addStretch(1)
         session_layout.addLayout(brand_layout)
 
         session_header = QHBoxLayout()
-        session_label = QLabel("会话")
-        session_label.setStyleSheet("color: #d7d7d7; font-size: 14px; font-weight: 600;")
-        session_header.addWidget(session_label)
+        self.session_label = QLabel("会话")
+        session_header.addWidget(self.session_label)
         session_header.addStretch(1)
         session_layout.addLayout(session_header)
         self.session_search = QLineEdit()
         self.session_search.setPlaceholderText("搜索会话")
-        self.session_search.setStyleSheet(
-            "QLineEdit { background: #303030; color: #eeeeee; border: 1px solid #4b4b4b; "
-            "border-radius: 4px; padding: 4px 7px; }"
-            "QLineEdit:focus { border: 1px solid #6688aa; }"
-        )
         self.session_search.textChanged.connect(self.refresh_session_list)
         session_layout.addWidget(self.session_search)
         self.session_list = QListWidget()
         self.session_list.setSpacing(2)
-        self.session_list.setStyleSheet(
-            "QListWidget { background: transparent; color: #eeeeee; border: none; padding: 2px 0; }"
-            "QListWidget::item { padding: 8px 9px; border-radius: 5px; }"
-            "QListWidget::item:hover { background: #383838; }"
-            "QListWidget::item:selected { background: #34495e; color: #ffffff; }"
-        )
         self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self._show_session_context_menu)
         self.session_list.itemClicked.connect(self._on_session_item_activated)
         session_layout.addWidget(self.session_list, 1)
 
-        session_separator = QWidget()
-        session_separator.setFixedHeight(1)
-        session_separator.setStyleSheet("background-color: #4b4b4b;")
-        session_layout.addWidget(session_separator)
+        self.session_separator = QWidget()
+        self.session_separator.setFixedHeight(1)
+        session_layout.addWidget(self.session_separator)
         self.new_session_bottom_button = QPushButton("＋  新对话")
         self.new_session_bottom_button.setMinimumHeight(40)
-        self.new_session_bottom_button.setStyleSheet(
-            "QPushButton { background: #29465f; color: #52a9ff; border: none; border-radius: 20px; "
-            "font-size: 15px; font-weight: 600; }"
-            "QPushButton:hover { background: #345a79; }"
-            "QPushButton:pressed { background: #223d53; }"
-        )
         self.new_session_bottom_button.clicked.connect(self.new_session)
         session_layout.addWidget(self.new_session_bottom_button)
 
         # 会话栏右侧的内容区，背景只绘制在这里，不覆盖会话栏
         self.content_panel = QWidget()
         self.content_panel.setObjectName("contentPanel")
-        self.content_panel.setStyleSheet(
-            "#contentPanel { border: 1px solid #46515f; border-radius: 16px; background: transparent; }"
-        )
         content_layout = QHBoxLayout(self.content_panel)
         content_layout.setContentsMargins(14, 14, 14, 14)
         content_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -5682,7 +7581,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.chat_list = QListWidget()
+        self.chat_list = SmoothChatListWidget()
         self.chat_list.setUniformItemSizes(False)
         self.chat_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.chat_list.setSpacing(5)
@@ -5703,17 +7602,6 @@ class MainWindow(QMainWindow):
         self.composer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.composer.setMinimumHeight(116)
         self.composer.setMaximumHeight(210)
-        self.composer.setStyleSheet(
-            "#composer { background: rgba(45, 45, 45, 235); border: 1px solid #555; "
-            "border-radius: 12px; }"
-            "QTextEdit { background: transparent; border: none; color: #eeeeee; "
-            "font-size: 15px; padding: 8px 10px; }"
-            "QTextEdit::placeholder { color: #929292; }"
-            "QToolButton { color: #d8d8d8; border: none; border-radius: 18px; padding: 5px 8px; }"
-            "QToolButton:hover { background: #484848; }"
-            "QComboBox { background: #363636; color: #dddddd; border: 1px solid #555; "
-            "border-radius: 5px; padding: 4px 8px; }"
-        )
         composer_layout = QVBoxLayout(self.composer)
         composer_layout.setContentsMargins(8, 6, 8, 8)
         composer_layout.setSpacing(4)
@@ -5730,7 +7618,6 @@ class MainWindow(QMainWindow):
         composer_layout.addWidget(self.input_text)
 
         self.attach_label = QLabel("")
-        self.attach_label.setStyleSheet("color: #aeb8c2; font-size: 12px; padding: 0 8px;")
         self.attach_clear_btn = QToolButton()
         self.attach_clear_btn.setText("×")
         self.attach_clear_btn.setToolTip("清除附件")
@@ -5747,7 +7634,6 @@ class MainWindow(QMainWindow):
         toolbar.setContentsMargins(2, 0, 2, 0)
         self.attach_btn = QToolButton()
         self.attach_btn.setText("+")
-        self.attach_btn.setStyleSheet("QToolButton { color: #d8d8d8; font-size: 22px; border: none; border-radius: 18px; padding: 2px 9px; }")
         self.attach_btn.setToolTip("截图、添加图片或选择文件")
         attach_menu = QMenu(self.attach_btn)
         screenshot_action = attach_menu.addAction("截图")
@@ -5805,13 +7691,11 @@ class MainWindow(QMainWindow):
         self.send_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
         self.send_btn.setIconSize(QSize(21, 21))
         self.send_btn.setToolTip("发送")
-        self.send_btn.setStyleSheet("QToolButton { background: #e7edf2; color: #252a2e; border: none; border-radius: 21px; }")
         self.send_btn.clicked.connect(self.send_message)
         self.stop_btn = QToolButton()
         self.stop_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
         self.stop_btn.setIconSize(QSize(18, 18))
         self.stop_btn.setToolTip("停止生成")
-        self.stop_btn.setStyleSheet("QToolButton { background: #d85c5c; color: white; border: none; border-radius: 21px; }")
         self.stop_btn.clicked.connect(self._stop_generation)
         self.action_stack.addWidget(self.send_btn)
         self.action_stack.addWidget(self.stop_btn)
@@ -5852,11 +7736,6 @@ class MainWindow(QMainWindow):
         self.session_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.session_splitter.setChildrenCollapsible(False)
         self.session_splitter.setHandleWidth(4)
-        self.session_splitter.setStyleSheet(
-            "QSplitter { background: transparent; }"
-            "QSplitter::handle { background: #1f1f1f; }"
-            "QSplitter::handle:hover { background: #4c7396; }"
-        )
         self.session_splitter.addWidget(self.session_panel)
         self.session_splitter.addWidget(self.content_panel)
         self.session_splitter.setCollapsible(0, False)
@@ -5871,61 +7750,213 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage(f"就绪 | 当前会话: {self.current_session_id[:8]}...")
         self.refresh_session_list()
+        self._apply_ui_theme()
+
+    def _apply_ui_theme(self):
+        """按当前主题重刷主窗口配色；暗色取值与改动前逐字一致。"""
+        theme = normalize_ui_theme(getattr(self, "ui_theme", "dark"))
+        palette = get_ui_theme_palette(theme)
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(build_ui_palette(theme))
+            app.setStyleSheet(build_scrollbar_stylesheet(palette))
+        apply_native_window_frame_theme(self, theme)
+        self.central_widget.setStyleSheet(
+            "#mainCentral { background-color: %s; }" % palette["window_bg"]
+        )
+        self.session_panel.setStyleSheet(
+            "#sessionPanel { background-color: %s; border-right: 1px solid %s; }"
+            % (palette["panel_bg"], palette["panel_border"])
+        )
+        self.brand_title.setStyleSheet(
+            "color: %s; font-size: 19px; font-weight: 700;" % palette["brand_text"]
+        )
+        self.session_label.setStyleSheet(
+            "color: %s; font-size: 14px; font-weight: 600;" % palette["label_text"]
+        )
+        self.session_search.setStyleSheet(
+            "QLineEdit { background: %s; color: %s; border: 1px solid %s; "
+            "border-radius: 4px; padding: 4px 7px; }"
+            "QLineEdit:focus { border: 1px solid %s; }"
+            % (
+                palette["input_bg"],
+                palette["item_text"],
+                palette["input_border"],
+                palette["input_focus_border"],
+            )
+        )
+        self.session_list.setStyleSheet(
+            "QListWidget { background: transparent; color: %s; border: none; padding: 2px 0; }"
+            "QListWidget::item { padding: 8px 9px; border-radius: 5px; }"
+            "QListWidget::item:hover { background: %s; }"
+            "QListWidget::item:selected { background: %s; color: %s; }"
+            % (
+                palette["item_text"],
+                palette["item_hover"],
+                palette["item_selected_bg"],
+                palette["item_selected_text"],
+            )
+        )
+        self.session_separator.setStyleSheet(
+            "background-color: %s;" % palette["separator"]
+        )
+        self.new_session_bottom_button.setStyleSheet(
+            "QPushButton { background: %s; color: %s; border: none; border-radius: 20px; "
+            "font-size: 15px; font-weight: 600; }"
+            "QPushButton:hover { background: %s; }"
+            "QPushButton:pressed { background: %s; }"
+            % (
+                palette["accent_bg"],
+                palette["accent_fg"],
+                palette["accent_hover"],
+                palette["accent_pressed"],
+            )
+        )
+        self.content_panel.setStyleSheet(
+            "#contentPanel { border: 1px solid %s; border-radius: 16px; background: transparent; }"
+            % palette["content_border"]
+        )
+        self.composer.setStyleSheet(
+            "#composer { background: %s; border: 1px solid %s; border-radius: 12px; }"
+            "QTextEdit { background: transparent; border: none; color: %s; "
+            "font-size: 15px; padding: 8px 10px; }"
+            "QTextEdit::placeholder { color: %s; }"
+            "QToolButton { color: %s; border: none; border-radius: 18px; padding: 5px 8px; }"
+            "QToolButton:hover { background: %s; }"
+            "QComboBox { background: %s; color: %s; border: 1px solid %s; "
+            "border-radius: 5px; padding: 4px 8px; }"
+            % (
+                palette["composer_bg"],
+                palette["composer_border"],
+                palette["composer_text"],
+                palette["placeholder"],
+                palette["tool_color"],
+                palette["tool_hover"],
+                palette["combo_bg"],
+                palette["combo_text"],
+                palette["composer_border"],
+            )
+        )
+        self.attach_label.setStyleSheet(
+            "color: %s; font-size: 12px; padding: 0 8px;" % palette["hint_text"]
+        )
+        self.attach_btn.setStyleSheet(
+            "QToolButton { color: %s; font-size: 22px; border: none; border-radius: 18px; "
+            "padding: 2px 9px; }" % palette["tool_color"]
+        )
+        self.send_btn.setStyleSheet(
+            "QToolButton { background: %s; color: %s; border: none; border-radius: 21px; }"
+            % (palette["send_bg"], palette["send_fg"])
+        )
+        self.stop_btn.setStyleSheet(
+            "QToolButton { background: %s; color: %s; border: none; border-radius: 21px; }"
+            % (palette["stop_bg"], palette["stop_fg"])
+        )
+        self.session_splitter.setStyleSheet(
+            "QSplitter { background: transparent; }"
+            "QSplitter::handle { background: %s; }"
+            "QSplitter::handle:hover { background: %s; }"
+            % (palette["splitter_handle"], palette["splitter_hover"])
+        )
+        panel = getattr(self, "chat_background_panel", None)
+        if panel is not None:
+            panel.set_base_color(palette["canvas_bg"])
+
+    def _refresh_theme_actions(self):
+        for theme_key, action in getattr(self, "theme_actions", {}).items():
+            action.setChecked(theme_key == getattr(self, "ui_theme", "dark"))
+
+    def set_ui_theme(self, name):
+        """切换明色/暗色主题并记住选择。"""
+        theme = str(name or "").strip().lower()
+        if theme not in UI_THEMES:
+            return
+        if theme == getattr(self, "ui_theme", None):
+            self._refresh_theme_actions()
+            return
+        self.ui_theme = theme
+        self.config.set_ui_theme(theme)
+        self._apply_ui_theme()
+        self._refresh_theme_actions()
+        status_bar = getattr(self, "status_bar", None)
+        if status_bar is not None:
+            status_bar.showMessage(
+                "已切换到%s主题" % ("暗色" if theme == "dark" else "明色"), 2000
+            )
 
     def init_menu(self):
         menubar = self.menuBar()
-        # 会话
+
         session_menu = menubar.addMenu("会话")
         session_menu.addAction("新建会话").triggered.connect(self.new_session)
         session_menu.addAction("历史会话").triggered.connect(self.show_session_list)
         session_menu.addSeparator()
         session_menu.addAction("清空当前会话").triggered.connect(self.clear_conversation)
-        # 设置
-        settings_menu = menubar.addMenu("设置")
-        settings_menu.addAction("配置").triggered.connect(self.show_config_dialog)
-        settings_menu.addAction("提示词").triggered.connect(self.show_prompt_dialog)
-        settings_menu.addAction("语音").triggered.connect(self.show_voice_config_dialog)
-        settings_menu.addAction("MCP 工具管理").triggered.connect(self.show_mcp_manager_dialog)
-        # 角色切换菜单
+
         self.role_menu = menubar.addMenu("角色")
         self._rebuild_role_menu()
-        # 新增：视图菜单
+
         view_menu = menubar.addMenu("视图")
-        view_menu.addAction("设置聊天背景").triggered.connect(self.set_chat_background)
-        view_menu.addAction("重置背景").triggered.connect(self.reset_chat_background)
-        background_mode_menu = view_menu.addMenu("背景显示模式")
-        self.background_mode_actions = {}
-        background_modes = {
-            "fill": "填充（保持比例，可能裁剪）",
-            "fit": "适应（保持比例，可能留边）",
-            "stretch": "拉伸（完整显示）",
-            "tile": "平铺",
-            "center": "居中",
-        }
-        for mode, label in background_modes.items():
-            action = background_mode_menu.addAction(label)
+        view_menu.addAction("聊天外观...").triggered.connect(
+            self.show_chat_appearance_dialog
+        )
+        theme_menu = view_menu.addMenu("主题")
+        self.theme_actions = {}
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        for theme_key, theme_label in (("dark", "暗色"), ("light", "明色")):
+            action = theme_menu.addAction(theme_label)
             action.setCheckable(True)
-            action.triggered.connect(lambda checked, value=mode: self.set_chat_background_mode(value))
-            self.background_mode_actions[mode] = action
-        self._refresh_background_mode_actions()
-        view_menu.addAction("气泡透明度").triggered.connect(self.show_opacity_dialog)
-        view_menu.addAction("桌宠模型大小").triggered.connect(self.show_pet_scale_dialog)
-        session_panel_action = view_menu.addAction("会话栏")
-        session_panel_action.setCheckable(True)
-        session_panel_action.setChecked(True)
-        session_panel_action.toggled.connect(self.toggle_session_panel)
-        # 帮助
+            action.setActionGroup(theme_group)
+            action.triggered.connect(
+                lambda checked=False, key=theme_key: self.set_ui_theme(key)
+            )
+            self.theme_actions[theme_key] = action
+        view_menu.addSeparator()
+
+        layout_menu = view_menu.addMenu("布局")
+        self.session_panel_action = layout_menu.addAction("会话栏")
+        self.session_panel_action.setCheckable(True)
+        self.session_panel_action.setChecked(True)
+        self.session_panel_action.toggled.connect(self.toggle_session_panel)
+
+        pet_menu = view_menu.addMenu("桌宠")
+        pet_menu.addAction("选择模型").triggered.connect(self.show_pet_model_dialog)
+        pet_menu.addAction("模型大小").triggered.connect(self.show_pet_scale_dialog)
+        pet_menu.addAction("重新加载模型").triggered.connect(self.reload_live2d_model)
+        pet_menu.addAction("打开模型目录").triggered.connect(self.open_model_directory)
+
+        settings_menu = menubar.addMenu("设置")
+        model_menu = settings_menu.addMenu("模型与接口")
+        model_menu.addAction("模型与 API").triggered.connect(self.show_config_dialog)
+        model_menu.addAction("提示词").triggered.connect(self.show_prompt_dialog)
+
+        interaction_menu = settings_menu.addMenu("交互与身份")
+        interaction_menu.addAction("语音").triggered.connect(
+            self.show_voice_config_dialog
+        )
+        interaction_menu.addAction("头像与身份").triggered.connect(
+            self.show_avatar_dialog
+        )
+
+        extension_menu = settings_menu.addMenu("扩展")
+        extension_menu.addAction("MCP 工具管理").triggered.connect(
+            self.show_mcp_manager_dialog
+        )
+
+        self.background_mode_actions = {}
+
         help_menu = menubar.addMenu("帮助")
-        help_menu.addAction("语音使用说明").triggered.connect(self.show_speech_config_help)
-        help_menu.addAction("配置文件说明").triggered.connect(self.show_config_file_help)
+        guide_menu = help_menu.addMenu("使用说明")
+        guide_menu.addAction("语音使用说明").triggered.connect(
+            self.show_speech_config_help
+        )
+        guide_menu.addAction("配置文件说明").triggered.connect(
+            self.show_config_file_help
+        )
+        help_menu.addSeparator()
         help_menu.addAction("关于").triggered.connect(self.show_about)
-        # Live2D
-        l2d_menu = menubar.addMenu("Live2D")
-        l2d_menu.addAction("选择模型").triggered.connect(self.show_pet_model_dialog)
-        reload_action = l2d_menu.addAction("重新加载模型")
-        reload_action.triggered.connect(self.reload_live2d_model)
-        l2d_menu.addAction("打开模型目录").triggered.connect(self.open_model_directory)
-        reload_action.setEnabled(True)
+        self._refresh_theme_actions()
 
     def show_opacity_dialog(self):
         current_opacity = self.bubble_opacity
@@ -5963,6 +7994,41 @@ class MainWindow(QMainWindow):
             self.update_all_bubbles_opacity(new_opacity)
         else:
             self.update_all_bubbles_opacity(current_opacity)
+
+    def show_code_opacity_dialog(self):
+        current_opacity = self.code_opacity
+        dialog = QDialog(self)
+        dialog.setWindowTitle("代码块透明度")
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("代码块透明度"))
+        code_slider = QSlider(Qt.Orientation.Horizontal)
+        code_slider.setRange(0, 100)
+        code_slider.setValue(int(current_opacity * 100))
+        layout.addWidget(code_slider)
+
+        value_label = QLabel(f"{current_opacity:.2f}")
+        layout.addWidget(value_label)
+
+        def on_code_slider_changed(value):
+            opacity = value / 100.0
+            value_label.setText(f"{opacity:.2f}")
+            self.update_all_code_opacity(opacity)
+
+        code_slider.valueChanged.connect(on_code_slider_changed)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_opacity = code_slider.value() / 100.0
+            self.code_opacity = new_opacity
+            self.config.set_code_opacity(new_opacity)
+            self.update_all_code_opacity(new_opacity)
+        else:
+            self.update_all_code_opacity(current_opacity)
 
     def _rebuild_role_menu(self):
         self.role_menu.clear()
@@ -6018,10 +8084,9 @@ class MainWindow(QMainWindow):
         self.chat_background_mode = mode
         self.config.set_chat_background_mode(mode)
         self._refresh_background_mode_actions()
-        saved_bg = self.config.settings.value("chat_bg_image", "")
-        self._apply_chat_background(saved_bg if saved_bg and os.path.exists(saved_bg) else None)
+        self._apply_chat_background(self._resolve_saved_chat_background())
 
-    def set_chat_background(self):
+    def choose_chat_background(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择背景图片",
@@ -6029,12 +8094,12 @@ class MainWindow(QMainWindow):
             "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif)",
         )
         if not file_path:
-            return
+            return ""
 
         pixmap = QPixmap(file_path)
         if pixmap.isNull():
             QMessageBox.warning(self, "图片无效", "无法加载所选图片，请换一张试试。")
-            return
+            return ""
 
         crop_dialog = ImageCropDialog(
             pixmap,
@@ -6042,21 +8107,26 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         if crop_dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return ""
 
         cropped_pixmap = crop_dialog.get_result_pixmap()
         if cropped_pixmap.isNull():
             QMessageBox.warning(self, "裁剪失败", "裁剪结果为空，请重新选择。")
-            return
+            return ""
 
         output_dir = os.path.join(get_runtime_dir(), "generated", "chat_backgrounds")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"chat_bg_{uuid.uuid4().hex[:8]}.png")
         if not cropped_pixmap.save(output_path, "PNG"):
             QMessageBox.warning(self, "保存失败", "裁剪后的背景图保存失败。")
-            return
+            return ""
 
-        output_path = output_path.replace("\\", "/")
+        return output_path.replace("\\", "/")
+
+    def set_chat_background(self):
+        output_path = self.choose_chat_background()
+        if not output_path:
+            return
         self.config.settings.setValue("chat_bg_image", output_path)
         self._apply_chat_background(output_path)
 
@@ -6064,9 +8134,28 @@ class MainWindow(QMainWindow):
         self.config.settings.remove("chat_bg_image")
         self._apply_chat_background(None)
 
+    def _resolve_saved_chat_background(self):
+        """读取已保存的背景图；原路径失效时用同名文件在生成目录里兜底。"""
+        saved = str(self.config.settings.value("chat_bg_image", "") or "")
+        if not saved:
+            return None
+        if os.path.isfile(saved):
+            return saved
+        fallback = os.path.join(
+            get_runtime_dir(), "generated", "chat_backgrounds", os.path.basename(saved)
+        )
+        if os.path.isfile(fallback):
+            fixed = fallback.replace("\\", "/")
+            self.config.settings.setValue("chat_bg_image", fixed)
+            return fixed
+        return None
+
     def _apply_chat_background(self, image_path=None):
         """绘制聊天区背景；消息列表和列表项保持透明。"""
         self.chat_background_panel.set_background_mode(self.chat_background_mode)
+        self.chat_background_panel.set_background_opacity(
+            getattr(self, "background_opacity", 1.0)
+        )
         self.chat_background_panel.set_background_image(image_path)
         self.chat_list.setStyleSheet(
             "QListWidget { border: none; background: transparent; }"
@@ -6359,10 +8448,25 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             return -1
 
+    def _sync_pet_task_activity(self, task_state):
+        """把任务状态映射成桌宠活动反馈，工作期间用气泡播报当前步骤。"""
+        if not self.pet_window:
+            return
+        state = dict(task_state or {})
+        status = str(state.get("status") or "")
+        step = str(state.get("current_step") or "").strip()
+        if status == "executing":
+            self.pet_window.set_pet_activity("working", step or "正在处理…")
+        elif status == "planning":
+            self.pet_window.set_pet_activity("thinking")
+        elif status == "failed":
+            self.pet_window.set_pet_activity("idle")
+
     def _on_task_state_updated(self, task_state):
         if self.sender() is not self.current_api_thread:
             return
         self._set_session_task_state(task_state)
+        self._sync_pet_task_activity(task_state)
         placeholder = getattr(self, "placeholder_widget", None)
         if placeholder is None:
             return
@@ -6374,6 +8478,11 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_computer_state(self, state):
+        if self.pet_window:
+            if str(state) in ("waiting_authorization", "waiting_external"):
+                self.pet_window.set_pet_activity("waiting", "等你确认一下…")
+            elif str(state) not in ("finished", "guard_failed"):
+                self.pet_window.set_pet_activity("working")
         labels = {
             "waiting_authorization": "等待用户授权视觉键鼠操作…",
             "q_listener_active": "Q 取消监听已启动，AI 正在准备接管…",
@@ -6419,15 +8528,34 @@ class MainWindow(QMainWindow):
         return display
 
     def add_message(self, message, is_user=True, store=True, sources=None):
+        should_follow_bottom = is_user or self._is_chat_at_bottom()
         display_text = self._compact_user_message(message) if is_user else message
-        widget = ChatMessageWidget(display_text, is_user, self.bubble_opacity, sources=sources)
+        avatar_path = self.config.get_avatar_path("user" if is_user else "assistant")
+        render_markdown = not is_user and not self.config.get_roleplay_mode()
+        widget = ChatMessageWidget(
+            display_text,
+            is_user,
+            self.bubble_opacity,
+            code_opacity=self.code_opacity,
+            bubble_color=self.bubble_user_color if is_user else self.bubble_assistant_color,
+            code_color=self.code_block_color,
+            sources=sources,
+            avatar_path=avatar_path,
+            render_markdown=render_markdown,
+            font_family=self.chat_font_family,
+            font_size=self.chat_font_size,
+            code_font_family=self.code_font_family,
+            code_font_size=self.code_font_size,
+        )
+        widget.avatar_clicked.connect(self.show_avatar_dialog)
         item = QListWidgetItem()
         item.setSizeHint(widget.sizeHint())
         widget.list_item = item
         self.chat_list.addItem(item)
         self.chat_list.setItemWidget(item, widget)
         widget.refresh_layout()
-        self.chat_list.scrollToBottom()
+        if should_follow_bottom:
+            self.chat_list.scrollToBottom()
         if store:
             role = "user" if is_user else "assistant"
             history_content = message if is_user else attach_sources_to_text(message, sources)
@@ -6717,7 +8845,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _screenshot_to_attachment(pixmap, prefix="截图"):
         """把图片落成临时文件并生成 data URL；超大时降采样转 JPEG。"""
-        folder = os.path.join(tempfile.gettempdir(), "aissist_screenshots")
+        folder = os.path.join(tempfile.gettempdir(), "aissistant_screenshots")
         os.makedirs(folder, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = os.path.join(folder, f"{prefix}_{stamp}.png")
@@ -6908,6 +9036,8 @@ class MainWindow(QMainWindow):
         if self.pet_window:
             self.pet_window.begin_speech_stream()
         self._show_thinking_kaomoji()
+        if self.pet_window:
+            self.pet_window.set_pet_activity("thinking")
 
         self.current_api_thread = APICallThread(
             api_messages,
@@ -6926,13 +9056,21 @@ class MainWindow(QMainWindow):
         self.current_api_thread.start()
 
         self.placeholder_item = QListWidgetItem()
-        self.placeholder_widget = TaskProgressWidget(opacity=self.bubble_opacity)
+        self.placeholder_widget = TaskProgressWidget(
+            opacity=self.bubble_opacity,
+            avatar_path=self.config.get_avatar_path("assistant"),
+            font_family=self.chat_font_family,
+            font_size=self.chat_font_size,
+            bubble_color=self.bubble_assistant_color,
+        )
+        self.placeholder_widget.avatar_clicked.connect(self.show_avatar_dialog)
         self.placeholder_item.setSizeHint(self.placeholder_widget.sizeHint())
         self.placeholder_widget.list_item = self.placeholder_item
         self.chat_list.addItem(self.placeholder_item)
         self.chat_list.setItemWidget(self.placeholder_item, self.placeholder_widget)
         self.placeholder_widget.refresh_layout()
         self.placeholder_widget.update_progress(task_state)
+        self.chat_list.scrollToBottom()
     def on_stream_chunk(self, chunk):
         if self.sender() is not self.current_api_thread:
             return
@@ -6943,11 +9081,13 @@ class MainWindow(QMainWindow):
         placeholder = getattr(self, "placeholder_widget", None)
         if placeholder is None:
             return
+        should_follow_output = self._is_chat_at_bottom()
         try:
             placeholder.set_text(self.stream_display_buffer)
         except RuntimeError:
             pass
-        self.chat_list.scrollToBottom()
+        if should_follow_output:
+            self.chat_list.scrollToBottom()
 
     def _stop_generation(self):
         had_running = False
@@ -6964,6 +9104,8 @@ class MainWindow(QMainWindow):
     def on_generation_stopped(self):
         if self.sender() is not self.current_api_thread:
             return
+        if self.pet_window:
+            self.pet_window.set_pet_activity("idle")
         stopped_thread = self.current_api_thread
         partial = (self.stream_display_buffer + self.chat_stream_filter.feed("", final=True)).strip()
         if self.pet_window:
@@ -7012,7 +9154,7 @@ class MainWindow(QMainWindow):
         final_reply = clean_response
         body, sources_block = split_reply_and_sources(final_reply)
         sources = parse_sources_block(sources_block)
-        spoken_reply = body
+        spoken_reply = markdown_to_plain_text(body)
 
         # 移除占位消息
         row = self._placeholder_row()
@@ -7065,6 +9207,9 @@ class MainWindow(QMainWindow):
         elif self.pet_window:
             self.pet_window.finish_speech_stream(spoken_reply, self.kaomoji_label.text())
 
+        if self.pet_window:
+            self.pet_window.set_pet_activity("done")
+
         # 恢复输入控件
         self._restore_input_controls()
         self.status_bar.showMessage("就绪", 2000)
@@ -7109,6 +9254,8 @@ class MainWindow(QMainWindow):
         elif tool_name == "write_file":
             prompt = prompt.replace("{path}", str(arguments.get("path", ""))).replace("{content}", str(arguments.get("content", "")))
         title = "命令超时" if is_timeout else "AI 操作授权"
+        if self.pet_window:
+            self.pet_window.set_pet_activity("waiting", "等你确认一下…")
         self._pending_permission = {"title": title, "message": prompt}
         if self.pet_window:
             self.pet_window.notify_permission_request(prompt.split("\n", 1)[0])
@@ -7145,6 +9292,8 @@ class MainWindow(QMainWindow):
         finally:
             self._permission_dialog = None
             self._pending_permission = None
+        if self.pet_window:
+            self.pet_window.set_pet_activity("working")
         guard_restored = True
         if computer_session_active:
             guard_restored = VisionInputController.resume_input_guard()
@@ -7196,6 +9345,7 @@ class MainWindow(QMainWindow):
         self.chat_stream_filter.reset()
         if self.pet_window:
             self.pet_window.cancel_speech()
+            self.pet_window.set_pet_activity("idle")
         self._set_kaomoji_display(text="(｡•́︿•̀｡)")
 
     def _update_model_indicator(self):
@@ -7248,6 +9398,17 @@ class MainWindow(QMainWindow):
 
     def _set_quick_mode(self, roleplay):
         self.config.set_roleplay_mode(bool(roleplay))
+        self.runtime_system_prompt = self._get_effective_system_prompt()
+        if self.conversation_history and self.conversation_history[0].get("role") == "system":
+            if self.runtime_system_prompt.strip():
+                self.conversation_history[0]["content"] = self.runtime_system_prompt
+            else:
+                self.conversation_history.pop(0)
+        elif self.runtime_system_prompt.strip():
+            self.conversation_history.insert(
+                0,
+                {"role": "system", "content": self.runtime_system_prompt},
+            )
         self._update_mode_button()
         self.status_bar.showMessage(
             "已切换到自由角色扮演模式" if roleplay else "已切换到默认模式",
@@ -7391,7 +9552,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def show_mcp_manager_dialog(self):
-        """只读查看 MCP server 状态与工具（P1）。"""
+        """查看 MCP server，并允许即时启用或禁用。"""
         dialog = QDialog(self)
         dialog.setWindowTitle("MCP 工具管理")
         dialog.resize(780, 480)
@@ -7399,7 +9560,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel(
             "MCP 工具由外部 server 提供，工具名格式 mcp__<server>__<工具名>。\n"
-            "当前为只读查看；修改 config/mcp.json 后需重启 Aissist 生效。"
+            "勾选左侧复选框可立即启用或禁用；更改命令、地址等配置后仍需重启 Aissistant。"
         ))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -7430,6 +9591,8 @@ class MainWindow(QMainWindow):
         view_state = {"server_sig": None, "tool_html": None}
 
         def build_tool_html(server_name):
+            if server_name and not MCPManager.is_server_enabled(server_name):
+                return "<p style='color:#888'>该 MCP server 已禁用。勾选左侧复选框即可启用。</p>"
             tools = MCPManager.server_tools(server_name)
             if not tools:
                 return "<p style='color:#888'>该 server 暂无可用工具（未就绪或没有工具）。</p>"
@@ -7457,7 +9620,14 @@ class MainWindow(QMainWindow):
         def refresh(force=False):
             servers = MCPManager.status()
             server_sig = tuple(
-                (s.get("name"), bool(s.get("ready")), s.get("tools", 0), str(s.get("error") or ""))
+                (
+                    s.get("name"),
+                    bool(s.get("enabled")),
+                    bool(s.get("running")),
+                    bool(s.get("ready")),
+                    s.get("tools", 0),
+                    str(s.get("error") or ""),
+                )
                 for s in servers
             )
             if force or server_sig != view_state["server_sig"]:
@@ -7468,11 +9638,25 @@ class MainWindow(QMainWindow):
                 server_list.blockSignals(True)
                 server_list.clear()
                 for i, s in enumerate(servers):
-                    state = "就绪" if s.get("ready") else "未就绪"
-                    if s.get("error"):
+                    enabled = bool(s.get("enabled"))
+                    if not enabled:
+                        state = "已禁用"
+                    elif s.get("error"):
                         state = "错误"
+                    elif s.get("ready"):
+                        state = "已就绪"
+                    elif s.get("running"):
+                        state = "启动中"
+                    else:
+                        state = "未启动"
                     item = QListWidgetItem("%s   [%s]   工具 %d 个" % (s.get("name"), state, s.get("tools", 0)))
                     item.setData(Qt.ItemDataRole.UserRole, s.get("name"))
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+                    )
+                    if not enabled:
+                        item.setForeground(QColor("#777777"))
                     if s.get("error"):
                         item.setForeground(QColor("#c0392b"))
                         item.setToolTip(str(s.get("error")))
@@ -7484,12 +9668,33 @@ class MainWindow(QMainWindow):
                 server_list.blockSignals(False)
             item = server_list.currentItem()
             show_tools(item.data(Qt.ItemDataRole.UserRole) if item else "")
-            status_label.setText("共 %d 个 server，%d 个 MCP 工具。" % (
-                len(servers), len(MCPManager.get_tool_definitions())))
+            enabled_count = sum(1 for server in servers if server.get("enabled"))
+            status_label.setText("共 %d 个 server，%d 个已启用，%d 个 MCP 工具。" % (
+                len(servers), enabled_count, len(MCPManager.get_tool_definitions())))
 
         def on_select():
             item = server_list.currentItem()
             show_tools(item.data(Qt.ItemDataRole.UserRole) if item else "")
+
+        def on_server_toggled(item):
+            server_name = item.data(Qt.ItemDataRole.UserRole)
+            enabled = item.checkState() == Qt.CheckState.Checked
+            try:
+                MCPManager.set_server_enabled(server_name, enabled)
+            except Exception as exc:
+                server_list.blockSignals(True)
+                item.setCheckState(
+                    Qt.CheckState.Unchecked if enabled else Qt.CheckState.Checked
+                )
+                server_list.blockSignals(False)
+                QMessageBox.warning(dialog, "MCP 操作失败", str(exc))
+                refresh(force=True)
+                return
+            status_label.setText(
+                "正在%s %s..." % ("启用" if enabled else "禁用", server_name)
+            )
+            view_state["server_sig"] = None
+            refresh(force=True)
 
         def open_path(path):
             try:
@@ -7502,6 +9707,7 @@ class MainWindow(QMainWindow):
 
         refresh_btn.clicked.connect(lambda: refresh(force=True))
         server_list.currentItemChanged.connect(lambda *_: on_select())
+        server_list.itemChanged.connect(on_server_toggled)
         config_btn.clicked.connect(lambda: open_path(MCPManager.config_path()))
         log_btn.clicked.connect(lambda: open_path(os.path.join(get_runtime_dir(), "logs")))
         close_btn.clicked.connect(dialog.accept)
@@ -7573,7 +9779,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "关于AI助手",
-                          "Aissist v1.101.5-test (PyQt6版本)\n"
+                          "Aissistant v1.102.1-test (PyQt6版本)\n"
                           "功能：多会话聊天、图片/文件附件、视觉键鼠、UI Automation、Live2D、语音输入与回复\n"
                           "技术栈：Python + PyQt6 + OpenAI兼容API + Live2D + edge-tts")
 
@@ -7694,7 +9900,7 @@ class MainWindow(QMainWindow):
         self.allow_close = True
         self.close()
 
-    
+
 
 
 # ======================== 程序入口 ========================
