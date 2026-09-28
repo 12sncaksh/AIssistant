@@ -47,11 +47,27 @@ if not exist "dist\Aissistant\generated\kws\encoder-epoch-12-avg-2-chunk-16-left
 
 echo [5/6] Adding user documentation and configuration templates...
 if not exist "dist\Aissistant\config\templates" mkdir "dist\Aissistant\config\templates"
-copy /y "docs\README_PORTABLE.md" "dist\Aissistant\README.md" >nul
+rem docs\ is not published in this repository: prefer the end-user portable notes,
+rem otherwise fall back to the repository README.md, and never fail silently.
+if exist "docs\README_PORTABLE.md" (
+    copy /y "docs\README_PORTABLE.md" "dist\Aissistant\README.md" >nul
+) else if exist "README.md" (
+    echo   docs\README_PORTABLE.md not found - packaging the repository README.md instead.
+    copy /y "README.md" "dist\Aissistant\README.md" >nul
+) else (
+    echo   WARNING: neither docs\README_PORTABLE.md nor README.md exists.
+    echo   The package will ship without a README.
+)
 copy /y "config\templates\auth.example.json" "dist\Aissistant\config\templates\auth.example.json" >nul
+if errorlevel 1 goto templates_missing
 copy /y "config\templates\config.example.json" "dist\Aissistant\config\templates\config.example.json" >nul
+if errorlevel 1 goto templates_missing
 copy /y "config\templates\apps.example.json" "dist\Aissistant\config\templates\apps.example.json" >nul
+if errorlevel 1 goto templates_missing
 copy /y "config\templates\mcp.example.json" "dist\Aissistant\config\templates\mcp.example.json" >nul
+if errorlevel 1 goto templates_missing
+copy /y "config\templates\live2d_emotions.example.json" "dist\Aissistant\config\templates\live2d_emotions.example.json" >nul
+if errorlevel 1 goto templates_missing
 
 echo [6/6] Creating ZIP package...
 where tar.exe >nul 2>nul
@@ -70,7 +86,22 @@ pause
 exit /b 0
 
 :missing_assets
-echo Missing generated\kws assets. The wake-word model files are required for this build.
+echo Missing wake-word assets under generated\kws. This build requires:
+echo   encoder-epoch-12-avg-2-chunk-16-left-64.onnx
+echo   decoder-epoch-12-avg-2-chunk-16-left-64.onnx
+echo   joiner-epoch-12-avg-2-chunk-16-left-64.onnx
+echo   tokens.txt
+echo   keywords.txt
+echo They are not published in this repository. Get them from the sherpa-onnx KWS model
+echo   https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
+echo copy the three .onnx files plus tokens.txt into generated\kws, then build keywords.txt with
+echo   sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppinyin keywords_raw.txt keywords.txt
+echo See README.md ("resources not shipped in this repository") for details.
+pause
+exit /b 1
+
+:templates_missing
+echo Failed to copy config\templates into the package. Check config\templates\*.example.json.
 pause
 exit /b 1
 
@@ -90,7 +121,11 @@ pause
 exit /b 1
 
 :packaged_assets_missing
-echo Live2D resources were not included in the package: assets\web_resources\dist\pet.html
+echo Packaged Live2D or wake-word resources are incomplete. Expected at least:
+echo   assets\web_resources\dist\pet.html
+echo   generated\kws\encoder-epoch-12-avg-2-chunk-16-left-64.onnx
+echo These files are not shipped in this repository, so a fresh clone cannot be packaged
+echo as-is. See README.md for the full list. Nothing failed in PyInstaller itself.
 pause
 exit /b 1
 

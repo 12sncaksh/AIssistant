@@ -3,5 +3,10 @@
   "model": "gpt-3.5-turbo",
   "vision_model": "",
   "reasoning_effort": "",
-  "searxng_url": "http://localhost:18080"
+  "searxng_url": "http://localhost:18080",
+  "dsh_bridge_enabled": false,
+  "dsh_command": "dsh",
+  "dsh_profile": "acp",
+  "dsh_provider": "",
+  "dsh_model": ""
 }

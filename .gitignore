@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # ---- 运行时数据 / 隐私 / 密钥（开源务必保留这些规则）----
 config/auth.json
@@ -13,6 +14,11 @@ config/dsh_acp_overlay.yml
 config/dsh_sessions.json
 config/apps.json
 config/live2d_emotions.json
+# 兜底：config 下只放行模板目录，其余 json/yml 一律不入库，
+# 避免以后新增配置项（网关地址、密钥等）被误提交。
+config/*.json
+config/*.yml
+!config/templates/
 data/
 logs/
 output.txt
@@ -21,8 +27,10 @@ agent_workspace/
 archive/
 .env
 *.db
+*.log
 
 # ---- 内部记录/文档（不公开）----
+# docs/ 与「工作文档」不随仓库发布，README / scripts 里不要引用这些文件。
 工作文档
 docs/
 
