@@ -65,7 +65,7 @@ scripts\run.bat            :: 隐藏启动
 
 ## 打包免安装版
 
-在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v1.102.1_test_portable.zip`。
+在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v1.102.5_test_portable.zip`。
 
 ## 项目结构
 

@@ -46,6 +46,24 @@ class ActionHandler:
     _agent_workspace = None  # 当前子agent隔离工作区（None=主循环不限制）
     _amap_api_key = ""    # 显式配置（GUI/环境变量），优先于 auth.json
     _timeout_confirm_callback = None  # 命令超时时询问用户是否继续等待的回调
+    _pet_command_callback = None      # 桌宠 Live2D 控制回调（由 GUI 主线程注册，线程安全队列转发）
+    _pet_param_catalog = []           # 当前桌宠模型的 Live2D 参数表 [{id,name,group}]，供大模型查询
+
+    PET_EMOTION_NAMES = (
+        "happy", "sad", "angry", "surprised", "shy", "wink", "cry", "sleepy",
+        "love", "sparkle", "magic", "heart", "excited", "confused", "nervous",
+        "tongue", "neutral",
+    )
+
+    @classmethod
+    def set_pet_command_callback(cls, callback):
+        """注册桌宠控制回调。回调应为线程安全的（GUI 侧用信号 emit）。"""
+        cls._pet_command_callback = callback
+
+    @classmethod
+    def set_pet_param_catalog(cls, catalog):
+        """登记当前桌宠模型可用的 Live2D 参数表。"""
+        cls._pet_param_catalog = list(catalog or [])
 
     @classmethod
     def load_apps(cls, config_path=None):
@@ -823,6 +841,91 @@ class ActionHandler:
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "control_pet",
+                    "description": "控制桌面桌宠（Live2D）做出情绪表情，用于自然地增强互动。在用户夸奖、开玩笑、表达强烈情绪，或你自己想表达态度时主动调用，不要每轮都调用。emotion 可选：happy、sad、angry、surprised、shy、wink、cry、sleepy、love、sparkle、magic、heart、excited、confused、nervous、tongue、neutral；neutral 表示立即收回表情。",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "emotion": {
+                                "type": "string",
+                                "enum": list(cls.PET_EMOTION_NAMES),
+                                "description": "要表达的情绪。"
+                            },
+                            "intensity": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                                "description": "情绪强度，0 到 1，默认 1。"
+                            },
+                            "duration_ms": {
+                                "type": "integer",
+                                "minimum": 500,
+                                "maximum": 30000,
+                                "description": "持续时间（毫秒），默认 6000。"
+                            }
+                        },
+                        "required": ["emotion", "intensity", "duration_ms"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_live2d_param",
+                    "description": "高级用法：直接设置当前桌宠 Live2D 模型的一个或多个参数值，做语义情绪覆盖不到的表现。参数名必须来自 list_live2d_params；数值越界会自动裁剪，到期后自动回落，不会残留。",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "parameters": {
+                                "type": "array",
+                                "description": "要设置的参数列表。",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string", "description": "Live2D 参数名，例如 ParamAngleZ。"},
+                                        "value": {"type": "number", "description": "目标数值。"}
+                                    },
+                                    "required": ["id", "value"],
+                                    "additionalProperties": False
+                                }
+                            },
+                            "duration_ms": {
+                                "type": "integer",
+                                "minimum": 500,
+                                "maximum": 30000,
+                                "description": "持续时间（毫秒），默认 6000。"
+                            }
+                        },
+                        "required": ["parameters", "duration_ms"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_live2d_params",
+                    "description": "列出当前桌宠 Live2D 模型支持的参数名与说明（可按关键词过滤），用于 set_live2d_param。仅在需要直接设置参数时调用。",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "keyword": {
+                                "type": "string",
+                                "description": "过滤关键词，匹配参数名或说明；空字符串表示列出全部。"
+                            }
+                        },
+                        "required": ["keyword"],
+                        "additionalProperties": False
+                    }
+                }
+            },
         ])
 
         apps = cls.get_available_apps()
@@ -863,6 +966,109 @@ class ActionHandler:
     def get_subagent_tool_definitions(cls, agent_type: str) -> list[dict[str, Any]]:
         whitelist = set(cls.SUBAGENT_TOOL_WHITELIST.get(agent_type, []))
         return [t for t in cls.get_tool_definitions() if t["function"]["name"] in whitelist]
+
+    @classmethod
+    def _handle_control_pet(cls, arguments: dict[str, Any]) -> dict[str, Any]:
+        emotion = str(arguments.get("emotion", "")).strip().lower()
+        if emotion not in cls.PET_EMOTION_NAMES:
+            return cls._result(False, f"不支持的情绪「{emotion}」，可选：{'、'.join(cls.PET_EMOTION_NAMES)}。")
+        try:
+            intensity = float(arguments.get("intensity", 1.0))
+        except (TypeError, ValueError):
+            intensity = 1.0
+        intensity = max(0.0, min(1.0, intensity))
+        try:
+            duration_ms = int(arguments.get("duration_ms", 6000))
+        except (TypeError, ValueError):
+            duration_ms = 6000
+        duration_ms = max(500, min(30000, duration_ms))
+        if cls._pet_command_callback is None:
+            return cls._result(False, "当前没有可控制的桌宠窗口。")
+        try:
+            cls._pet_command_callback({
+                "kind": "emotion",
+                "emotion": emotion,
+                "intensity": intensity,
+                "duration_ms": duration_ms,
+            })
+        except Exception as e:
+            return cls._result(False, f"桌宠表情指令下发失败: {e}")
+        if emotion == "neutral":
+            return cls._result(True, "已登记收回桌宠表情，将在本条回复播报时生效。")
+        return cls._result(True, f"已登记桌宠情绪「{emotion}」（强度 {intensity:.2f}，持续 {duration_ms}ms），将在本条回复播报/说话时展示。")
+
+    @classmethod
+    def _handle_set_live2d_param(cls, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw = arguments.get("parameters") or []
+        if not isinstance(raw, list):
+            return cls._result(False, "parameters 必须是 {id,value} 列表。")
+        known_ids = {item.get("id") for item in cls._pet_param_catalog}
+        mapping: dict[str, float] = {}
+        unknown: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id", "")).strip()
+            if not pid:
+                continue
+            if known_ids and pid not in known_ids:
+                unknown.append(pid)
+                continue
+            try:
+                mapping[pid] = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+        if unknown:
+            return cls._result(
+                False,
+                f"以下参数不在当前模型（可用 list_live2d_params 查询）：{'、'.join(unknown[:20])}。",
+            )
+        if not mapping:
+            return cls._result(False, "没有可设置的有效参数。")
+        try:
+            duration_ms = int(arguments.get("duration_ms", 6000))
+        except (TypeError, ValueError):
+            duration_ms = 6000
+        duration_ms = max(500, min(30000, duration_ms))
+        if cls._pet_command_callback is None:
+            return cls._result(False, "当前没有可控制的桌宠窗口。")
+        try:
+            cls._pet_command_callback({
+                "kind": "param",
+                "parameters": mapping,
+                "duration_ms": duration_ms,
+            })
+        except Exception as e:
+            return cls._result(False, f"Live2D 参数下发失败: {e}")
+        shown = "、".join(f"{pid}={val:g}" for pid, val in list(mapping.items())[:12])
+        return cls._result(True, f"已登记桌宠参数：{shown}（将在本条回复播报时展示，持续 {duration_ms}ms 后回落）。")
+
+    @classmethod
+    def _handle_list_live2d_params(cls, arguments: dict[str, Any]) -> dict[str, Any]:
+        keyword = str(arguments.get("keyword", "")).strip().lower()
+        catalog = cls._pet_param_catalog
+        if not catalog:
+            return cls._result(False, "当前模型没有可读取的 Live2D 参数表。")
+        rows = [
+            item for item in catalog
+            if not keyword
+            or keyword in str(item.get("id", "")).lower()
+            or keyword in str(item.get("name", "")).lower()
+            or keyword in str(item.get("group", "")).lower()
+        ]
+        if not rows:
+            return cls._result(True, f"没有匹配「{keyword}」的 Live2D 参数。", {"params": []})
+        limit = 200
+        lines = [
+            f"{item.get('id', '')}（{item.get('name', '') or item.get('group', '')}）"
+            for item in rows[:limit]
+        ]
+        suffix = "" if len(rows) <= limit else f"\n（已截断，仅显示前 {limit} 个）"
+        return cls._result(
+            True,
+            f"当前模型共 {len(catalog)} 个参数，匹配 {len(rows)} 个：\n" + "\n".join(lines) + suffix,
+            {"params": rows[:limit]},
+        )
 
     @staticmethod
     def _result(success: bool, message: str, data: Any = None) -> dict[str, Any]:
@@ -1135,6 +1341,15 @@ class ActionHandler:
 
             if tool_name == "wait_for_user_action":
                 return VisionInputController.wait_for_user_action(arguments.get("seconds", 15))
+
+            if tool_name == "control_pet":
+                return cls._handle_control_pet(arguments)
+
+            if tool_name == "set_live2d_param":
+                return cls._handle_set_live2d_param(arguments)
+
+            if tool_name == "list_live2d_params":
+                return cls._handle_list_live2d_params(arguments)
 
             if tool_name == "get_current_datetime":
                 success, msg, data = cls._get_current_datetime()

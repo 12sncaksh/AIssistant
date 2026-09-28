@@ -2,6 +2,10 @@
 # 桌面AI助手主程序 - 支持API调用、Live2D模型展示、会话管理、语音合成(PyQt6版本)
 import sys
 import os
+
+# 调试模式：`python src/main.py --debug` 打开（run_debug.bat 会带上），
+# 用于在托盘菜单里保留「测试表情/裸参数」等开发用入口。
+DEBUG_MODE = "--debug" in sys.argv
 import json
 import copy
 import html
@@ -42,6 +46,11 @@ from logging.handlers import RotatingFileHandler
 from action_control import ActionHandler  # 导入外部应用控制模块
 from mcp_client import MCPManager  # 外部 MCP 工具（工具表合并 + 调用分发）
 from vision_input import VisionInputController
+from dsh_acp_client import (  # DSH（DeepSeek Harness）桥接
+    DSHSessionThread,
+    current_connection,
+    reset_connection,
+)
 import json
 # PyQt6 导入
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
@@ -507,6 +516,336 @@ def get_live2d_model_catalog():
             })
             break
     return catalog
+
+
+def get_live2d_param_catalog(model_id=None):
+    """读取指定（默认当前）模型的 .cdi3.json，返回可读参数表供大模型查询。"""
+    catalog = get_live2d_model_catalog()
+    model = None
+    if model_id:
+        model = next((item for item in catalog if item["id"] == model_id), None)
+    if model is None:
+        model = catalog[0] if catalog else None
+    if not model:
+        return []
+    resources_dir = get_resource_path("assets", "web_resources", "dist", "Resources")
+    model_path = os.path.join(resources_dir, *model["path"].split("/"))
+    folder = os.path.dirname(model_path)
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    cdi_name = next((name for name in names if name.lower().endswith(".cdi3.json")), None)
+    if not cdi_name:
+        return []
+    try:
+        with open(os.path.join(folder, cdi_name), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        logging.warning("读取 Live2D 参数表失败：%s", cdi_name)
+        return []
+    params = []
+    for item in data.get("Parameters", []):
+        pid = str(item.get("Id", "")).strip()
+        if not pid:
+            continue
+        params.append({
+            "id": pid,
+            "name": str(item.get("Name", "") or ""),
+            "group": str(item.get("GroupId", "") or ""),
+        })
+    return params
+
+
+# 情绪名 -> 模型作者自带的 *.exp3.json 文件名候选（取第一个存在的）。
+# 作者原版表情才是该模型「正确」的观感：物料开关之外往往还带基础五官改动
+# （例如大肥鱼 开心兴奋 会同时把 ParamEyeLOpen/ParamEyeROpen 关掉），
+# 只写物料开关会让物料叠在没被关掉的原脸上。
+PET_EMOTION_EXPRESSIONS = {
+    "happy": ("开心兴奋", "happy", "exp_02"),
+    "sad": ("悲伤", "sad", "exp_05"),
+    "angry": ("生气", "angry", "exp_08"),
+    "surprised": ("感叹号", "surprised", "exp_07"),
+    "shy": ("脸红", "shy", "exp_06"),
+    "wink": ("调皮", "wink"),
+    "cry": ("哭", "cry", "exp_05"),
+    "sleepy": ("闭眼口水", "sleepy"),
+    "love": ("爱心眼", "love"),
+    "sparkle": ("星星眼", "sparkle", "exp_04"),
+    "magic": ("魔爪", "magic"),
+    "heart": ("心跳", "heart"),
+    "excited": ("开心兴奋", "excited", "exp_04"),
+    "confused": ("问号", "confused"),
+    "nervous": ("流汗", "nervous"),
+    "tongue": ("吐舌", "tongue"),
+}
+
+
+def _live2d_model_folder(model_id=None):
+    """返回 (模型文件夹绝对路径, 模型id)；找不到返回 (None, None)。"""
+    catalog = get_live2d_model_catalog()
+    model = next((item for item in catalog if item["id"] == model_id), None) if model_id else None
+    if model is None:
+        model = catalog[0] if catalog else None
+    if not model:
+        return None, None
+    resources_dir = get_resource_path("assets", "web_resources", "dist", "Resources")
+    model_path = os.path.join(resources_dir, *model["path"].split("/"))
+    return os.path.dirname(model_path), model["id"]
+
+
+def _read_exp3_entries(folder, file_name):
+    """读取一个 .exp3.json，返回 [{id, value, blend}] 原始 Delta。"""
+    try:
+        with open(os.path.join(folder, file_name), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        logging.warning("读取 Live2D 表情文件失败：%s", file_name)
+        return []
+    params = []
+    for item in data.get("Parameters") or []:
+        pid = str(item.get("Id", "") or "").strip()
+        if not pid:
+            continue
+        try:
+            value = float(item.get("Value", 0.0))
+        except (TypeError, ValueError):
+            continue
+        params.append({
+            "id": pid,
+            "value": value,
+            "blend": str(item.get("Blend", "") or "Add"),
+        })
+    return params
+
+
+def load_live2d_emotion_config(model_id=None):
+    """读取 config/live2d_emotions.json 中指定模型段（不再有 default 段）。
+
+    结构示例见 config/templates/live2d_emotions.example.json：
+        { "大肥鱼": { "happy": {"expressions": ["开心兴奋","happy"],
+                              "params": [{"id":"ParamMouthForm","value":1}] } } }
+    只认以模型文件夹名为键的段；未命中时内置 PET_EMOTION_EXPRESSIONS 兜底。
+    """
+    path = os.path.join(get_config_dir(), "live2d_emotions.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        logging.warning("读取 %s 失败：%s", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    part = data.get(str(model_id or ""))
+    if not isinstance(part, dict):
+        return {}
+    merged = {}
+    for emotion, spec in part.items():
+        if isinstance(spec, dict):
+            merged[str(emotion).strip().lower()] = spec
+    return merged
+
+
+def _scan_exp3_files(folder):
+    """递归收集模型目录下的 .exp3.json，返回 {文件名(不含扩展, 小写键): 相对路径}。
+
+    多数模型把表情放在 expressions/ 子目录（如 Mao 的 exp_01..exp_08），
+    也有直接放在模型根目录的（如大肥鱼），这里两种都覆盖。
+    """
+    found = {}
+    if not folder:
+        return found
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            if not name.lower().endswith(".exp3.json"):
+                continue
+            base = name[: -len(".exp3.json")]
+            rel = os.path.relpath(os.path.join(root, name), folder)
+            found.setdefault(base.casefold(), rel)
+    return found
+
+
+def _config_explicit_params(spec):
+    """把配置里的 params（绝对数值）转成 blend=Set 的条目。"""
+    entries = []
+    for item in (spec or {}).get("params") or []:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id", "") or "").strip()
+        if not pid:
+            continue
+        try:
+            value = float(item.get("value"))
+        except (TypeError, ValueError):
+            continue
+        entries.append({"id": pid, "value": value, "blend": "Set"})
+    return entries
+
+
+def get_live2d_expression_params(model_id=None):
+    """返回 {情绪: [参数条目]}。
+
+    优先级：config/live2d_emotions.json 指定的 expressions/params →
+    内置 PET_EMOTION_EXPRESSIONS。exp3 返回原始 Delta（Add/Multiply），
+    配置 params 返回 blend=Set 的绝对值，均由前端折算成最终数值。
+    """
+    folder, _ = _live2d_model_folder(model_id)
+    if not folder:
+        return {}
+    available = _scan_exp3_files(folder)
+    config = load_live2d_emotion_config(model_id)
+    emotions = [e for e in PET_EMOTION_EXPRESSIONS]
+    emotions += [e for e in config if e not in PET_EMOTION_EXPRESSIONS]
+    table = {}
+    for emotion in emotions:
+        spec = config.get(emotion) or {}
+        candidates = spec.get("expressions") or PET_EMOTION_EXPRESSIONS.get(emotion, ())
+        entries = []
+        for candidate in candidates:
+            rel_path = available.get(str(candidate).casefold())
+            if not rel_path:
+                continue
+            entries = _read_exp3_entries(folder, rel_path)
+            if entries:
+                break
+        entries = list(entries) + _config_explicit_params(spec)
+        if entries:
+            table[emotion] = entries
+    return table
+
+
+
+def get_live2d_all_expressions(model_id=None):
+    """扫描模型目录全部 .exp3.json，返回 {文件名(不含扩展): [条目]}，供穿戴菜单用。"""
+    folder, _ = _live2d_model_folder(model_id)
+    if not folder:
+        return {}
+    found = _scan_exp3_files(folder)
+    out = {}
+    for base in sorted(found, key=str.casefold):
+        entries = _read_exp3_entries(folder, found[base])
+        if entries:
+            # 用原始大小写文件名展示
+            display = os.path.basename(found[base])[: -len(".exp3.json")]
+            out[display] = entries
+    return out
+
+
+def get_live2d_model_expression_names(model_id=None):
+    """返回模型可穿戴/可播放的 .exp3.json 名称列表（用于菜单）。
+
+    过滤掉三类不适合单独穿戴的条目：
+    1) 含非 0/1 选择器参数（眼镜/头箍/情绪花花等互斥组代表），单独穿会残影；
+    2) 会覆盖多处基础五官的「整体表情」（如 开心兴奋/生气/悲伤/哭/调皮/晕晕/吐舌），
+       那是情绪层的活，穿戴会冲突；
+    3) 名称带「动画/贴纸」且含多参数的复合件。
+    """
+    all_expr = get_live2d_all_expressions(model_id)
+    return [name for name, entries in all_expr.items() if _is_wearable_prop(name, entries)]
+
+
+def _is_wearable_prop(name, entries):
+    entries = entries or []
+    # 含非 0/1 值：互斥组的选择器参数，不能单独穿戴
+    for item in entries:
+        try:
+            num = float(item.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if abs(num) not in (0.0, 1.0):
+            return False
+    # 驱动多处基础五官（眼/眉/嘴）的，是整体表情而非配件
+    face_groups = set()
+    for item in entries:
+        pid = str(item.get("id", ""))
+        if pid.startswith("ParamEye") or pid.startswith("ParamBrow"):
+            face_groups.add("face")
+        if pid.startswith("ParamMouth") or pid in ("ParamA", "ParamI", "ParamU", "ParamE", "ParamO"):
+            face_groups.add("face")
+    if face_groups:
+        return False
+    return True
+
+
+def build_live2d_emotion_template(model_id=None):
+    """按当前模型的 .exp3.json 生成只含该模型段的空模板（供用户填写）。
+
+    不再生成 default 段：每个情绪给一个占位（expressions / params 均为空），
+    能按内置候选名自动命中的顺手填好；另附 `_可用exp3` 列出该模型全部
+    .exp3.json 文件名，供用户对照填写。
+    """
+    folder, _ = _live2d_model_folder(model_id)
+    available = {}
+    if folder:
+        for _base_lower, rel in _scan_exp3_files(folder).items():
+            display = os.path.basename(rel)[: -len(".exp3.json")]
+            available[display.casefold()] = display
+    section = {}
+    for emotion, candidates in PET_EMOTION_EXPRESSIONS.items():
+        matched = [
+            available[str(candidate).casefold()]
+            for candidate in candidates
+            if str(candidate).casefold() in available
+        ]
+        section[emotion] = {
+            "expressions": matched[:1],
+            "params": [],
+        }
+    exp_list = sorted(set(available.values()), key=str.casefold)
+    section["_可用exp3"] = exp_list
+    if not exp_list:
+        section["_提示"] = (
+            "该模型没有任何 .exp3.json。请改用 params 直接指定参数"
+            "（可在「动作映射配置」里查看模型参数，或运行 "
+            "scripts/list_live2d_props.py 查看）。"
+        )
+    _, mid = _live2d_model_folder(model_id)
+    template = {}
+    if mid:
+        template[mid] = section
+    return template
+
+
+def merge_live2d_emotion_config(template, path):
+    """把模板合并进已有配置：模型段不存在则整体写入；已存在则只补缺失情绪，
+    并始终刷新 `_可用exp3`/`_提示`。不覆盖用户已填的 expressions/params。"""
+    existing = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    meta_keys = ("_可用exp3", "_提示", "_说明")
+    changed = 0
+    for model_key, section in template.items():
+        if not isinstance(section, dict):
+            continue
+        target = existing.get(model_key)
+        if not isinstance(target, dict):
+            existing[model_key] = section
+            changed += 1
+            continue
+        for sub_key, sub_value in section.items():
+            if sub_key in meta_keys:
+                if target.get(sub_key) != sub_value:
+                    target[sub_key] = sub_value
+                    changed += 1
+            elif sub_key not in target:
+                target[sub_key] = sub_value
+                changed += 1
+        # 清理历史遗留的 default 段（新结构不再需要）
+        existing.pop("default", None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(existing, handle, ensure_ascii=False, indent=2)
+    return changed
+
+
 
 
 # pygame.mixer 是进程级全局设备，绝不能由多个 TTS 线程并发 init/stop/quit。
@@ -1377,6 +1716,33 @@ class ConfigManager:
         value = str(value or "").strip().lower()
         self.settings.setValue("reasoning_effort", value if value in REASONING_EFFORT_VALUES else "")
 
+    def get_dsh_bridge_enabled(self):
+        value = self._get_setting_or_file("dsh_bridge_enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def set_dsh_bridge_enabled(self, enabled):
+        self.settings.setValue("dsh_bridge_enabled", "true" if enabled else "false")
+
+    def get_dsh_command(self):
+        return str(self._get_setting_or_file("dsh_command", "dsh")).strip() or "dsh"
+
+    def get_dsh_profile(self):
+        return str(self._get_setting_or_file("dsh_profile", "acp")).strip() or "acp"
+
+    def get_dsh_provider(self):
+        return str(self._get_setting_or_file("dsh_provider", "")).strip()
+
+    def set_dsh_provider(self, value):
+        self.settings.setValue("dsh_provider", str(value or "").strip())
+
+    def get_dsh_model(self):
+        return str(self._get_setting_or_file("dsh_model", "")).strip()
+
+    def set_dsh_model(self, value):
+        self.settings.setValue("dsh_model", str(value or "").strip())
+
     def get_searxng_url(self):
         return str(self._get_setting_or_file("searxng_url", "http://localhost:18080")).strip()
 
@@ -1644,6 +2010,22 @@ class ConfigManager:
 
     def set_pet_model_name(self, value):
         self.settings.setValue("pet_model_name", str(value or "Mao").strip())
+
+    def get_pet_worn(self, model_name):
+        """读取某模型已保存的持久穿戴（.exp3.json 名称列表）。"""
+        key = "pet_worn_%s" % str(model_name or "").strip()
+        raw = self.settings.value(key, "", type=str)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [str(item) for item in data] if isinstance(data, list) else []
+
+    def set_pet_worn(self, model_name, names):
+        key = "pet_worn_%s" % str(model_name or "").strip()
+        self.settings.setValue(key, json.dumps([str(n) for n in (names or [])], ensure_ascii=False))
 
 
 # ======================== 语音合成线程 (edge-tts) ========================
@@ -3574,6 +3956,26 @@ class ConfigDialog(QDialog):
                 key: str(config.settings.value(key, "") or "").strip()
                 for key in ("api_key", "tavily_api_key", "amap_api_key")
             }
+            self.dsh_bridge_checkbox = QCheckBox("启用 DSH 桥接（交给本机 DSH 运行时）")
+            self.dsh_bridge_checkbox.setChecked(config.get_dsh_bridge_enabled())
+            self.dsh_bridge_checkbox.setToolTip(
+                "勾选后：消息转交本机 DSH（dsh --profile acp）处理，模型与 API Key 由 DSH 自己管理；\n"
+                "下面的 Base URL / API Key / 模型 / 推理强度将不再生效。\n"
+                "取消勾选：回到本地直连模型。"
+            )
+            layout.addRow(self.dsh_bridge_checkbox)
+            self.dsh_bridge_hint = QLabel(
+                "⚠ 已启用 DSH 桥接：下面的 Base URL / API Key / 模型 / 推理强度已停用（灰色），"
+                "对话与工具执行全部交给本机 DSH 运行时。"
+            )
+            self.dsh_bridge_hint.setWordWrap(True)
+            self.dsh_bridge_hint.setStyleSheet(
+                "color: #ffb454; font-weight: bold; background-color: #3a2d17;"
+                " border: 1px solid #d9822b; border-radius: 6px; padding: 6px 8px;"
+            )
+            self.dsh_bridge_hint.setVisible(config.get_dsh_bridge_enabled())
+            layout.addRow("", self.dsh_bridge_hint)
+
             self.api_key_edit = self._make_secret_edit(config.get_api_key(), "sk-...")
             layout.addRow("API Key:", self.api_key_edit)
 
@@ -3611,6 +4013,9 @@ class ConfigDialog(QDialog):
 
             self.amap_api_key_edit = self._make_secret_edit(config.get_amap_api_key(), "高德开放平台 Web服务 Key")
             layout.addRow("高德 Key:", self.amap_api_key_edit)
+
+            self.dsh_bridge_checkbox.toggled.connect(self._apply_dsh_bridge_state)
+            self._apply_dsh_bridge_state(self.dsh_bridge_checkbox.isChecked())
 
         elif section == "prompt":
             displayed_system_prompt = system_prompt_text if system_prompt_text is not None else config.get_system_prompt()
@@ -3719,6 +4124,28 @@ class ConfigDialog(QDialog):
         self.system_prompt_edit.setPlainText(self.default_system_prompt_text)
         self.system_prompt_edit.blockSignals(False)
 
+    def _apply_dsh_bridge_state(self, enabled):
+        """桥接开启时，本地模型相关字段不再参与，直接置灰并标注，避免看不出区别。"""
+        disabled_style = (
+            "color: #6f747a; background-color: #23262a;"
+            " border: 1px solid #34383d; border-radius: 4px; padding: 2px 6px;"
+        )
+        for widget in (
+            self.api_key_edit,
+            self.base_url_edit,
+            self.model_edit,
+            self.vision_model_edit,
+            self.reasoning_combo,
+        ):
+            widget.setEnabled(not enabled)
+            widget.setStyleSheet(disabled_style if enabled else "")
+        self.dsh_bridge_checkbox.setText(
+            "启用 DSH 桥接（交给本机 DSH 运行时）"
+            if not enabled
+            else "启用 DSH 桥接（已开启：由本机 DSH 运行时接管）"
+        )
+        self.dsh_bridge_hint.setVisible(enabled)
+
     def accept(self):
         if self.section == "config":
             self._save_secret_override("api_key", self.api_key_edit)
@@ -3729,6 +4156,7 @@ class ConfigDialog(QDialog):
             self.config.set_searxng_url(self.searxng_url_edit.text().strip())
             self._save_secret_override("tavily_api_key", self.tavily_api_key_edit)
             self._save_secret_override("amap_api_key", self.amap_api_key_edit)
+            self.config.set_dsh_bridge_enabled(self.dsh_bridge_checkbox.isChecked())
         elif self.section == "prompt":
             current_prompt = self.system_prompt_edit.toPlainText()
             if self._prompt_reset_requested:
@@ -4572,15 +5000,31 @@ class LocalHTTPServer:
         self.server = None
         self.thread = None
 
+    def _candidate_ports(self):
+        yield self.port
+        for extra in range(self.port + 1, self.port + 10):
+            yield extra
+
     def start(self):
         index_path = os.path.join(self.directory, "pet.html")
         if not os.path.isfile(index_path):
             raise FileNotFoundError(f"Live2D 页面资源缺失: {index_path}")
         handler = partial(Live2DRequestHandler, directory=self.directory)
-        self.server = HTTPServer(("localhost", self.port), handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        logging.info("本地HTTP服务器已启动: http://localhost:%s，目录：%s", self.port, self.directory)
+        last_error = None
+        for port in self._candidate_ports():
+            try:
+                server = HTTPServer(("localhost", port), handler)
+            except OSError as exc:
+                last_error = exc
+                logging.warning("本地HTTP端口 %s 被占用，尝试下一个端口", port)
+                continue
+            self.port = port
+            self.server = server
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+            logging.info("本地HTTP服务器已启动: http://localhost:%s，目录：%s", self.port, self.directory)
+            return
+        raise last_error or OSError("本地HTTP服务器无法启动")
 
     def stop(self):
         if self.server:
@@ -5734,6 +6178,7 @@ PET_DRAG_STAGE_SCRIPT = r"""
       }
     }
     window.__petActivityPre && window.__petActivityPre(model, dt);
+    window.__petParamPre && window.__petParamPre(model, dt);
     } catch (err) { stageError("pre", err); }
   };
 
@@ -5908,6 +6353,480 @@ PET_ACTIVITY_SCRIPT = r"""
 """
 
 
+# ======================== 桌宠 Live2D 参数层（大模型可调） ========================
+PET_PARAM_ENABLED = True
+PET_PARAM_DEFAULT_MS = 6000
+PET_PARAM_MIN_MS = 500
+PET_PARAM_MAX_MS = 30000
+
+# 语义情绪名（与 PET_PARAM_SCRIPT 内 EMOTIONS 保持一致，action_control 用它做参数校验）
+PET_EMOTION_NAMES = (
+    "happy", "sad", "angry", "surprised", "shy", "wink", "cry", "sleepy",
+    "love", "sparkle", "magic", "heart", "excited", "confused", "nervous",
+    "tongue", "neutral",
+)
+
+PET_PARAM_SCRIPT = r"""
+// 桌宠 Live2D 情绪层：语义情绪 + 原始参数覆盖，由大模型经工具调用驱动。
+// 状态仲裁：工作/思考/等待时整层让位给活动层（活动层独占）；播放 TTS 时与口型共存，
+// 但嘴型永远归口型动画（speaking 期间情绪不写嘴）。拖拽演出（phase != idle）时整层让位。
+// 每个覆盖项到期后平滑回落到底层默认值，再把控制权交回框架动作/物理。
+// 注意：框架每帧 loadParameters() 会用上一帧 saveParameters() 的快照还原参数，
+// 所以覆盖项必须自己维护动画值（overrides[id].cur）；若每帧从模型当前值重新逼近，
+// 就只会走 rate*dt（约两成）就停在原地，表现是所有表情都半透明发虚。
+(() => {
+  if (window.__petParamReady) { return; }
+  window.__petParamReady = true;
+
+  const DEFAULT_DURATION_MS = 6000;
+  const MIN_DURATION_MS = 500;
+  const MAX_DURATION_MS = 30000;
+  const APPLY_RATE = 12;      // 逼近目标速度
+  const RELEASE_RATE = 7;     // 回落默认值速度
+  const SWITCH_APPLY_RATE = 26;    // 物料开关（ParamCheek** 这类 0/1 美术件）要快
+  const SWITCH_RELEASE_RATE = 22;  // 否则切换时两个物料各半透明地叠在一起
+  const CLEAR_EPS = 0.02;
+
+  // 说话期间这些参数归 __petMouthSet 口型动画独占，情绪不得写入
+  const MOUTH_PARAMS = {
+    ParamMouthForm: 1, ParamMouthOpenY: 1,
+    ParamA: 1, ParamI: 1, ParamU: 1, ParamE: 1, ParamO: 1,
+  };
+
+  window.__petSpeaking = false;
+
+  // 语义情绪 -> 参数目标。每项 ids 为候选参数名，运行时取当前模型中第一个存在的。
+  // 覆盖 Mao / Hiyori / 大肥鱼 三种内置模型的常见参数，跨模型自动降级。
+  const EMOTIONS = {
+    happy: [
+      { ids: ["ParamEyeLSmile"], value: 1 },
+      { ids: ["ParamEyeRSmile"], value: 1 },
+      { ids: ["ParamMouthForm"], value: 1 },
+      { ids: ["ParamCheek"], value: 0.6 },
+      { ids: ["ParamCheek76"], value: 1 }
+    ],
+    sad: [
+      // 不用作者 阴暗.exp3 的 Paramhh3：那是整脸蒙一层半透明灰，会让画面发虚
+      { ids: ["ParamBrowLY"], value: -1 },
+      { ids: ["ParamBrowRY"], value: -1 },
+      { ids: ["ParamMouthForm"], value: -1.5 },
+      { ids: ["ParamEyeBallY"], value: -0.5 },
+      { ids: ["ParamEyeLOpen"], value: 0.6 },
+      { ids: ["ParamEyeROpen"], value: 0.6 },
+      { ids: ["ParamCheek15"], value: 1 }
+    ],
+    angry: [
+      { ids: ["ParamBrowLX"], value: -1 },
+      { ids: ["ParamBrowLY"], value: -0.5 },
+      { ids: ["ParamBrowLAngle"], value: -1 },
+      { ids: ["ParamBrowLForm"], value: -0.6 },
+      { ids: ["ParamBrowRX"], value: -1 },
+      { ids: ["ParamBrowRY"], value: -0.5 },
+      { ids: ["ParamBrowRAngle"], value: -1 },
+      { ids: ["ParamBrowRForm"], value: -0.6 },
+      { ids: ["ParamMouthAngry"], value: 1 },
+      { ids: ["ParamCheek80"], value: 1 },
+      { ids: ["ParamCheek23"], value: 1 }
+    ],
+    surprised: [
+      { ids: ["ParamEyeLOpen"], value: 1.7 },
+      { ids: ["ParamEyeROpen"], value: 1.7 },
+      { ids: ["ParamBrowLY"], value: 1 },
+      { ids: ["ParamBrowRY"], value: 1 },
+      { ids: ["ParamMouthOpenY"], value: 0.9 },
+      { ids: ["ParamA"], value: 0.9 },
+      { ids: ["ParamO"], value: 0.6 },
+      { ids: ["ParamCheek75"], value: 1 }
+    ],
+    shy: [
+      { ids: ["ParamCheek"], value: 1 },
+      { ids: ["Paramhh2"], value: 1 },
+      { ids: ["ParamEyeLSmile"], value: 0.7 },
+      { ids: ["ParamEyeRSmile"], value: 0.7 },
+      { ids: ["ParamEyeBallX"], value: -0.25 },
+      { ids: ["ParamEyeBallY"], value: -0.3 },
+      { ids: ["ParamMouthForm"], value: 0.3 }
+    ],
+    wink: [
+      { ids: ["ParamEyeLOpen"], value: 0 },
+      { ids: ["ParamEyeRSmile"], value: 1 },
+      { ids: ["ParamMouthForm"], value: 0.6 },
+      { ids: ["ParamCheek"], value: 0.4 },
+      { ids: ["ParamCheek21"], value: 1 }
+    ],
+    cry: [
+      // 眼睛全闭：作者 哭.exp3 自带呆眼物料，留缝会露出底下的眼睛叠影
+      { ids: ["ParamEyeLOpen"], value: 0 },
+      { ids: ["ParamEyeROpen"], value: 0 },
+      { ids: ["ParamEyeBallY"], value: -0.7 },
+      { ids: ["ParamBrowLY"], value: -1 },
+      { ids: ["ParamBrowRY"], value: -1 },
+      { ids: ["ParamMouthForm"], value: -1.5 },
+      { ids: ["ParamCheek20"], value: 1 },
+      { ids: ["ParamCheek27"], value: 1 }
+    ],
+    sleepy: [
+      // 眼睛全闭：作者 闭眼口水.exp3 的物料自带闭眼美术
+      { ids: ["ParamEyeLOpen"], value: 0 },
+      { ids: ["ParamEyeROpen"], value: 0 },
+      { ids: ["ParamBrowLY"], value: -0.4 },
+      { ids: ["ParamBrowRY"], value: -0.4 },
+      { ids: ["ParamMouthForm"], value: -0.3 },
+      { ids: ["ParamMouthOpenY"], value: 0.15 },
+      { ids: ["ParamCheek22"], value: 1 }
+    ],
+    love: [
+      { ids: ["ParamCheek"], value: 0.9 },
+      { ids: ["ParamEyeLSmile"], value: 1 },
+      { ids: ["ParamEyeRSmile"], value: 1 },
+      { ids: ["ParamCheek17"], value: 1 },
+      { ids: ["ParamHeartHealOn"], value: 1 },
+      { ids: ["ParamHeartColorHeal"], value: 1 },
+      { ids: ["ParamHeartDrow"], value: 1 },
+      { ids: ["ParamHeartSize"], value: 1 }
+    ],
+    sparkle: [
+      { ids: ["ParamCheek"], value: 0.5 },
+      { ids: ["ParamEyeLSmile"], value: 1 },
+      { ids: ["ParamEyeRSmile"], value: 1 },
+      { ids: ["ParamEyeBallY"], value: 0.2 },
+      { ids: ["ParamCheek16"], value: 1 },
+      { ids: ["ParamHeartLightOn"], value: 1 },
+      { ids: ["ParamHeartLight"], value: 1 }
+    ],
+    magic: [
+      { ids: ["ParamWandInk"], value: 1 },
+      { ids: ["ParamWandRotate"], value: 1 },
+      { ids: ["ParamAuraOn"], value: 1 },
+      { ids: ["ParamAura"], value: 1 },
+      { ids: ["ParamEyeLSmile"], value: 0.6 },
+      { ids: ["ParamEyeRSmile"], value: 0.6 },
+      { ids: ["mozhua"], value: 1 },
+      { ids: ["bi"], value: 1 }
+    ],
+    heart: [
+      { ids: ["ParamHeartHealOn"], value: 1 },
+      { ids: ["ParamHeartColorHeal"], value: 1 },
+      { ids: ["ParamHeartDrow"], value: 1 },
+      { ids: ["ParamHeartSize"], value: 1 },
+      { ids: ["ParamCheek"], value: 1 },
+      { ids: ["ParamCheek73"], value: 1 }
+    ],
+    excited: [
+      { ids: ["ParamEyeLOpen"], value: 1.3 },
+      { ids: ["ParamEyeROpen"], value: 1.3 },
+      { ids: ["ParamEyeBallY"], value: 0.3 },
+      { ids: ["ParamCheek"], value: 0.7 },
+      { ids: ["ParamMouthOpenY"], value: 0.5 },
+      { ids: ["ParamA"], value: 0.5 },
+      { ids: ["ParamCheek76"], value: 1 }
+    ],
+    confused: [
+      { ids: ["ParamBrowLY"], value: 1 },
+      { ids: ["ParamBrowRY"], value: -0.4 },
+      { ids: ["ParamEyeBallX"], value: 0.4 },
+      { ids: ["ParamMouthForm"], value: -0.3 },
+      { ids: ["ParamCheek74"], value: 1 }
+    ],
+    nervous: [
+      { ids: ["ParamCheek19"], value: 1 },
+      { ids: ["ParamEyeLOpen"], value: 0.9 },
+      { ids: ["ParamEyeROpen"], value: 0.9 },
+      { ids: ["ParamBrowLY"], value: -0.3 },
+      { ids: ["ParamBrowRY"], value: -0.3 },
+      { ids: ["ParamMouthForm"], value: -0.4 }
+    ],
+    tongue: [
+      { ids: ["ParamCheek79"], value: 1 },
+      { ids: ["ParamMouthOpenY"], value: 0.76 },
+      { ids: ["ParamMouthForm"], value: 0.97 },
+      { ids: ["ParamEyeRSmile"], value: 0.8 }
+    ],
+    neutral: []
+  };
+
+  window.__petParamEmotions = Object.keys(EMOTIONS);
+
+  let modelRef = null;
+  let indexOf = {};
+  let ranges = {};
+  let pendingOp = null;
+  let pendingWear = null;
+
+  const overrides = {};   // id -> { target, rate, release }  瞬时情绪/裸参数
+  const worn = {};        // id -> { value, cur }             持久穿戴（配件/表情），与瞬时互不干扰
+  let expireAt = 0;
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  function ensureModel(model) {
+    if (modelRef === model && modelRef) { return true; }
+    const params = model && model._model && model._model.parameters;
+    if (!params || !params.ids) { return false; }
+    modelRef = model;
+    indexOf = {};
+    ranges = {};
+    const ids = Array.from(params.ids);
+    for (let i = 0; i < ids.length; i++) {
+      indexOf[ids[i]] = i;
+      ranges[ids[i]] = {
+        min: params.minimumValues ? params.minimumValues[i] : -10,
+        max: params.maximumValues ? params.maximumValues[i] : 10,
+        def: params.defaultValues ? params.defaultValues[i] : 0
+      };
+    }
+    if (pendingOp) {
+      const op = pendingOp;
+      pendingOp = null;
+      try { op(); } catch (err) { window.__petParamErr = String((err && err.message) ? err.message : err); }
+    }
+    if (pendingWear !== null) {
+      const names = pendingWear;
+      pendingWear = null;
+      try { applyWear(names); } catch (err) { window.__petParamErr = String((err && err.message) ? err.message : err); }
+    }
+    return true;
+  }
+
+  function pickId(ids) {
+    for (let i = 0; i < ids.length; i++) {
+      if (Object.prototype.hasOwnProperty.call(indexOf, ids[i])) { return ids[i]; }
+    }
+    return null;
+  }
+
+  // 参数分组：作者 exp3 已经照顾到的组（眼/眉/嘴）让通用表让位，避免两边各写一份打架。
+  function paramGroup(id) {
+    if (/^ParamEye/.test(id)) { return "eye"; }
+    if (/^ParamBrow/.test(id)) { return "brow"; }
+    if (/^ParamMouth/.test(id) || id === "ParamA" || id === "ParamI" || id === "ParamU"
+        || id === "ParamE" || id === "ParamO") { return "mouth"; }
+    return "";
+  }
+
+  // 物料开关：0/1 驱动一整块美术件（大肥鱼 ParamCheek**/Paramhh* 与道具参数），
+  // 走快档、且不按强度缩放，绝不停在半透明中间态。
+  function isSwitchParam(id) {
+    return /^ParamCheek\d+$/.test(id) || /^Paramhh\d+$/.test(id)
+      || id === "mozhua" || id === "mozhua2" || id === "love" || id === "aixing"
+      || id === "ji" || id === "bi";
+  }
+
+  // 作者自带 exp3 的 Delta 折算成绝对值：Add = 默认值 + 增量，Multiply = 默认值 * 增量，
+  // Set = 直接取该值（配置文件里的 params 用）。
+  function convertEntries(list) {
+    if (!list || !list.length) { return null; }
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i] || {};
+      const id = String(item.id || "");
+      const range = ranges[id];
+      if (!id || !range) { continue; }
+      const delta = Number(item.value) || 0;
+      const blend = String(item.blend || "Add").toLowerCase();
+      let value = delta;
+      if (blend === "multiply") { value = range.def * delta; }
+      else if (blend === "add") { value = range.def + delta; }
+      // 没真正改动的项（Add 0 / Multiply 1）跳过：覆盖它们等于把参数钉死，连眨眼都会被冻住。
+      if (Math.abs(value - range.def) < 1e-6) { continue; }
+      out.push({ id: id, value: value });
+    }
+    return out.length ? out : null;
+  }
+
+  // 情绪用：config 解析后的情绪表（作者表情 + 配置 params）。
+  function expressionEntries(name) {
+    const table = window.__petExprParams;
+    return convertEntries(table ? table[name] : null);
+  }
+
+  // 穿戴用：模型全部 exp3 原表。
+  function wornEntries(name) {
+    const table = window.__petAllExpressions;
+    return convertEntries(table ? table[name] : null);
+  }
+
+  function applyWear(names) {
+    for (const id in worn) { delete worn[id]; }
+    const list = names || [];
+    for (let i = 0; i < list.length; i++) {
+      const entries = wornEntries(list[i]);
+      if (!entries) { continue; }
+      for (let j = 0; j < entries.length; j++) {
+        const entry = entries[j];
+        const range = ranges[entry.id];
+        if (!range) { continue; }
+        worn[entry.id] = { value: clamp(entry.value, range.min, range.max), cur: null };
+      }
+    }
+    return Object.keys(worn);
+  }
+
+  window.__petWearApply = function (names) {
+    if (!modelRef) { pendingWear = names; return true; }
+    applyWear(names);
+    return true;
+  };
+
+  window.__petWearClear = function () {
+    for (const id in worn) { delete worn[id]; }
+    pendingWear = null;
+  };
+
+  function setOverride(id, target, isSwitch) {
+    const range = ranges[id];
+    if (!range) { return; }
+    const keep = overrides[id];
+    overrides[id] = {
+      target: clamp(target, range.min, range.max),
+      cur: keep ? keep.cur : null,
+      rate: isSwitch ? SWITCH_APPLY_RATE : APPLY_RATE,
+      releaseRate: isSwitch ? SWITCH_RELEASE_RATE : RELEASE_RATE,
+      release: false
+    };
+  }
+
+  function performEmotion(name, intensity, durationMs) {
+    const table = EMOTIONS[name];
+    if (!table) { return; }
+    for (const id in overrides) { overrides[id].release = true; }
+    const k = clamp(Number(intensity) || 0, 0, 1);
+    // 作者原版表情优先：它才是该模型「正确」的观感（物料之外还带基础五官改动）。
+    const expr = expressionEntries(name);
+    const claimedId = {};
+    const claimedGroup = {};
+    if (expr) {
+      for (let i = 0; i < expr.length; i++) {
+        claimedId[expr[i].id] = true;
+        const group = paramGroup(expr[i].id);
+        if (group) { claimedGroup[group] = true; }
+      }
+    }
+    for (let i = 0; i < table.length; i++) {
+      const entry = table[i];
+      const id = pickId(entry.ids);
+      if (!id || claimedId[id]) { continue; }
+      const group = paramGroup(id);
+      if (group && claimedGroup[group]) { continue; }
+      setOverride(id, entry.value * k, isSwitchParam(id));
+    }
+    if (expr) {
+      for (let i = 0; i < expr.length; i++) {
+        const id = expr[i].id;
+        const isSwitch = isSwitchParam(id);
+        setOverride(id, isSwitch ? expr[i].value : expr[i].value * k, isSwitch);
+      }
+    }
+    const dur = clamp(Number(durationMs) || DEFAULT_DURATION_MS, MIN_DURATION_MS, MAX_DURATION_MS);
+    expireAt = performance.now() + dur;
+  }
+
+  function performRaw(mapping, durationMs) {
+    const keys = Object.keys(mapping || {});
+    for (const id in overrides) { overrides[id].release = true; }
+    for (let i = 0; i < keys.length; i++) {
+      const id = keys[i];
+      if (Object.prototype.hasOwnProperty.call(indexOf, id)) {
+        setOverride(id, Number(mapping[id]) || 0, false);
+      }
+    }
+    const dur = clamp(Number(durationMs) || DEFAULT_DURATION_MS, MIN_DURATION_MS, MAX_DURATION_MS);
+    expireAt = performance.now() + dur;
+  }
+
+  function releaseAll() {
+    for (const id in overrides) { overrides[id].release = true; }
+  }
+
+  window.__petEmotionSet = function (name, intensity, durationMs) {
+    const key = String(name || "").trim().toLowerCase();
+    if (!EMOTIONS[key]) { return false; }
+    if (!modelRef) { pendingOp = function () { performEmotion(key, intensity, durationMs); }; return true; }
+    performEmotion(key, intensity, durationMs);
+    return true;
+  };
+
+  window.__petParamSet = function (mapping, durationMs) {
+    if (!mapping || typeof mapping !== "object") { return false; }
+    if (!modelRef) { pendingOp = function () { performRaw(mapping, durationMs); }; return true; }
+    performRaw(mapping, durationMs);
+    return true;
+  };
+
+  window.__petParamClear = function () {
+    expireAt = 0;
+    releaseAll();
+  };
+
+  window.__petParamActive = function () {
+    return Object.keys(overrides).length > 0;
+  };
+
+  window.__petParamInfo = function () {
+    return {
+      ready: true,
+      model: modelRef ? true : false,
+      emotions: Object.keys(EMOTIONS),
+      modelExpressions: Object.keys(window.__petExprParams || {}),
+      wearables: Object.keys(window.__petAllExpressions || {}),
+      active: Object.keys(overrides),
+      worn: Object.keys(worn)
+    };
+  };
+
+  window.__petParamPre = function (model, dt) { try {
+    if (!ensureModel(model)) { return; }
+    const step = clamp(Number(dt) || 0.016, 0.001, 0.05);
+    const speaking = !!window.__petSpeaking;
+    // 持久穿戴层：任何状态都在（拖拽/工作也不脱），瞬时情绪可临时盖住同参数
+    const wornIds = Object.keys(worn);
+    for (let i = 0; i < wornIds.length; i++) {
+      const id = wornIds[i];
+      if (speaking && MOUTH_PARAMS[id]) { continue; }
+      if (overrides[id]) { continue; }   // 瞬时情绪优先
+      const index = indexOf[id];
+      const range = ranges[id];
+      const w = worn[id];
+      if (index === undefined || !range || !w) { delete worn[id]; continue; }
+      if (w.cur === null || w.cur === undefined) { w.cur = model.getParameterValueByIndex(index); }
+      const rate = isSwitchParam(id) ? SWITCH_APPLY_RATE : APPLY_RATE;
+      w.cur = w.cur + (w.value - w.cur) * Math.min(1, step * rate);
+      model.setParameterValueByIndex(index, w.cur);
+    }
+
+    const phase = (window.__petStage && window.__petStage.phase) || "idle";
+    if (phase !== "idle") { return; }
+    // 状态仲裁：工作/思考/等待时活动层独占，瞬时情绪让位（除非正在说话）
+    const activity = (window.__petActivityState && window.__petActivityState.name) || "idle";
+    if (!speaking && (activity === "thinking" || activity === "working" || activity === "waiting")) {
+      return;
+    }
+    const now = performance.now();
+    if (expireAt && now > expireAt) { expireAt = 0; releaseAll(); }
+    const ids = Object.keys(overrides);
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      // 说话期间嘴型归口型动画独占，情绪跳过所有嘴部参数
+      if (speaking && MOUTH_PARAMS[id]) { continue; }
+      const index = indexOf[id];
+      const range = ranges[id];
+      const ov = overrides[id];
+      if (index === undefined || !range || !ov) { delete overrides[id]; continue; }
+      // 模型上的值每帧都会被框架 loadParameters() 还原，不能拿它当逼近基准；
+      // 覆盖项自己维护动画值，逐帧绝对写入（本钩子在框架写完参数之后、update() 之前）。
+      if (ov.cur === null || ov.cur === undefined) { ov.cur = model.getParameterValueByIndex(index); }
+      const target = ov.release ? clamp(range.def, range.min, range.max) : ov.target;
+      const rate = ov.release ? (ov.releaseRate || RELEASE_RATE) : ov.rate;
+      ov.cur = ov.cur + (target - ov.cur) * Math.min(1, step * rate);
+      model.setParameterValueByIndex(index, ov.cur);
+      if (ov.release && Math.abs(ov.cur - target) < CLEAR_EPS) { delete overrides[id]; }
+    }
+  } catch (err) { window.__petParamErr = String((err && err.message) ? err.message : err); } };
+})();
+
+"""
+
+
 class DesktopPetWindow(QWidget):
     BASE_SIZE = QSize(360, 480)
 
@@ -5951,6 +6870,7 @@ class DesktopPetWindow(QWidget):
         self._mouth_timer = QTimer(self)
         self._mouth_timer.setInterval(PET_MOUTH_TICK_MS)
         self._mouth_timer.timeout.connect(self._tick_mouth)
+        self._pending_expression = None   # 大模型表情指令缓存：等到回复播报/说话时再执行
         self._setup_tray()
 
         self.setWindowTitle("桌宠")
@@ -5986,11 +6906,46 @@ class DesktopPetWindow(QWidget):
         self.interaction_overlay.raise_()
 
         self._place_default_position()
+        self._pet_model_loaded = False
+        self._pet_load_retry = 0
         if self.live2d_server:
             QTimer.singleShot(400, self.load_live2d_model)
-        self.webview.loadFinished.connect(lambda _ok: self._clear_canvas_scale())
-        self.webview.loadFinished.connect(lambda _ok: self._install_pet_drag_stage())
-        self.webview.loadFinished.connect(lambda _ok: self._install_pet_activity())
+        self.webview.loadFinished.connect(self._on_pet_page_loaded)
+
+    def _on_pet_page_loaded(self, ok):
+        """页面加载完成：装脚本；若引擎还没就绪（首次常发），延迟重试一次。"""
+        self._clear_canvas_scale()
+        self._install_pet_drag_stage()
+        self._install_pet_activity()
+        self._install_pet_params()
+        if not ok:
+            return
+        QTimer.singleShot(800, self._verify_pet_model)
+        QTimer.singleShot(2200, self._verify_pet_model)
+
+    def _verify_pet_model(self):
+        if self.webview is None:
+            return
+        self.webview.page().runJavaScript(
+            "JSON.stringify(window.__petParamInfo ? window.__petParamInfo() : {missing:true})",
+            self._on_pet_model_probe,
+        )
+
+    def _on_pet_model_probe(self, result):
+        try:
+            info = json.loads(result) if isinstance(result, str) else (result or {})
+        except (TypeError, ValueError):
+            info = {}
+        ready = bool(info.get("model")) if isinstance(info, dict) else False
+        if ready:
+            self._pet_model_loaded = True
+            self._pet_load_retry = 0
+            return
+        if self._pet_model_loaded or self._pet_load_retry >= 1:
+            return
+        self._pet_load_retry += 1
+        logging.warning("[pet] 首次加载未就绪，重试加载模型页面：%s", info)
+        self.load_live2d_model()
 
     def load_live2d_model(self):
         if self.live2d_server:
@@ -6156,6 +7111,7 @@ class DesktopPetWindow(QWidget):
         self._speech_stream_received = False
         self._speech_playing = False
         self._tts_speech_active = False
+        self._pending_expression = None   # 新一轮开始，丢弃上一轮未播放的表情
 
     def prepare_tts_speech(self, pages, kaomoji=None):
         self.speech_timer.stop()
@@ -6260,6 +7216,9 @@ class DesktopPetWindow(QWidget):
         self._mouth_started = time.monotonic()
         self.webview.page().runJavaScript(PET_DRAG_STAGE_SCRIPT)
         self._mouth_timer.start()
+        self._set_pet_speaking(True)
+        # 说话开始：真正播放本回合缓存的表情，与口型一起
+        self.activate_pending_expression()
 
     def stop_mouth_animation(self):
         self._mouth_timer.stop()
@@ -6268,6 +7227,7 @@ class DesktopPetWindow(QWidget):
         self._mouth_started = 0.0
         if PET_DRAG_STAGE_ENABLED and self.webview is not None:
             self.webview.page().runJavaScript("window.__petMouthSet && window.__petMouthSet(0, 0);")
+        self._set_pet_speaking(False)
 
     def _tick_mouth(self):
         if not self._tts_speech_active or self.webview is None:
@@ -6302,6 +7262,7 @@ class DesktopPetWindow(QWidget):
         self._speech_stream_received = False
         self._speech_playing = False
         self._tts_speech_active = False
+        self._pending_expression = None
         self.stop_mouth_animation()
         self.speech_bubble.hide()
 
@@ -6443,6 +7404,139 @@ class DesktopPetWindow(QWidget):
         script = "window.__petActivitySet && window.__petActivitySet(%s);" % json.dumps(name)
         self.webview.page().runJavaScript(script)
 
+    # --- 大模型可调的 Live2D 参数层 ---
+    def _current_pet_model_name(self):
+        try:
+            return self.chat_window.config.get_pet_model_name()
+        except AttributeError:
+            return None
+
+    def _push_pet_expressions(self):
+        """把当前模型作者自带的 *.exp3.json 下发到页面（情绪层按作者原版还原表情，
+        并附全量清单供穿戴菜单使用）。"""
+        if self.webview is None:
+            return
+        model_name = self._current_pet_model_name()
+        table = get_live2d_expression_params(model_name)
+        all_expr = get_live2d_all_expressions(model_name)
+        self.webview.page().runJavaScript(
+            "window.__petExprParams = %s;" % json.dumps(table, ensure_ascii=False))
+        self.webview.page().runJavaScript(
+            "window.__petAllExpressions = %s;" % json.dumps(all_expr, ensure_ascii=False))
+
+    def _install_pet_params(self):
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        self._push_pet_expressions()
+        self.webview.page().runJavaScript(PET_PARAM_SCRIPT)
+        # 页面就绪后恢复该模型已保存的穿戴
+        self.set_pet_wear(self.get_current_worn())
+
+    def get_current_worn(self):
+        model_name = self._current_pet_model_name()
+        try:
+            return self.chat_window.config.get_pet_worn(model_name)
+        except AttributeError:
+            return []
+
+    def set_pet_wear(self, names):
+        """持久穿戴：列出要佩戴的 .exp3.json 名称，未列出的自动脱下。"""
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        names = [str(n) for n in (names or [])]
+        script = "window.__petWearApply && window.__petWearApply(%s);" % json.dumps(
+            names, ensure_ascii=False)
+        logging.info("[pet-wear] 应用穿戴：%s", names)
+        self.webview.page().runJavaScript(script)
+
+    def clear_pet_wear(self):
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        self.webview.page().runJavaScript("window.__petWearClear && window.__petWearClear();")
+
+    def set_pet_emotion(self, name, intensity=1.0, duration_ms=None):
+        """按语义情绪驱动桌宠表情（happy/shy/angry/love/...）。"""
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        duration_ms = PET_PARAM_DEFAULT_MS if duration_ms is None else int(duration_ms)
+        self._install_pet_params()
+        try:
+            intensity = max(0.0, min(1.0, float(intensity)))
+        except (TypeError, ValueError):
+            intensity = 1.0
+        script = "window.__petEmotionSet && window.__petEmotionSet(%s, %s, %s);" % (
+            json.dumps(str(name or "neutral")), round(intensity, 3), int(duration_ms))
+        logging.info("[pet-exp] JS 情绪：%s", script)
+        self.webview.page().runJavaScript(script)
+
+    def set_pet_params(self, mapping, duration_ms=None):
+        """直接覆盖一个或多个 Live2D 参数，到期后自动回落默认值。"""
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        if not isinstance(mapping, dict) or not mapping:
+            return
+        duration_ms = PET_PARAM_DEFAULT_MS if duration_ms is None else int(duration_ms)
+        try:
+            clean = {str(k): float(v) for k, v in mapping.items()}
+        except (TypeError, ValueError):
+            return
+        self._install_pet_params()
+        script = "window.__petParamSet && window.__petParamSet(%s, %s);" % (
+            json.dumps(clean, ensure_ascii=False), int(duration_ms))
+        self.webview.page().runJavaScript(script)
+
+    def clear_pet_params(self):
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        self.webview.page().runJavaScript("window.__petParamClear && window.__petParamClear();")
+
+    # --- 情绪层调度：工作期间只跑活动层，情绪缓存到回复播报/说话时才播 ---
+    def request_pet_expression(self, payload):
+        """登记一次大模型表情指令，等工作结束、开始播报/说话时再执行。"""
+        if not isinstance(payload, dict):
+            return
+        self._pending_expression = dict(payload)
+        logging.info("[pet-exp] 登记表情指令：%s", self._pending_expression)
+
+    def has_pending_expression(self):
+        return bool(self._pending_expression)
+
+    def clear_pending_expression(self):
+        if self._pending_expression:
+            logging.info("[pet-exp] 清空未播放的表情：%s", self._pending_expression)
+        self._pending_expression = None
+
+    def activate_pending_expression(self):
+        """把缓存的表情指令真正下发到页面；返回是否执行了指令。"""
+        payload = self._pending_expression
+        self._pending_expression = None
+        if not payload:
+            logging.info("[pet-exp] 无可播放的表情（pending 为空）")
+            return False
+        kind = str(payload.get("kind") or "")
+        logging.info("[pet-exp] 播放缓存表情：%s", payload)
+        if kind == "emotion":
+            self.set_pet_emotion(
+                payload.get("emotion", "neutral"),
+                payload.get("intensity", 1.0),
+                payload.get("duration_ms"),
+            )
+        elif kind == "param":
+            self.set_pet_params(payload.get("parameters") or {}, payload.get("duration_ms"))
+        elif kind == "clear":
+            self.clear_pet_params()
+        else:
+            logging.warning("[pet-exp] 未知的表情指令类型：%s", kind)
+            return False
+        return True
+
+    def _set_pet_speaking(self, speaking):
+        if not PET_PARAM_ENABLED or self.webview is None:
+            return
+        logging.info("[pet-exp] speaking=%s", speaking)
+        self.webview.page().runJavaScript(
+            "window.__petSpeaking = %s;" % ("true" if speaking else "false"))
+
     def set_pet_activity(self, name, hint=None):
         """设置桌宠活动反馈：idle / thinking / working / waiting / done。"""
         name = str(name or "idle").strip() or "idle"
@@ -6500,26 +7594,61 @@ class DesktopPetWindow(QWidget):
             return
         self.speech_bubble.hide()
 
+    def _add_pet_menu_entries(self, menu, include_window_toggles=True):
+        """把「桌宠」菜单项加进任意菜单：右键桌宠与托盘共用同一批入口。"""
+        model_menu = menu.addMenu("桌宠模型")
+        catalog = get_live2d_model_catalog()
+        current = self.chat_window._get_selected_live2d_model()["id"] if catalog else None
+        model_group = QActionGroup(model_menu)
+        model_group.setExclusive(True)
+        for item in catalog:
+            action = model_menu.addAction(item["label"])
+            action.setCheckable(True)
+            action.setChecked(item["id"] == current)
+            action.setActionGroup(model_group)
+            action.triggered.connect(
+                lambda _checked=False, mid=item["id"]: self.chat_window.set_pet_model(mid)
+            )
+        if not catalog:
+            empty = model_menu.addAction("（没有可用模型）")
+            empty.setEnabled(False)
+        model_menu.addSeparator()
+        model_menu.addAction("模型大小...").triggered.connect(
+            self.chat_window.show_pet_scale_dialog
+        )
+        model_menu.addAction("重新加载模型").triggered.connect(
+            self.chat_window.reload_live2d_model
+        )
+        model_menu.addAction("打开模型目录").triggered.connect(
+            self.chat_window.open_model_directory
+        )
+        menu.addAction("配件管理...").triggered.connect(
+            self.chat_window.show_pet_wear_dialog
+        )
+        menu.addAction("动作映射配置...").triggered.connect(
+            self.chat_window.show_pet_emotion_dialog
+        )
+        menu.addSeparator()
+        if include_window_toggles:
+            if self.chat_window.isVisible():
+                menu.addAction("隐藏聊天窗口").triggered.connect(
+                    self.chat_window.hide_chat_window
+                )
+            else:
+                menu.addAction("打开聊天窗口").triggered.connect(
+                    self.chat_window.show_chat_window
+                )
+            menu.addAction("隐藏桌宠").triggered.connect(self.hide)
+
     def show_context_menu(self, global_pos):
         menu = QMenu(self)
         style_popup_menu(menu, getattr(self.chat_window, "ui_theme", "dark"))
-        if self.chat_window.isVisible():
-            toggle_action = menu.addAction("隐藏聊天窗口")
-        else:
-            toggle_action = menu.addAction("打开聊天窗口")
-        hide_pet_action = menu.addAction("隐藏桌宠")
-        quit_action = menu.addAction("退出程序")
-
-        action = menu.exec(global_pos)
-        if action == toggle_action:
-            if self.chat_window.isVisible():
-                self.chat_window.hide_chat_window()
-            else:
-                self.chat_window.show_chat_window()
-        elif action == hide_pet_action:
-            self.hide()
-        elif action == quit_action:
-            self.quit_application()
+        menu.addAction("打开聊天窗口").triggered.connect(self.chat_window.show_chat_window)
+        menu.addSeparator()
+        self._add_pet_menu_entries(menu, include_window_toggles=True)
+        menu.addSeparator()
+        menu.addAction("退出程序").triggered.connect(self.quit_application)
+        menu.exec(global_pos)
 
     def quit_application(self):
         logging.info("退出程序")
@@ -6557,6 +7686,31 @@ class DesktopPetWindow(QWidget):
         self._tray_pet_action = menu.addAction("显示桌宠")
         self._tray_chat_action = menu.addAction("打开聊天窗口")
         menu.addSeparator()
+        self._add_pet_menu_entries(menu, include_window_toggles=False)
+        menu.addSeparator()
+        if DEBUG_MODE:
+            emotion_menu = menu.addMenu("测试桌宠表情")
+            for emotion, label in (
+                ("happy", "开心 happy"),
+                ("love", "心动 love"),
+                ("sparkle", "星星眼 sparkle"),
+                ("shy", "害羞 shy"),
+                ("angry", "生气 angry"),
+                ("sleepy", "犯困 sleepy"),
+                ("neutral", "收回表情"),
+            ):
+                action = emotion_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, name=emotion: (
+                        self.set_pet_activity("idle"),
+                        self.set_pet_emotion(name, 1.0, 8000),
+                    )
+                )
+            param_action = menu.addAction("测试裸参数 ParamAngleZ")
+            param_action.triggered.connect(
+                lambda: self.set_pet_params({"ParamAngleZ": 25}, 5000)
+            )
+            menu.addSeparator()
         quit_action = menu.addAction("退出程序")
         self._tray_pet_action.triggered.connect(self._toggle_pet_visibility)
         self._tray_chat_action.triggered.connect(self._toggle_chat_window)
@@ -6964,6 +8118,8 @@ class ComputerControlOverlay(QWidget):
 
 
 class MainWindow(QMainWindow):
+    pet_command_requested = pyqtSignal(object)
+
     def __init__(self, show_live2d_panel=True, managed_by_pet=False):
         super().__init__()
         self.setWindowIcon(get_app_icon())
@@ -6971,6 +8127,8 @@ class MainWindow(QMainWindow):
         self.managed_by_pet = managed_by_pet
         self.allow_close = not managed_by_pet
         self.pet_window = None
+        self.pet_command_requested.connect(self._apply_pet_command)
+        ActionHandler.set_pet_command_callback(self.pet_command_requested.emit)
         self.config = ConfigManager()
         self.db = MessageDatabase()
         ActionHandler.load_apps()
@@ -6991,6 +8149,8 @@ class MainWindow(QMainWindow):
         self.session_task_states = {}
         self.current_task_state = None
         self.current_api_thread = None
+        self.session_threads = {}
+        self.session_stream = {}
         self._permission_dialog = None
         self._pending_permission = None
         self.computer_overlay = ComputerControlOverlay()
@@ -7042,6 +8202,28 @@ class MainWindow(QMainWindow):
     def bind_pet_window(self, pet_window):
         self.pet_window = pet_window
         self._sync_kaomoji_to_pet()
+        self._refresh_pet_param_catalog()
+
+    def _refresh_pet_param_catalog(self):
+        """把当前桌宠模型的参数表同步给工具层，供 list_live2d_params 查询。"""
+        try:
+            model = self._get_selected_live2d_model()
+            ActionHandler.set_pet_param_catalog(get_live2d_param_catalog(model["id"]))
+        except Exception:
+            logging.debug("刷新 Live2D 参数表失败", exc_info=True)
+
+    def _apply_pet_command(self, payload):
+        """工具线程经信号转到主线程：表情指令只登记，等回复播报/说话时才真正执行。"""
+        if not self.pet_window or not isinstance(payload, dict):
+            return
+        kind = str(payload.get("kind") or "")
+        if kind not in ("emotion", "param", "clear"):
+            return
+        try:
+            logging.info("[pet-exp] 收到桌宠指令：%s", payload)
+            self.pet_window.request_pet_expression(payload)
+        except Exception:
+            logging.warning("登记桌宠指令失败：%s", payload, exc_info=True)
 
     def _sync_kaomoji_to_pet(self):
         if self.pet_window:
@@ -7393,16 +8575,19 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        self._delete_session(session_id)
 
-        if session_id == self.current_session_id:
+    def _delete_session(self, session_id):
+        """删除会话；若删的是当前窗口，则切到一个干净的新会话。"""
+        is_current = session_id == self.current_session_id
+        if is_current:
             self._discard_current_generation()
-            self.db.delete_session(session_id)
-            self._set_session_task_state(None, session_id=session_id)
-            self._show_temporary_session("当前会话已删除，等待新消息")
-            return
-
+        self._stop_session_thread(session_id)
         self.db.delete_session(session_id)
         self._set_session_task_state(None, session_id=session_id)
+        if is_current:
+            self._show_temporary_session("当前会话已删除，等待新消息")
+            return
         self.refresh_session_list()
 
     def _on_session_splitter_moved(self, position, index):
@@ -7477,6 +8662,16 @@ class MainWindow(QMainWindow):
         - 用户想清理磁盘、找大文件、看临时文件占用时，用 disk_scan 工具做只读扫描，列举结果并给出建议；不要删除任何文件，也不要建议执行删除命令。
         - 工具执行完成后，再基于工具返回结果自然回复用户。
         - {final_format_rule}
+        """
+        prompt += """
+
+        【桌宠 Live2D 表现】
+        - 你有一只桌面桌宠，可以用 control_pet 工具让它做出情绪表情，这是你与用户互动的一部分，能让交流更生动。
+        - 情绪明显、语气有起伏时就可以自然地调用，不必等用户点名要求；一条回复最多一次，别机械地每句都换表情，也别在纯信息型/严肃回复里硬套。
+        - 表情会在你本条回复开始播报/朗读时随说话动作一起展示，工作过程中不会抢动画，所以不用担心和任务动画冲突。
+        - control_pet 的 emotion 可选：happy、sad、angry、surprised、shy、wink、cry、sleepy、love、sparkle、magic、heart、excited、confused、nervous、tongue、neutral。intensity 为 0~1 的强度，duration_ms 为持续时间（默认 6000，500~30000）。neutral 表示立即收回表情。
+        - 需要更精细或模型专属的表现时，可用 set_live2d_param 直接设置参数；不确定参数名时先用 list_live2d_params 查询当前模型支持的参数，数值越界会被自动裁剪，到期后表情会自动回落。
+        - 这些工具只影响桌宠外观，不会修改系统；不要因为调用它们而在回复里解释技术细节，保持自然即可。
         """
         return prompt
 
@@ -7923,6 +9118,9 @@ class MainWindow(QMainWindow):
         pet_menu = view_menu.addMenu("桌宠")
         pet_menu.addAction("选择模型").triggered.connect(self.show_pet_model_dialog)
         pet_menu.addAction("模型大小").triggered.connect(self.show_pet_scale_dialog)
+        pet_menu.addAction("配件管理...").triggered.connect(self.show_pet_wear_dialog)
+        pet_menu.addAction("动作映射配置...").triggered.connect(self.show_pet_emotion_dialog)
+        pet_menu.addSeparator()
         pet_menu.addAction("重新加载模型").triggered.connect(self.reload_live2d_model)
         pet_menu.addAction("打开模型目录").triggered.connect(self.open_model_directory)
 
@@ -8192,6 +9390,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "模型不可用", "没有找到有效的 Live2D 模型资源。")
             return
         self.config.set_pet_model_name(model["id"])
+        self._refresh_pet_param_catalog()
         if self.show_live2d_panel and self.webview and self.live2d_server:
             self.webview.setUrl(QUrl(self._live2d_page_url("index.html")))
         if self.pet_window:
@@ -8222,6 +9421,176 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.set_pet_model(combo.currentData())
+
+    def show_pet_wear_dialog(self):
+        """独立窗口：勾选当前模型要持久穿戴的配件/表情（.exp3.json），可多选。"""
+        model = self._get_selected_live2d_model()
+        names = get_live2d_model_expression_names(model["id"])
+        worn = set(self.config.get_pet_worn(model["id"]))
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"穿戴配件 - {model['label']}")
+        dialog.resize(420, 460)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "勾选要佩戴的配件/表情，立即生效并记住。\n"
+            "同一部位的建议只选其一（例如眼镜类、耳饰类），避免美术件互相叠加。"
+        ))
+        listw = QListWidget()
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if name in worn else Qt.CheckState.Unchecked
+            )
+            listw.addItem(item)
+        if not names:
+            empty = QListWidgetItem("（当前模型没有可穿戴的 .exp3.json）")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            listw.addItem(empty)
+        layout.addWidget(listw, 1)
+
+        btn_layout = QHBoxLayout()
+        clear_btn = QPushButton("全部脱下")
+        close_btn = QPushButton("关闭")
+        btn_layout.addWidget(clear_btn)
+        btn_layout.addStretch(1)
+        btn_layout.addWidget(close_btn)
+
+        def apply_wear():
+            selected = [
+                listw.item(i).text()
+                for i in range(listw.count())
+                if listw.item(i).checkState() == Qt.CheckState.Checked
+            ]
+            selected = [n for n in selected if n in names]
+            self.config.set_pet_worn(model["id"], selected)
+            if self.pet_window:
+                self.pet_window.set_pet_wear(selected)
+            self.status_bar.showMessage(f"已更新穿戴：{len(selected)} 件", 2500)
+
+        def on_item_changed(_item):
+            apply_wear()
+
+        def clear_all():
+            listw.blockSignals(True)
+            for i in range(listw.count()):
+                listw.item(i).setCheckState(Qt.CheckState.Unchecked)
+            listw.blockSignals(False)
+            apply_wear()
+
+        listw.itemChanged.connect(on_item_changed)
+        clear_btn.clicked.connect(clear_all)
+        close_btn.clicked.connect(dialog.accept)
+        layout.addLayout(btn_layout)
+        dialog.exec()
+
+    def show_pet_emotion_dialog(self):
+        """独立窗口：情绪映射配置文件（生成模板 / 打开编辑 / 重载）。"""
+        model = self._get_selected_live2d_model()
+        path = os.path.join(get_config_dir(), "live2d_emotions.json")
+        folder, _ = _live2d_model_folder(model["id"])
+        available = set(_scan_exp3_files(folder).keys()) if folder else set()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("动作映射配置")
+        dialog.resize(600, 560)
+        layout = QVBoxLayout(dialog)
+        info = QTextBrowser()
+        layout.addWidget(info, 1)
+
+        def spec_label(spec):
+            if not isinstance(spec, dict):
+                return "未配置"
+            names = spec.get("expressions") or []
+            if names:
+                hits = [n for n in names if str(n).casefold() in available]
+                if hits:
+                    return "、".join(hits)
+                return "文件名无效：%s（该模型没有此 exp3）" % "、".join(str(n) for n in names)
+            if spec.get("params"):
+                return "参数覆盖 %d 项" % len(spec["params"])
+            return "未配置"
+
+        def refresh():
+            config = load_live2d_emotion_config(model["id"])
+            rows = []
+            matched = 0
+            for emotion in PET_EMOTION_EXPRESSIONS:
+                label = spec_label(config.get(emotion))
+                if label not in ("未配置",) and not label.startswith("文件名无效"):
+                    matched += 1
+                rows.append("  · %s：%s" % (emotion, label))
+            all_expr = get_live2d_all_expressions(model["id"])
+            if all_expr:
+                rows.append("")
+                rows.append("本模型可用 .exp3 文件（把文件名填到上面的 expressions 里）：")
+                for name, entries in all_expr.items():
+                    detail = "、".join(
+                        "%s=%s" % (e.get("id"), e.get("value")) for e in entries[:5]
+                    )
+                    rows.append("  · %s（%s）" % (name, detail))
+            else:
+                rows.append("")
+                rows.append("本模型没有任何 .exp3 文件：只能靠 params 直接指定参数。")
+                rows.append("  可用参数见「打开模型目录」里的 .cdi3.json，或运行")
+                rows.append("  scripts/list_live2d_props.py。")
+            lines = [
+                "配置文件：%s" % path,
+                "当前模型：%s" % model["label"],
+                "已配置情绪：%d / %d（读取当前配置，含手改内容）" % (
+                    matched, len(PET_EMOTION_EXPRESSIONS)),
+                "说明：expressions 填上面的 .exp3 文件名；params 可直接写参数绝对值。",
+            ] + rows
+            info.setPlainText("\n".join(lines))
+
+        def open_path(target):
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(target)
+                else:
+                    webbrowser.open("file://" + target)
+            except Exception as exc:
+                QMessageBox.warning(dialog, "打开失败", str(exc))
+
+        def generate():
+            template = build_live2d_emotion_template(model["id"])
+            try:
+                added = merge_live2d_emotion_config(template, path)
+            except OSError as exc:
+                QMessageBox.warning(dialog, "生成失败", f"无法写入：{exc}")
+                return
+            refresh()
+            QMessageBox.information(
+                dialog, "已生成映射模板",
+                "文件：%s\n已为模型「%s」生成/补全空模板（新增 %d 项），"
+                "已有填写不会覆盖。\n点击「打开配置文件」填写，保存后点「重载生效」。"
+                % (path, model["label"], added),
+            )
+
+        btn_layout = QHBoxLayout()
+        gen_btn = QPushButton("生成/补全映射模板")
+        open_btn = QPushButton("打开配置文件")
+        reload_btn = QPushButton("重载生效")
+        close_btn = QPushButton("关闭")
+        btn_layout.addWidget(gen_btn)
+        btn_layout.addWidget(open_btn)
+        btn_layout.addWidget(reload_btn)
+        btn_layout.addStretch(1)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        def reload_config():
+            if self.pet_window:
+                self.pet_window._install_pet_params()
+            refresh()
+            self.status_bar.showMessage("已重载动作映射配置", 2500)
+
+        gen_btn.clicked.connect(generate)
+        open_btn.clicked.connect(lambda: open_path(path))
+        reload_btn.clicked.connect(reload_config)
+        close_btn.clicked.connect(dialog.accept)
+        refresh()
+        dialog.exec()
 
     def init_live2d_server(self):
         web_dir = get_resource_path("assets", "web_resources")
@@ -8396,17 +9765,7 @@ class MainWindow(QMainWindow):
         self.input_text.setFocus()
 
     def _discard_current_generation(self):
-        """在切换或删除会话前安全丢弃当前生成，不污染新的会话状态。"""
-        thread = self.current_api_thread
-        if thread and thread.isRunning():
-            try:
-                thread.stopped.disconnect(self.on_generation_stopped)
-            except (TypeError, RuntimeError):
-                pass
-            thread.stop()
-            if not thread.wait(1500):
-                thread.terminate()
-                thread.wait()
+        """只解绑当前界面，不再打断仍在后台执行的回答。"""
         self.current_api_thread = None
         row = self._placeholder_row()
         if row >= 0:
@@ -8438,6 +9797,85 @@ class MainWindow(QMainWindow):
             style="font-weight: bold; background-color: #f5f5f5; padding: 5px; font-size: 18px; color: #333333;",
         )
 
+    def _create_task_placeholder(self, task_state=None):
+        """创建任务占位气泡（当前会话正在执行时使用）。"""
+        self.placeholder_item = QListWidgetItem()
+        self.placeholder_widget = TaskProgressWidget(
+            opacity=self.bubble_opacity,
+            avatar_path=self.config.get_avatar_path("assistant"),
+            font_family=self.chat_font_family,
+            font_size=self.chat_font_size,
+            bubble_color=self.bubble_assistant_color,
+        )
+        self.placeholder_widget.avatar_clicked.connect(self.show_avatar_dialog)
+        self.placeholder_item.setSizeHint(self.placeholder_widget.sizeHint())
+        self.placeholder_widget.list_item = self.placeholder_item
+        self.chat_list.addItem(self.placeholder_item)
+        self.chat_list.setItemWidget(self.placeholder_item, self.placeholder_widget)
+        self.placeholder_widget.refresh_layout()
+        if task_state:
+            self.placeholder_widget.update_progress(task_state)
+        self.chat_list.scrollToBottom()
+
+    def _restore_running_session_ui(self, session_id):
+        """切回一个仍在后台执行的会话：恢复停止按钮与流式气泡。"""
+        thread = self.session_threads.get(session_id)
+        if thread is None or not thread.isRunning():
+            return
+        self.current_api_thread = thread
+        state = self.session_stream.setdefault(session_id, {"display": "", "pending": True})
+        self.stream_buffer = ""
+        self.stream_display_buffer = state.get("display", "")
+        self.chat_stream_filter.reset()
+        self.input_text.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        self.attach_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.action_stack.setCurrentWidget(self.stop_btn)
+        self._create_task_placeholder(self.current_task_state)
+        if self.placeholder_widget is not None and self.stream_display_buffer:
+            try:
+                self.placeholder_widget.set_text(self.stream_display_buffer)
+            except RuntimeError:
+                pass
+        self.status_bar.showMessage("该会话仍在后台执行…", 0)
+
+    def _stop_session_thread(self, session_id):
+        """删除会话时确保它的后台线程停下，并释放它占用的 DSH 会话。"""
+        thread = self.session_threads.pop(session_id, None)
+        self.session_stream.pop(session_id, None)
+        try:
+            connection = current_connection()
+            if connection is not None:
+                connection.forget_session(session_id)
+        except Exception:
+            pass
+        if thread is None:
+            return
+        try:
+            thread.stop()
+            if not thread.wait(1500):
+                thread.terminate()
+                thread.wait()
+        except RuntimeError:
+            pass
+
+    def _finish_background_reply(self, sid, full_response):
+        """后台会话完成：只落库，不动当前界面、桌宠与语音。"""
+        self.session_threads.pop(sid, None)
+        self.session_stream.pop(sid, None)
+        _kaomoji, clean = extract_kaomoji_tag(full_response or "")
+        clean = self._format_assistant_text(clean)
+        body, sources_block = split_reply_and_sources(clean)
+        sources = parse_sources_block(sources_block)
+        if not body:
+            return
+        try:
+            self.db.save_message(sid, "assistant", body, sources=sources)
+        except Exception as exc:
+            print(f"[WARN] 后台会话落库失败: {exc}")
+        self.refresh_session_list()
+
     def _placeholder_row(self):
         """占位气泡当前所在行；已被清空/删除时返回 -1。"""
         item = getattr(self, "placeholder_item", None)
@@ -8462,10 +9900,17 @@ class MainWindow(QMainWindow):
         elif status == "failed":
             self.pet_window.set_pet_activity("idle")
 
-    def _on_task_state_updated(self, task_state):
-        if self.sender() is not self.current_api_thread:
+    def _on_status_update(self, text, sid=None):
+        if (sid or self.current_session_id) != self.current_session_id:
             return
-        self._set_session_task_state(task_state)
+        self.status_bar.showMessage(text, 0)
+
+    def _on_task_state_updated(self, task_state, sid=None):
+        if sid is None and self.sender() is not self.current_api_thread:
+            return
+        self._set_session_task_state(task_state, session_id=sid)
+        if sid is not None and sid != self.current_session_id:
+            return
         self._sync_pet_task_activity(task_state)
         placeholder = getattr(self, "placeholder_widget", None)
         if placeholder is None:
@@ -8476,8 +9921,9 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    @pyqtSlot(str)
-    def _on_computer_state(self, state):
+    def _on_computer_state(self, state, sid=None):
+        if sid is not None and sid != self.current_session_id:
+            return
         if self.pet_window:
             if str(state) in ("waiting_authorization", "waiting_external"):
                 self.pet_window.set_pet_activity("waiting", "等你确认一下…")
@@ -9005,7 +10451,8 @@ class MainWindow(QMainWindow):
             full_msg = user_msg
             task_state = clarification_result["task_state"]
 
-        if not self.config.get_api_key():
+        dsh_bridge_enabled = self.config.get_dsh_bridge_enabled()
+        if not dsh_bridge_enabled and not self.config.get_api_key():
             QMessageBox.warning(self, "缺少配置", "请先在 设置->API配置 中设置API Key")
             return
 
@@ -9039,43 +10486,57 @@ class MainWindow(QMainWindow):
         if self.pet_window:
             self.pet_window.set_pet_activity("thinking")
 
-        self.current_api_thread = APICallThread(
-            api_messages,
-            self.config,
-            stream=False,
-            task_state=task_state
+        if self.config.get_dsh_bridge_enabled():
+            self.current_api_thread = DSHSessionThread(
+                api_messages,
+                self.config,
+                task_state=task_state,
+                session_id=self.current_session_id
+            )
+        else:
+            self.current_api_thread = APICallThread(
+                api_messages,
+                self.config,
+                stream=False,
+                task_state=task_state
+            )
+        active_session = self.current_session_id
+        self.session_threads[active_session] = self.current_api_thread
+        self.session_stream[active_session] = {"display": "", "pending": True}
+        self.current_api_thread.stream_chunk.connect(
+            lambda chunk, sid=active_session: self.on_stream_chunk(chunk, sid)
         )
-        self.current_api_thread.stream_chunk.connect(self.on_stream_chunk)
-        self.current_api_thread.response_received.connect(self.on_response_complete)
-        self.current_api_thread.error_occurred.connect(self.on_api_error)
+        self.current_api_thread.response_received.connect(
+            lambda text, sid=active_session: self.on_response_complete(text, sid)
+        )
+        self.current_api_thread.error_occurred.connect(
+            lambda msg, sid=active_session: self.on_api_error(msg, sid)
+        )
         self.current_api_thread.tool_confirmation_requested.connect(self.on_tool_confirmation_requested)
-        self.current_api_thread.status_update.connect(lambda text: self.status_bar.showMessage(text, 0))
-        self.current_api_thread.computer_state.connect(self._on_computer_state)
-        self.current_api_thread.task_state_updated.connect(self._on_task_state_updated)
-        self.current_api_thread.stopped.connect(self.on_generation_stopped)
+        self.current_api_thread.status_update.connect(
+            lambda text, sid=active_session: self._on_status_update(text, sid)
+        )
+        self.current_api_thread.computer_state.connect(
+            lambda state, sid=active_session: self._on_computer_state(state, sid)
+        )
+        self.current_api_thread.task_state_updated.connect(
+            lambda state, sid=active_session: self._on_task_state_updated(state, sid)
+        )
+        self.current_api_thread.stopped.connect(
+            lambda sid=active_session: self.on_generation_stopped(sid)
+        )
         self.current_api_thread.start()
 
-        self.placeholder_item = QListWidgetItem()
-        self.placeholder_widget = TaskProgressWidget(
-            opacity=self.bubble_opacity,
-            avatar_path=self.config.get_avatar_path("assistant"),
-            font_family=self.chat_font_family,
-            font_size=self.chat_font_size,
-            bubble_color=self.bubble_assistant_color,
-        )
-        self.placeholder_widget.avatar_clicked.connect(self.show_avatar_dialog)
-        self.placeholder_item.setSizeHint(self.placeholder_widget.sizeHint())
-        self.placeholder_widget.list_item = self.placeholder_item
-        self.chat_list.addItem(self.placeholder_item)
-        self.chat_list.setItemWidget(self.placeholder_item, self.placeholder_widget)
-        self.placeholder_widget.refresh_layout()
-        self.placeholder_widget.update_progress(task_state)
-        self.chat_list.scrollToBottom()
-    def on_stream_chunk(self, chunk):
-        if self.sender() is not self.current_api_thread:
+        self._create_task_placeholder(task_state)
+    def on_stream_chunk(self, chunk, sid=None):
+        sid = sid or self.current_session_id
+        state = self.session_stream.setdefault(sid, {"display": "", "pending": True})
+        if sid != self.current_session_id:
+            state["display"] = state.get("display", "") + chunk
             return
         self.stream_buffer += chunk
         self.stream_display_buffer += self.chat_stream_filter.feed(chunk)
+        state["display"] = self.stream_display_buffer
         if self.pet_window:
             self.pet_window.append_speech_chunk(chunk)
         placeholder = getattr(self, "placeholder_widget", None)
@@ -9091,8 +10552,9 @@ class MainWindow(QMainWindow):
 
     def _stop_generation(self):
         had_running = False
-        if self.current_api_thread and self.current_api_thread.isRunning():
-            self.current_api_thread.stop()
+        active = self.session_threads.get(self.current_session_id) or self.current_api_thread
+        if active is not None and active.isRunning():
+            active.stop()
             had_running = True
         if any(thread.isRunning() for thread in self._tts_threads):
             self._stop_tts()
@@ -9101,10 +10563,14 @@ class MainWindow(QMainWindow):
         if had_running:
             self.status_bar.showMessage("正在停止…（等待当前操作返回）", 0)
 
-    def on_generation_stopped(self):
-        if self.sender() is not self.current_api_thread:
+    def on_generation_stopped(self, sid=None):
+        sid = sid or self.current_session_id
+        self.session_threads.pop(sid, None)
+        self.session_stream.pop(sid, None)
+        if sid != self.current_session_id:
             return
         if self.pet_window:
+            self.pet_window.clear_pending_expression()
             self.pet_window.set_pet_activity("idle")
         stopped_thread = self.current_api_thread
         partial = (self.stream_display_buffer + self.chat_stream_filter.feed("", final=True)).strip()
@@ -9142,9 +10608,13 @@ class MainWindow(QMainWindow):
         self.stream_display_buffer = ""
         self.chat_stream_filter.reset()
 
-    def on_response_complete(self, full_response):
-        if self.sender() is not self.current_api_thread:
+    def on_response_complete(self, full_response, sid=None):
+        sid = sid or self.current_session_id
+        if sid != self.current_session_id:
+            self._finish_background_reply(sid, full_response)
             return
+        self.session_threads.pop(sid, None)
+        self.session_stream.pop(sid, None)
         clean_response = full_response   # 先初始化
 
         # 1. 提取并移除 kaomoji 标签
@@ -9188,6 +10658,9 @@ class MainWindow(QMainWindow):
             )  # 回复为空时显示默认表情
 
         # 语音输出
+        has_pending_expression = bool(
+            self.pet_window and self.pet_window.has_pending_expression()
+        )
         if self.config.get_tts_enabled() and spoken_reply:
             self._stop_tts()
             voice = self.config.get_tts_voice()
@@ -9206,9 +10679,15 @@ class MainWindow(QMainWindow):
             tts_thread.start()
         elif self.pet_window:
             self.pet_window.finish_speech_stream(spoken_reply, self.kaomoji_label.text())
+            # 没有 TTS 时，回复显示即播放缓存表情
+            self.pet_window.activate_pending_expression()
 
         if self.pet_window:
-            self.pet_window.set_pet_activity("done")
+            if has_pending_expression:
+                # 本回合有表情：跳过「完成」庆祝，让情绪 + 说话主导
+                self.pet_window.set_pet_activity("idle")
+            else:
+                self.pet_window.set_pet_activity("done")
 
         # 恢复输入控件
         self._restore_input_controls()
@@ -9249,6 +10728,8 @@ class MainWindow(QMainWindow):
             )
         else:
             prompt = prompt_map.get(tool_name, f"确定要执行工具「{tool_name}」吗？")
+            if tool_name not in prompt_map and arguments:
+                prompt += "\n\n参数：\n" + json.dumps(arguments, ensure_ascii=False, indent=2)
         if tool_name == "run_command":
             prompt = prompt.replace("{command}", str(arguments.get("command", "")))
         elif tool_name == "write_file":
@@ -9297,9 +10778,10 @@ class MainWindow(QMainWindow):
         guard_restored = True
         if computer_session_active:
             guard_restored = VisionInputController.resume_input_guard()
-        if self.current_api_thread:
+        requesting_thread = self.sender() or self.current_api_thread
+        if requesting_thread:
             approved = reply == QMessageBox.StandardButton.Yes and guard_restored
-            self.current_api_thread.set_tool_confirmation(call_id, approved)
+            requesting_thread.set_tool_confirmation(call_id, approved)
 
     def raise_permission_dialog(self):
         dialog = self._permission_dialog
@@ -9315,8 +10797,12 @@ class MainWindow(QMainWindow):
         self.chat_background_panel.update()
         self._resize_composer_input()
 
-    def on_api_error(self, error_msg):
-        if self.sender() is not self.current_api_thread:
+    def on_api_error(self, error_msg, sid=None):
+        sid = sid or self.current_session_id
+        self.session_threads.pop(sid, None)
+        self.session_stream.pop(sid, None)
+        if sid != self.current_session_id:
+            logging.error("后台会话 API 调用错误（session=%s）：%s", sid, error_msg)
             return
         failed_session_id = self.current_session_id
         preserved_messages = len(self.conversation_history)
@@ -9350,6 +10836,16 @@ class MainWindow(QMainWindow):
 
     def _update_model_indicator(self):
         if not hasattr(self, "model_indicator"):
+            return
+        if self.config.get_dsh_bridge_enabled():
+            dsh_model = self.config.get_dsh_model() or "模型由 DSH 选择"
+            label = f"DSH 桥接 · {dsh_model}"
+            self.model_indicator.setText(label if len(label) <= 30 else label[:27] + "…")
+            self.model_indicator.setToolTip(
+                "当前处于 DSH 桥接模式：消息交给本机 DSH 运行时（Agent + 工具）处理。\n"
+                "本机模型的 Base URL / API Key / 模型设置在此模式下不生效。\n"
+                "点击打开配置"
+            )
             return
         model = self.config.get_model() or "未配置模型"
         label = model if len(model) <= 24 else model[:21] + "…"
@@ -9430,6 +10926,9 @@ class MainWindow(QMainWindow):
             self.runtime_system_prompt = self._get_effective_system_prompt()
             self.load_system_prompt()
             self._update_model_indicator()
+            # 桥接配置可能变化：没有会话在跑时重建连接，让新的 provider / 模型生效。
+            if self.config.get_dsh_bridge_enabled() and not self.session_threads:
+                reset_connection()
             self.reasoning_quick_combo.setCurrentIndex(
                 max(0, self.reasoning_quick_combo.findData(self.config.get_reasoning_effort()))
             )
@@ -9460,6 +10959,7 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self._stop_generation()
             self.chat_list.clear()
+            self._stop_session_thread(self.current_session_id)
             self.db.delete_session(self.current_session_id)
             self.session_is_persisted = False
             self._set_session_task_state(None)
@@ -9477,7 +10977,7 @@ class MainWindow(QMainWindow):
         self._show_temporary_session("新会话已准备好，等待新消息")
 
     def show_session_list(self):
-        """显示历史会话列表对话框，支持双击切换和右键/按钮删除"""
+        """显示历史会话列表对话框，支持双击切换和右键/按钮删除（含当前会话）"""
         sessions = self.db.get_session_info()
         if not sessions:
             QMessageBox.information(self, "历史会话", "暂无历史会话记录")
@@ -9514,13 +11014,13 @@ class MainWindow(QMainWindow):
                 return
             session_id = current_item.data(Qt.ItemDataRole.UserRole)
             if session_id == self.current_session_id:
-                QMessageBox.warning(dialog, "警告", "不能删除当前正在使用的会话。")
-                return
-            reply = QMessageBox.question(dialog, "确认删除", f"确定要删除会话 {session_id} 吗？",
+                confirm_text = "确定删除当前正在使用的会话吗？删除后会切换到新的空会话。"
+            else:
+                confirm_text = f"确定要删除会话 {session_id} 吗？"
+            reply = QMessageBox.question(dialog, "确认删除", confirm_text,
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                self.db.delete_session(session_id)
-                self._set_session_task_state(None, session_id=session_id)
+                self._delete_session(session_id)
                 row = list_widget.row(current_item)
                 list_widget.takeItem(row)
                 QMessageBox.information(dialog, "成功", "会话已删除")
@@ -9764,13 +11264,14 @@ class MainWindow(QMainWindow):
     def switch_session(self, session_id):
         if session_id == self.current_session_id:
             return
-        self._stop_generation()
+        self._discard_current_generation()
         self.current_session_id = session_id
         self.current_task_state = self._get_session_task_state(session_id)
         self.chat_list.clear()
         self.load_system_prompt()
         self.load_history_from_db()
         self.refresh_session_list()
+        self._restore_running_session_ui(session_id)
         self.status_bar.showMessage(f"已切换到会话: {session_id[:8]}...", 3000)
         self._set_kaomoji_display(
             text="(｡•ᴗ•｡)",
@@ -9779,7 +11280,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "关于AI助手",
-                          "Aissistant v1.102.1-test (PyQt6版本)\n"
+                          "Aissistant v1.102.5-test (PyQt6版本)\n"
                           "功能：多会话聊天、图片/文件附件、视觉键鼠、UI Automation、Live2D、语音输入与回复\n"
                           "技术栈：Python + PyQt6 + OpenAI兼容API + Live2D + edge-tts")
 

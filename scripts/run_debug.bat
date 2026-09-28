@@ -3,5 +3,5 @@
 cd /d "%~dp0.."
 
 call conda activate ai_assistant
-python src\main.py
+python src\main.py --debug
 pause

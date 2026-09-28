@@ -9,7 +9,10 @@ venv/
 config/auth.json
 config/config.json
 config/mcp.json
+config/dsh_acp_overlay.yml
+config/dsh_sessions.json
 config/apps.json
+config/live2d_emotions.json
 data/
 logs/
 output.txt

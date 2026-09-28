@@ -1,0 +1,41 @@
+{
+  "_说明": "Live2D 情绪映射表。只按模型文件夹名分段（不再有 default 段）。每段里 16 个情绪各一行：expressions 填该模型目录下 .exp3.json 文件名（可含 expressions/ 子目录，写文件名即可），params 可直接写参数绝对值。字段 _可用exp3 由「生成/补全映射模板」自动维护，列出该模型全部表情文件供参考。",
+  "大肥鱼": {
+    "happy": { "expressions": ["开心兴奋"], "params": [] },
+    "sad": { "expressions": ["悲伤"], "params": [] },
+    "angry": { "expressions": ["生气"], "params": [] },
+    "surprised": { "expressions": ["感叹号"], "params": [] },
+    "shy": { "expressions": ["脸红"], "params": [] },
+    "wink": { "expressions": ["调皮"], "params": [] },
+    "cry": { "expressions": ["哭"], "params": [] },
+    "sleepy": { "expressions": ["闭眼口水"], "params": [] },
+    "love": { "expressions": ["爱心眼"], "params": [] },
+    "sparkle": { "expressions": ["星星眼"], "params": [] },
+    "magic": { "expressions": ["魔爪"], "params": [] },
+    "heart": { "expressions": ["心跳"], "params": [] },
+    "excited": { "expressions": ["开心兴奋"], "params": [] },
+    "confused": { "expressions": ["问号"], "params": [] },
+    "nervous": { "expressions": ["流汗"], "params": [] },
+    "tongue": { "expressions": ["吐舌"], "params": [] },
+    "_可用exp3": []
+  },
+  "Mao": {
+    "happy": { "expressions": ["exp_02"], "params": [] },
+    "sad": { "expressions": ["exp_05"], "params": [] },
+    "angry": { "expressions": ["exp_08"], "params": [] },
+    "surprised": { "expressions": ["exp_07"], "params": [] },
+    "shy": { "expressions": ["exp_06"], "params": [] },
+    "wink": { "expressions": [], "params": [] },
+    "cry": { "expressions": ["exp_05"], "params": [] },
+    "sleepy": { "expressions": [], "params": [] },
+    "love": { "expressions": [], "params": [] },
+    "sparkle": { "expressions": ["exp_04"], "params": [] },
+    "magic": { "expressions": [], "params": [] },
+    "heart": { "expressions": [], "params": [] },
+    "excited": { "expressions": ["exp_04"], "params": [] },
+    "confused": { "expressions": [], "params": [] },
+    "nervous": { "expressions": [], "params": [] },
+    "tongue": { "expressions": [], "params": [] },
+    "_可用exp3": ["exp_01", "exp_02", "exp_03", "exp_04", "exp_05", "exp_06", "exp_07", "exp_08"]
+  }
+}
