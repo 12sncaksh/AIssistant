@@ -44,7 +44,7 @@ from functools import partial
 from logging.handlers import RotatingFileHandler
 
 from action_control import ActionHandler  # 导入外部应用控制模块
-from mcp_client import MCPManager  # 外部 MCP 工具（工具表合并 + 调用分发）
+from mcp_client import MCPManager  # MCP 工具（工具表合并 + 调用分发 + 自带 server 配置）
 from vision_input import VisionInputController
 from dsh_acp_client import (  # DSH（DeepSeek Harness）桥接
     DSHSessionThread,
@@ -72,6 +72,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import (
     QTextOption, QIcon, QPixmap, QImage, QImageReader, QTextDocument,
     QPainter, QColor, QFont, QLinearGradient, QPainterPath, QPen, QPalette, QActionGroup,
+    QTextCursor, QTextBlockFormat,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -472,6 +473,23 @@ def chat_font_style(font_family, font_size):
     family = str(font_family or "").strip().replace('"', "")
     family_rule = f'font-family:"{family}";' if family else ""
     return f'{family_rule}font-size:{clamp_chat_font_size(font_size)}pt;'
+
+
+# 正文行距：Qt 的 QSS 不支持 line-height，只有 QTextDocument 默认样式表
+# 和 QTextBlockFormat 两条路生效；纯文本（setPlainText）只能用后者。
+CHAT_LINE_HEIGHT_PERCENT = 150
+CHAT_LINE_HEIGHT_STYLE_SHEET = "p, li, div { line-height: %d%%; }" % CHAT_LINE_HEIGHT_PERCENT
+
+
+def apply_plain_text_line_height(text_edit, percent=CHAT_LINE_HEIGHT_PERCENT):
+    """给纯文本 QTextEdit 打块级行距（setPlainText 吃不到默认样式表）。"""
+    cursor = QTextCursor(text_edit.document())
+    cursor.select(QTextCursor.SelectionType.Document)
+    block_format = QTextBlockFormat()
+    block_format.setLineHeight(
+        percent, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value
+    )
+    cursor.mergeBlockFormat(block_format)
 
 
 def get_app_icon():
@@ -4398,8 +4416,9 @@ class ClickableAvatarLabel(QLabel):
 class ChatMessageWidget(QWidget):
     MIN_BUBBLE_WIDTH = 140
     MAX_BUBBLE_WIDTH = 960
-    BUBBLE_HORIZONTAL_PADDING = 28
-    BUBBLE_VERTICAL_PADDING = 16
+    # 必须与 _apply_bubble_style 里的 QSS "padding:6px 10px" 对齐：10+10 / 6+6
+    BUBBLE_HORIZONTAL_PADDING = 20
+    BUBBLE_VERTICAL_PADDING = 12
     HEIGHT_SAFETY = 4
     avatar_clicked = pyqtSignal()
 
@@ -4461,6 +4480,7 @@ class ChatMessageWidget(QWidget):
         self.message_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.message_text.document().setDocumentMargin(0)
+        self.message_text.document().setDefaultStyleSheet(CHAT_LINE_HEIGHT_STYLE_SHEET)
         self.message_text.setFont(QFont(self.font_family, self.font_size))
         self._apply_bubble_style(opacity)
         self.message_text.setOpenLinks(False)
@@ -4550,6 +4570,8 @@ class ChatMessageWidget(QWidget):
             self.message_text.setHtml(self._build_html(text, self.sources))
         else:
             self.message_text.setPlainText(text)
+            # setPlainText 不经过富文本引擎，默认样式表的行距不生效，这里补块级行距。
+            apply_plain_text_line_height(self.message_text)
         self._sync_bubble_geometry(force=True)
         self.updateGeometry()
         if self.list_item:
@@ -4741,6 +4763,7 @@ class TaskProgressWidget(QWidget):
         self.progress_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.progress_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.progress_text.document().setDocumentMargin(0)
+        self.progress_text.document().setDefaultStyleSheet(CHAT_LINE_HEIGHT_STYLE_SHEET)
         self.progress_text.setFont(QFont(self.font_family, self.font_size))
         self.progress_text.setStyleSheet(
             "QTextEdit { border:none; background:transparent; color:#333333; padding:0px; "
@@ -4765,6 +4788,7 @@ class TaskProgressWidget(QWidget):
         self.message_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.message_text.document().setDocumentMargin(0)
+        self.message_text.document().setDefaultStyleSheet(CHAT_LINE_HEIGHT_STYLE_SHEET)
         self.message_text.setFont(QFont(self.font_family, self.font_size))
         self.message_text.setStyleSheet(
             "QTextEdit { border:none; background:transparent; color:#000000; padding:0px; "
@@ -4841,6 +4865,7 @@ class TaskProgressWidget(QWidget):
     def set_text(self, text):
         self._text = text
         self.message_text.setPlainText(text)
+        apply_plain_text_line_height(self.message_text)
         self._sync_geometry(force=True)
         self.updateGeometry()
         if self.list_item:
@@ -4989,8 +5014,70 @@ class TaskProgressWidget(QWidget):
 class Live2DRequestHandler(SimpleHTTPRequestHandler):
     """避免无控制台打包程序中的 stderr 写入导致请求被中断。"""
 
+    # 由 MainWindow 在启动本地服务前注入；HTTP 线程只通过 Qt 信号回主线程，
+    # 所以这里拿到的活对象不会被跨线程直接操作。
+    app = None
+
     def log_message(self, format_string, *args):
         logging.info("Live2D HTTP: %s", format_string % args)
+
+    # ---- 桌宠控制接口（供 mcp_servers/aissistant_pet_server.py 调用）----
+    # 只做转发：真正的校验/裁剪/登记都在 ActionHandler.execute_tool 里，
+    # 与本地直连模式的工具路径逐字一致，不重复实现逻辑。
+    def _send_json(self, payload, status=200):
+        try:
+            body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            body = json.dumps({"success": False, "message": "结果无法序列化：%s" % exc}).encode("utf-8")
+            status = 500
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > 1_000_000:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except (UnicodeDecodeError, OSError):
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _route(self):
+        return self.path.split("?", 1)[0].rstrip("/")
+
+    def do_GET(self):
+        if self._route() == "/v1/pet/params":
+            from urllib.parse import parse_qs, urlparse
+
+            keyword = (parse_qs(urlparse(self.path).query).get("keyword") or [""])[0]
+            self._send_json(ActionHandler.execute_tool("list_live2d_params", {"keyword": keyword}))
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        route = self._route()
+        payload = self._read_json()
+        if route == "/v1/pet/emote":
+            self._send_json(ActionHandler.execute_tool("control_pet", payload))
+            return
+        if route == "/v1/pet/param":
+            self._send_json(ActionHandler.execute_tool("set_live2d_param", payload))
+            return
+        self._send_json({"success": False, "message": "未知接口：%s" % route}, 404)
 
 
 class LocalHTTPServer:
@@ -8134,6 +8221,10 @@ class MainWindow(QMainWindow):
         ActionHandler.load_apps()
         self.refresh_action_handler_config()
         try:
+            MCPManager.ensure_builtin_servers()
+        except Exception:
+            logging.warning("自动配置自带 MCP server 失败", exc_info=True)
+        try:
             MCPManager.ensure_started()
         except Exception:
             logging.warning("应用启动时启动 MCP server 失败", exc_info=True)
@@ -9596,14 +9687,39 @@ class MainWindow(QMainWindow):
         web_dir = get_resource_path("assets", "web_resources")
         dist_dir = os.path.join(web_dir, "dist")
         try:
+            Live2DRequestHandler.app = self
             self.live2d_server = LocalHTTPServer(dist_dir, port=8123)
             self.live2d_server.start()
         except Exception as e:
             self.live2d_server = None
             logging.exception("Live2D 本地服务器启动失败：%s", e)
             return
+        self._publish_pet_endpoint()
         if self.show_live2d_panel and self.webview:
             QTimer.singleShot(1000, lambda: self.webview.setUrl(QUrl(self._live2d_page_url("index.html"))))
+
+    def _publish_pet_endpoint(self):
+        """把 Live2D 本地服务的实际监听地址写给桌宠 MCP server。
+
+        端口不是固定的：LocalHTTPServer 从 8123 起顺延找可用端口，所以必须运行时发布。
+        主机名写 localhost 与 HTTPServer 的绑定名保持一致（写 127.0.0.1 在只绑到 ::1 时会连不上）。
+        """
+        server = getattr(self, "live2d_server", None)
+        if server is None:
+            return
+        path = os.path.join(get_runtime_dir(), "data", "runtime_endpoint.json")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {
+                "pet": {"host": "localhost", "port": int(server.port)},
+                "pid": os.getpid(),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            logging.info("桌宠本地接口已发布：%s", path)
+        except Exception:
+            logging.warning("写 runtime_endpoint.json 失败：%s", path, exc_info=True)
 
     def reload_live2d_model(self):
         if self.webview and self.live2d_server and self.show_live2d_panel:
@@ -11280,7 +11396,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "关于AI助手",
-                          "Aissistant v1.102.5-test (PyQt6版本)\n"
+                          "Aissistant v1.102.6-test (PyQt6版本)\n"
                           "功能：多会话聊天、图片/文件附件、视觉键鼠、UI Automation、Live2D、语音输入与回复\n"
                           "技术栈：Python + PyQt6 + OpenAI兼容API + Live2D + edge-tts")
 

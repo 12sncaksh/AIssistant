@@ -6,7 +6,8 @@
 
 - 大模型流式对话（OpenAI 兼容接口）；也可把整轮对话交给本机 DSH 运行时处理，见「DSH 桥接」
 - 结构化工具调用（function calling）：联网搜索、天气/路线、系统状态、磁盘只读扫描、文件读写、锁屏/关机等
-- MCP（Model Context Protocol）扩展：支持 stdio 本地 server 与远程 HTTP/SSE server，工具自动并入工具表
+- MCP（Model Context Protocol）扩展：支持 stdio 本地 server 与远程 HTTP/SSE server，工具自动并入工具表；
+  程序自身的系统/电源/桌宠能力也以自带 MCP server 的形式提供
 - 语音：sherpa-onnx 唤醒「小柚」、讯飞语音听写、edge-tts 语音回复
 - Live2D 桌宠：无边框置顶、拖拽、系统托盘、模型切换、大模型可调的表情/参数层
 - 聊天界面：用户与 AI 全局头像更换、Markdown 排版、代码块复制；可通过“视图 → 聊天外观...”统一设置背景、气泡配色与透明度、代码块配色与字体、聊天正文字体
@@ -51,7 +52,7 @@ scripts\run.bat            :: 隐藏启动
 | `config/auth.json` | 密钥（模型 api_key、高德、Tavily、讯飞） | 否（已忽略） |
 | `config/config.json` | Base URL、聊天模型、视觉模型、推理强度、SearXNG URL、DSH 桥接 | 否（已忽略） |
 | `config/apps.json` | 常用应用快捷方式 | 否（已忽略） |
-| `config/mcp.json` | MCP server 配置 | 否（已忽略） |
+| `config/mcp.json` | MCP server 配置（自带 server 由程序自动写入） | 否（已忽略） |
 | `config/live2d_emotions.json` | Live2D 语义情绪 → 表情/参数映射 | 否（程序可生成模板） |
 | `config/dsh_sessions.json` | 聊天会话 ↔ DSH 会话映射 | 否（运行时自动生成） |
 | `config/dsh_acp_overlay.yml` | DSH 路由覆盖补丁 | 否（填了 `dsh_provider` 时自动生成） |
@@ -59,7 +60,9 @@ scripts\run.bat            :: 隐藏启动
 优先级：设置窗口中已保存的值 → 对应 JSON 文件 → 程序默认值。头像文件保存在运行时 `data/avatars/`，QSettings 仅保存路径。
 
 其它运行时目录：日志 `logs/app.log`（2MB × 3 滚动）、会话库 `data/chat_history.db`、
-AI 生成的聊天背景 `generated/chat_backgrounds/`、DSH 工作区 `agent_workspace/`。
+AI 生成的聊天背景 `generated/chat_backgrounds/`、DSH 工作区 `agent_workspace/`、
+桌宠本地接口端口 `data/runtime_endpoint.json`（Live2D 服务的端口不是固定的，从 8123 起顺延，
+由主程序在启动时发布给 `aissistant-pet` server）。
 
 `config/config.json` 除上表字段外还支持这些可选键（不填即关闭）：
 `dsh_bridge_enabled`、`dsh_command`、`dsh_profile`、`dsh_provider`、`dsh_model`，
@@ -119,7 +122,28 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 
 ## MCP 工具
 
-外部 MCP server 在 `config/mcp.json` 的 `mcpServers` 段里配置（模板见 `config/templates/mcp.example.json`），两类写法：
+### 自带的 MCP server
+
+程序自身的一部分能力已经搬到 `mcp_servers/` 下的三个本地 MCP server。它们的配置
+**由程序在启动时按当前机器的解释器和项目路径自动写入 `config/mcp.json`**，不需要手动填：
+
+| server | 工具 | 是否免确认 |
+| --- | --- | --- |
+| `aissistant` | `system_status`、`health_check`、`disk_scan`、`network_info`、`speedtest`、`ping_host`、`get_weather`、`get_forecast`、`get_route`、`recommend_food_by_*`、`open_app`、`open_url` | 是（`autoApprove: true`） |
+| `aissistant-power` | `lock_screen`、`shutdown`、`reboot` | **否，每次都要确认** |
+| `aissistant-pet` | `control_pet`、`set_live2d_param`、`list_live2d_params` | 是（`autoApprove: true`） |
+
+- 工具的 `description` 与参数 schema 直接取自 `ActionHandler`，执行也走同一个
+  `ActionHandler.execute_tool()`，所以经 MCP 调用和内置调用行为逐字一致。
+- 自动配置只校正 `command` / `args`，**不会改 `enabled`**：在「MCP 工具管理」里关掉的
+  server 不会被重新打开。这三个名字由程序占用，同名条目会被校正成自带 server。
+- **免安装版例外**：PyInstaller 包里既没有 Python 解释器也没有 `mcp_servers/`，这三个
+  server 起不来。此时上表工具会回落到内置工具表继续可用（不会消失），
+  代价是工具名不带 `mcp__` 前缀。
+
+### 外部 MCP server
+
+外部 MCP server 同样写在 `config/mcp.json` 的 `mcpServers` 段里（模板见 `config/templates/mcp.example.json`），两类写法：
 
 ```json
 {
@@ -138,6 +162,9 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 - 工具名统一为 `mcp__<server>__<tool>`，会自动并入工具表。
 - `enabled: false` 表示不启用；默认启用。
 - 每个 MCP 工具**默认都要在界面上确认**，某个 server 想免确认就加 `"autoApprove": true`。
+- `"dsh": true` 表示启用「DSH 桥接」时也把这个 server 一并转交给 DSH 运行时（见下节）；
+  没写这个键的只在本程序内生效。ACP 侧要求 `command` 是**存在的绝对路径**，解析不出来的
+  server 会被自动跳过，以免拖垮整个桥接会话。
 - 仓库自带最小示例 `mcp_servers/demo_server.py`（stdio，只需 `mcp` 包，源码运行时可用）。
 
 查看已接入的工具：
@@ -161,7 +188,7 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 
 ## 打包免安装版
 
-在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v1.102.5_test_portable.zip`。
+在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v1.102.6_test_portable.zip`。
 
 - 脚本先检查 `generated\kws\` 与 `assets\web_resources\dist\pet.html`：缺了会打印下载与放置说明并中止
   （免安装包必须自带 Live2D 页面与唤醒词模型，所以要先把「仓库不包含的资源」补齐）。
@@ -183,7 +210,7 @@ src/                     # 全部 Python 源码
 config/templates/        # 配置模板（随包发布）
 scripts/                 # 启动 / 打包 / 自检脚本（run*.bat、build_portable.bat、Aissistant.spec 等）
 assets/                  # 图标与 web_resources（Live2D 页面、引擎、模型，多为本地资源）
-mcp_servers/             # MCP server 示例
+mcp_servers/             # 自带 MCP server（系统/电源/桌宠）+ demo 示例
 generated/               # 运行时生成：kws 唤醒词模型、chat_backgrounds
 data/  logs/             # 运行时数据与日志（不入库）
 ```

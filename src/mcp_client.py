@@ -38,6 +38,57 @@ def runtime_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# ---- 自带 MCP server ----
+# 名字 -> (脚本文件名, 是否免确认)。这三个 server 承载程序自身的一部分能力
+# （见 ActionHandler.MCP_MIGRATED_TOOLS），路径必须按当前机器解析，所以配置由
+# MCPManager.ensure_builtin_servers() 在启动时生成/校正，不写进配置模板。
+BUILTIN_SERVERS = (
+    ("aissistant", "aissistant_mcp_server.py", True),
+    ("aissistant-power", "aissistant_power_server.py", False),
+    ("aissistant-pet", "aissistant_pet_server.py", True),
+)
+
+
+def builtin_servers_dir() -> str:
+    """自带 MCP server 脚本所在目录：<根目录>/mcp_servers。"""
+    return os.path.join(runtime_dir(), "mcp_servers")
+
+
+def builtin_interpreter() -> str:
+    """用哪个解释器跑自带 server；拿不到可用解释器时返回空串。
+
+    冻结（免安装版）下 sys.executable 就是 Aissistant.exe 本身，拿它当 command
+    等于每个 server 再把整个 GUI 拉起来一次，所以这里必须返回空串。
+    """
+    if getattr(sys, "frozen", False):
+        return ""
+    executable = os.path.abspath(sys.executable or "")
+    return executable if os.path.isfile(executable) else ""
+
+
+def builtin_server_specs() -> dict:
+    """算出本机自带 server 的正确配置；解释器或脚本缺失时整体返回空。"""
+    interpreter = builtin_interpreter()
+    if not interpreter:
+        return {}
+    script_dir = builtin_servers_dir()
+    specs = {}
+    for name, filename, auto_approve in BUILTIN_SERVERS:
+        script = os.path.join(script_dir, filename)
+        if not os.path.isfile(script):
+            logging.warning("自带 MCP server 脚本缺失，本次跳过：%s", script)
+            continue
+        specs[name] = {
+            "command": interpreter,
+            "args": [script],
+            "autoApprove": auto_approve,
+            "dsh": True,
+            "enabled": True,
+            "_说明": "本程序自带能力的本地 MCP server，启动时自动生成/校正，一般不用手改。",
+        }
+    return specs
+
+
 def safe_tool_name(server: str, tool: str) -> str:
     """拼出既好读、又不超长的工具名；超长时用短哈希保证唯一。"""
     raw = "%s%s__%s" % (TOOL_PREFIX, server, tool)
@@ -244,6 +295,76 @@ class MCPManager:
     @classmethod
     def config_path(cls) -> str:
         return os.path.join(runtime_dir(), "config", CONFIG_FILENAME)
+
+    @classmethod
+    def ensure_builtin_servers(cls) -> list:
+        """把自带 server 的配置写回 config/mcp.json，返回新增或校正过的名字。
+
+        为什么必须有这一步：ActionHandler 把 system_status / lock_screen / control_pet
+        这些工具从内置表让给了 MCP，而 command/args 是逐机的。用户手抄模板很容易留下
+        过时路径（模板里曾经写死过绝对路径），结果就是工具静默消失。
+        这里只校正 command/args，从不改 enabled——界面上关掉的 server 不该被重新打开。
+        """
+        specs = builtin_server_specs()
+        if not specs:
+            return []
+
+        path = cls.config_path()
+        document = {"mcpServers": {}}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8-sig") as handle:
+                    loaded = json.load(handle)
+            except (OSError, ValueError):
+                logging.warning("读取 %s 失败，本次不改动它", path, exc_info=True)
+                return []
+            if not isinstance(loaded, dict):
+                logging.warning("%s 顶层不是对象，本次不改动它", path)
+                return []
+            document = loaded
+
+        servers = document.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+            document["mcpServers"] = servers
+
+        changed = []
+        for name, spec in specs.items():
+            current = servers.get(name)
+            if not isinstance(current, dict):
+                servers[name] = dict(spec)
+                changed.append(name)
+                continue
+            if (
+                current.get("command") != spec["command"]
+                or list(current.get("args") or []) != spec["args"]
+            ):
+                current["command"] = spec["command"]
+                current["args"] = list(spec["args"])
+                changed.append(name)
+        if not changed:
+            return []
+
+        temp_path = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(document, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temp_path, path)
+        except OSError as exc:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            logging.warning("写入 %s 失败，自带 MCP server 配置未生效：%s", path, exc)
+            return []
+
+        with cls._lock:
+            cls._config = None
+        logging.info("已自动配置自带 MCP server：%s", "、".join(changed))
+        return changed
 
     @classmethod
     def load_config(cls) -> dict:

@@ -1,0 +1,14 @@
+# 仓库内统一以 LF 存储，避免不同平台提交出 CRLF/LF 混用。
+* text=auto eol=lf
+
+# Windows 批处理/脚本必须保留 CRLF，否则 cmd 解析可能出错。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+
+# 二进制资源不做任何行尾转换。
+*.ico binary
+*.png binary
+*.jpg binary
+*.moc3 binary
+*.onnx binary

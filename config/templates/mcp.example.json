@@ -1,4 +1,5 @@
 {
+  "_说明": "本程序自带的 aissistant / aissistant-power / aissistant-pet 三个 server 由程序在启动时按当前机器自动写入 config/mcp.json，不需要也不建议在这里手写路径。这里只放外部 MCP server 的示例。",
   "mcpServers": {
     "demo": {
       "command": "python",

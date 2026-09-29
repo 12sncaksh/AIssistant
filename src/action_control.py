@@ -9,7 +9,6 @@ import platform
 import cpuinfo
 import psutil
 import requests        # 公网IP查询（已有）
-import scapy           # 扫描局域网设备（可能需管理员权限）
 import socket
 import uuid
 import pyperclip
@@ -229,8 +228,12 @@ class ActionHandler:
             cls.load_apps()
         return list(cls._apps.keys())
 
+    # 已迁到本地 MCP server 的工具：本程序自己的工具表里不再重复提供，
+    # 由 mcp_servers/aissistant_*.py 通过 MCP 暴露（本地直连和 DSH 桥接都走 MCP）。
+    MCP_MIGRATED_TOOLS = frozenset(('system_status', 'health_check', 'disk_scan', 'network_info', 'speedtest', 'ping_host', 'get_weather', 'get_forecast', 'get_route', 'recommend_food_by_address', 'recommend_food_by_city', 'recommend_food_by_coordinates', 'open_app', 'open_url', 'lock_screen', 'shutdown', 'reboot', 'control_pet', 'set_live2d_param', 'list_live2d_params'))
+
     @classmethod
-    def get_tool_definitions(cls) -> list[dict[str, Any]]:
+    def _builtin_tool_definitions(cls) -> list[dict[str, Any]]:
         tools = [
             {
                 "type": "function",
@@ -951,8 +954,49 @@ class ActionHandler:
                 }
             })
 
+        return tools
+
+    @classmethod
+    def get_mcp_tool_definitions(cls) -> list[dict[str, Any]]:
+        """只返回已迁到 MCP 的那部分工具定义，供 mcp_servers/ 下的 server 复用。
+
+        刻意不碰 MCPManager：本方法必须无任何启动副作用，否则 MCP server
+        自己调它会递归拉起一套 MCP server。
+        """
+        return [
+            tool for tool in cls._builtin_tool_definitions()
+            if tool.get("function", {}).get("name") in cls.MCP_MIGRATED_TOOLS
+        ]
+
+    @classmethod
+    def _mcp_covered_tools(cls, mcp_tools: list) -> set:
+        """mcp_tools 里实际提供了哪些「已迁移」工具（工具名形如 mcp__<server>__<tool>）。"""
+        covered = set()
+        for tool in mcp_tools:
+            name = str(tool.get("function", {}).get("name") or "")
+            if not name.startswith("mcp__"):
+                continue
+            suffix = name.rsplit("__", 1)[-1]
+            if suffix in cls.MCP_MIGRATED_TOOLS:
+                covered.add(suffix)
+        return covered
+
+    @classmethod
+    def get_tool_definitions(cls) -> list[dict[str, Any]]:
+        """本程序自己的工具表：让位给已就绪的 MCP 工具，再合并 MCP server 的工具。
+
+        「让位」必须是有条件的：免安装版（PyInstaller）里既没有 Python 解释器也没有
+        mcp_servers/，自带 server 起不来；那时若无条件剔除，这些工具会静默消失。
+        所以只在 MCP 侧确实报出同名工具时才摘掉内置定义。
+        """
+        mcp_tools = MCPManager.get_tool_definitions()
+        covered = cls._mcp_covered_tools(mcp_tools)
+        tools = [
+            tool for tool in cls._builtin_tool_definitions()
+            if tool.get("function", {}).get("name") not in covered
+        ]
         # 合并外部 MCP server 提供的工具（还没有 server 就绪时返回空列表，不影响内置工具）
-        tools.extend(MCPManager.get_tool_definitions())
+        tools.extend(mcp_tools)
 
         return tools
 

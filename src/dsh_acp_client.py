@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -29,6 +31,76 @@ WORKSPACE_DIRNAME = "agent_workspace"
 SESSION_MAP_FILENAME = "dsh_sessions.json"
 HISTORY_SEED_TURNS = 5
 HISTORY_SEED_CHARS = 600
+
+
+MCP_CONFIG_FILENAME = "mcp.json"
+
+
+def _resolve_stdio_command(command):
+    """把 mcp.json 里的 command 转成绝对路径。
+
+    dsh-acp 会校验 mcpServers[].command 必须是绝对路径，相对路径直接抛
+    AcpMcpConfigError；而且它把 failOnStartupError 写死为 true——任何一个 server 起不来
+    都会让整个 DSH 会话建立失败。所以这里解析不出来就跳过该 server，绝不硬塞进去。
+    """
+    command = str(command or "").strip()
+    if not command:
+        return ""
+    if os.path.isabs(command):
+        return command if os.path.exists(command) else ""
+    found = shutil.which(command)
+    return found or ""
+
+
+def build_acp_mcp_servers(config=None):
+    """把 config/mcp.json 里「显式声明 dsh: true」的 stdio server 翻译成 ACP 形状。
+
+    为什么只取 dsh: true 的：config/mcp.json 里的 server 是给本程序自己的 MCPManager 用的，
+    其中可能有需要联网下载（npx/uvx）或依赖本机 node 的条目。整份透传给 DSH 的话，
+    任何一个起不来都会连带整个桥接会话建不起来。
+    ACP 侧只认 name/command/args/env，且 env 必须是 [{name,value}] 列表，不能是字典。
+    """
+    path = os.path.join(PROJECT_ROOT, "config", MCP_CONFIG_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logging.warning("读取 %s 失败，本次 DSH 会话不附带任何 MCP server", path, exc_info=True)
+        return []
+
+    servers = document.get("mcpServers") if isinstance(document, dict) else None
+    if not isinstance(servers, dict):
+        return []
+
+    result = []
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            continue
+        if not spec.get("dsh"):
+            continue
+        if spec.get("enabled") is False:
+            continue
+        if str(spec.get("type") or "").strip().lower():
+            logging.info("DSH 桥接暂不支持非 stdio 的 MCP server，已跳过：%s", name)
+            continue
+        command = _resolve_stdio_command(spec.get("command"))
+        if not command:
+            logging.warning(
+                "MCP server %s 的 command 无法解析成绝对路径，已跳过（否则会拖垮整个 DSH 会话）", name
+            )
+            continue
+        raw_env = spec.get("env")
+        env = []
+        if isinstance(raw_env, dict):
+            env = [{"name": str(key), "value": str(value)} for key, value in raw_env.items()]
+        args = [str(item) for item in (spec.get("args") or [])]
+        result.append({"name": str(name), "command": command, "args": args, "env": env})
+
+    if result:
+        logging.info("DSH 桥接将附带 %d 个 MCP server：%s", len(result), "、".join(item["name"] for item in result))
+    return result
 
 
 def default_workspace():
@@ -452,7 +524,9 @@ class DshAcpConnection:
             self._notify_status("上次的 DSH 会话已不可恢复，将新建会话")
 
         result = self.request(
-            "session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=180
+            "session/new",
+            {"cwd": self.cwd, "mcpServers": build_acp_mcp_servers()},
+            timeout=180,
         )
         session_id = result.get("sessionId")
         if not session_id:
@@ -467,7 +541,11 @@ class DshAcpConnection:
         try:
             self.request(
                 "session/resume",
-                {"sessionId": session_id, "cwd": self.cwd, "mcpServers": []},
+                {
+                    "sessionId": session_id,
+                    "cwd": self.cwd,
+                    "mcpServers": build_acp_mcp_servers(),
+                },
                 timeout=180,
             )
         except DshAcpError:
