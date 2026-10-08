@@ -2685,20 +2685,6 @@ class MessageDatabase:
         except sqlite3.OperationalError:
             return []
 
-    def session_has_user_messages(self, session_id):
-        """该会话是否已经有用户消息；用于判断「空会话」能否复用 session_id。"""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT 1 FROM messages
-                    WHERE session_id = ? AND role = 'user' AND is_system = 0
-                    LIMIT 1
-                """, (session_id,))
-                return cursor.fetchone() is not None
-        except sqlite3.OperationalError:
-            return True
-
     def ensure_session(self, session_id, title=""):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
@@ -2725,37 +2711,6 @@ class MessageDatabase:
             ]
         except Exception:
             return []
-
-    def find_session_by_first_user_message(self, content):
-        """找出「第一条用户消息与 content 完全相同」的已有会话，用于避免重复建会话。
-
-        必须直接在 SQL 里比较「每个会话最早的那条用户消息」：先按 content 捞一行、
-        再回头校验首条消息的写法会被「该内容出现在别的会话的后续消息里」提前命中，
-        从而漏掉真正首条匹配的会话。
-        """
-        text = str(content or "").strip()
-        if not text:
-            return ""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT m.session_id
-                    FROM messages m
-                    WHERE m.role = 'user' AND m.is_system = 0
-                      AND m.id = (
-                          SELECT m2.id FROM messages m2
-                          WHERE m2.session_id = m.session_id
-                            AND m2.role = 'user' AND m2.is_system = 0
-                          ORDER BY m2.timestamp ASC, m2.id ASC LIMIT 1
-                      )
-                      AND TRIM(m.content) = ?
-                    LIMIT 1
-                """, (text,))
-                row = cursor.fetchone()
-                return str(row[0]) if row else ""
-        except sqlite3.OperationalError:
-            return ""
 
     def save_message(self, session_id, role, content, is_system=False, sources=None):
         sources_json = None
@@ -9118,7 +9073,10 @@ class MainWindow(QMainWindow):
                 current_group = group
             display_title = ("★ " if item.get("pinned") else "") + title[:32]
             display = display_title
-            if preview and preview != title:
+            # 标题就是「首条用户消息的前 50 字」，所以它通常正是摘要的开头：再补一行摘要，
+            # 两行在列表可见宽度内会是完全相同的文字，看起来像标题被重复渲染了两次。
+            # 只有摘要确实带来标题之外的信息（例如会话被重命名过）时才补这一行。
+            if preview and preview != title and not preview.startswith(title):
                 display += f"\n{preview[:46]}"
             list_item = QListWidgetItem(display)
             list_item.setData(Qt.ItemDataRole.UserRole, item["session_id"])
@@ -10444,28 +10402,13 @@ class MainWindow(QMainWindow):
         self.chat_stream_filter.reset()
         self._restore_input_controls()
 
-    def _current_session_has_user_messages(self):
-        """当前会话是否已有用户消息：决定「新对话」能否复用 session_id。"""
-        try:
-            return bool(self.db.session_has_user_messages(self.current_session_id))
-        except Exception:
-            return True   # 查不到就当作已有内容，宁可新建也不冒合并的风险
-
     def _new_session_id(self):
         return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     def _show_temporary_session(self, status_message=""):
-        """显示未持久化的新会话，直到用户发送消息才创建数据库记录。
-
-        只有「从没落库、也没有用户消息」的空会话才复用同一个 session_id：
-        每次点「新对话」都换 id，会让同一段内容留下多条近似重复的会话记录；
-        而已经落库的会话绝不能复用，否则欢迎语会一轮轮追加进同一条会话，
-        标题/摘要会堆成一串重复的问候。
-        """
-        reuse = (not self.session_is_persisted) and not self._current_session_has_user_messages()
-        if not reuse:
-            self.current_session_id = self._new_session_id()
-            self.session_is_persisted = False
+        """显示未持久化的新会话，直到用户发送消息才创建数据库记录。"""
+        self.current_session_id = self._new_session_id()
+        self.session_is_persisted = False
         self._set_session_task_state(None, session_id=self.current_session_id)
         self.chat_list.clear()
         self.load_system_prompt()
@@ -11118,27 +11061,6 @@ class MainWindow(QMainWindow):
         # 去掉所有欢迎语后，若剩下的只是标点/空白，同样视为重复粘贴
         return not stripped.strip(" \t\r\n，。！？、；：,.!?;:~～…—-_*#`\"'()（）[]【】")
 
-    def _adopt_existing_session_for(self, first_user_message):
-        """当前是空会话、而库里已存在首条消息相同的历史会话时，接管那条会话。
-
-        否则同一个开头被重复发送一次就会多出一条标题相同、只有摘要长度不同的
-        重复会话——正是会话栏里出现两条近似记录的原因。
-        """
-        if self.session_is_persisted:
-            return
-        if self._current_session_has_user_messages():
-            return
-        try:
-            existing = self.db.find_session_by_first_user_message(first_user_message)
-        except Exception:
-            return
-        if not existing or existing == self.current_session_id:
-            return
-        self.current_session_id = existing
-        self.session_is_persisted = True
-        # 空会话上刚建的任务状态搬到接管过来的 session_id 下，避免它随着旧 id 一起悬空
-        self._set_session_task_state(self.current_task_state, session_id=existing)
-
     def _clear_attachments(self):
         self._pending_attachments = []
         self._pending_image_attachments = []
@@ -11191,7 +11113,6 @@ class MainWindow(QMainWindow):
             return
 
         self._set_session_task_state(task_state)
-        self._adopt_existing_session_for(full_msg)
         self.add_message(full_msg, is_user=True)
         api_messages = self.conversation_history.copy()
         if image_attachments and api_messages:
