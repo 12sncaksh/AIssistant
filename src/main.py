@@ -877,6 +877,10 @@ def merge_live2d_emotion_config(template, path):
 # pygame.mixer 是进程级全局设备，绝不能由多个 TTS 线程并发 init/stop/quit。
 TTS_AUDIO_LOCK = threading.RLock()
 
+# 喊「小柚」唤醒后的语音应答：开着语音回复时应该出声，而不是只弹气泡。
+# 保持很短，避免唤醒后要等很久才开始拾音。
+WAKE_ACK_SPEECH = "我在"
+
 
 DATETIME_FORCE_KEYWORDS = [
     "今天几号", "今天是几号", "今天日期", "今天星期几", "今天周几", "今天礼拜几",
@@ -8736,6 +8740,10 @@ class MainWindow(QMainWindow):
         self._tts_threads = []
         self.stt_thread = None
         self.wakeword_thread = None
+        # 唤醒应答播完后要自动开始拾音（播报期间开麦会把应答本身录进去）。
+        # 记线程对象而不是布尔标记：应答若被别处 _stop_tts() 打断，标记会漏清，
+        # 结果变成下一次回复播完才突然开始录音。
+        self._pending_voice_input_thread = None
         self._pending_attachments = []
         self._pending_image_attachments = []
         self._screenshot_overlay = None
@@ -10661,7 +10669,29 @@ class MainWindow(QMainWindow):
             return
         self._set_kaomoji_display(text="在呢~ (｡•ᴗ•｡)")
         self.status_bar.showMessage("在呢~ 请说…", 3000)
+        if self.config.get_tts_enabled():
+            # 开着语音回复就出声应答；播完再拾音，否则麦克风会把「我在」当成用户输入
+            self._speak_wake_ack()
+            return
         self._start_voice_input()
+
+    def _speak_wake_ack(self):
+        """唤醒后播报应答语，并交给 _on_tts_finished 在播完后开始拾音。"""
+        voice = self.config.get_tts_voice()
+        pages = [WAKE_ACK_SPEECH]
+        if self.pet_window:
+            self.pet_window.prepare_tts_speech(pages, self.kaomoji_label.text())
+        tts_thread = TextToSpeechThread(pages, voice)
+        self.tts_thread = tts_thread
+        self._pending_voice_input_thread = tts_thread
+        self._tts_threads.append(tts_thread)
+        tts_thread.page_started.connect(self._on_tts_page_started)
+        tts_thread.error.connect(self._on_tts_error)
+        tts_thread.finished.connect(self._on_tts_finished)
+        if self.wakeword_thread:
+            self.wakeword_thread.set_paused(True)
+            self.wakeword_thread.suspend()
+        tts_thread.start()
 
     def _toggle_voice_input(self):
         if self.stt_thread and self.stt_thread.isRunning():
@@ -10780,6 +10810,20 @@ class MainWindow(QMainWindow):
         finished_thread = self.sender()
         if finished_thread in self._tts_threads:
             self._tts_threads.remove(finished_thread)
+        # 唤醒应答：不管正常播完还是被中途打断，接着都该开麦。要在下面的
+        # 「不是当前 TTS 线程」提前返回之前处理，否则应答被 _stop_tts() 打断时
+        # 会漏掉这次拾音。
+        if finished_thread is self._pending_voice_input_thread:
+            self._pending_voice_input_thread = None
+            if self.tts_thread is finished_thread:
+                if self.pet_window:
+                    self.pet_window.finish_tts_speech()
+                self.tts_thread = None
+            if self.wakeword_thread:
+                self.wakeword_thread.set_paused(False)
+                self.wakeword_thread.resume()
+            self._start_voice_input()
+            return
         if finished_thread is not self.tts_thread:
             return
         if self.pet_window:
