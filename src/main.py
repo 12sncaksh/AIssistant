@@ -10402,31 +10402,24 @@ class MainWindow(QMainWindow):
         self.chat_stream_filter.reset()
         self._restore_input_controls()
 
-    def _new_session_id(self):
-        return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
     def _show_temporary_session(self, status_message=""):
         """显示未持久化的新会话，直到用户发送消息才创建数据库记录。"""
-        self.current_session_id = self._new_session_id()
+        self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.session_is_persisted = False
         self._set_session_task_state(None, session_id=self.current_session_id)
         self.chat_list.clear()
         self.load_system_prompt()
-        self._show_welcome_message()
+        self.add_message(
+            "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)",
+            is_user=False,
+            store=False,
+        )
         self.refresh_session_list()
         if status_message:
             self.status_bar.showMessage(status_message, 3000)
         self._set_kaomoji_display(
             text="(｡•ᴗ•｡)",
             style="font-weight: bold; background-color: #f5f5f5; padding: 5px; font-size: 18px; color: #333333;",
-        )
-
-    def _show_welcome_message(self):
-        """欢迎语只在界面上显示：store=False 时不应写进数据库。"""
-        self.add_message(
-            "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)",
-            is_user=False,
-            store=False,
         )
 
     def _create_task_placeholder(self, task_state=None):
@@ -11044,23 +11037,6 @@ class MainWindow(QMainWindow):
         self.attach_clear_btn.show()
         self._resize_composer_input()
 
-    @staticmethod
-    def _looks_like_welcome_echo(text):
-        """判断一段输入是否只是欢迎语本身的重复粘贴。
-
-        欢迎语气泡里的文字可以选中复制，误操作会把「你好呀！…」重复贴上很多遍再发送，
-        在会话里留下一条没有信息量的巨长用户消息（并污染标题与摘要）。
-        """
-        body = str(text or "").strip()
-        if len(body) < 40:
-            return False
-        unit = "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)"
-        stripped = body.replace(unit, "").strip()
-        if not stripped:
-            return True
-        # 去掉所有欢迎语后，若剩下的只是标点/空白，同样视为重复粘贴
-        return not stripped.strip(" \t\r\n，。！？、；：,.!?;:~～…—-_*#`\"'()（）[]【】")
-
     def _clear_attachments(self):
         self._pending_attachments = []
         self._pending_image_attachments = []
@@ -11103,13 +11079,6 @@ class MainWindow(QMainWindow):
         dsh_bridge_enabled = self.config.get_dsh_bridge_enabled()
         if not dsh_bridge_enabled and not self.config.get_api_key():
             QMessageBox.warning(self, "缺少配置", "请先在 设置->API配置 中设置API Key")
-            return
-
-        if not attachments and not image_attachments and self._looks_like_welcome_echo(user_msg):
-            # 欢迎语气泡是可选中文本；误选/误发时不应把它当成一次真实提问存进会话
-            self.input_text.clear()
-            self._restore_input_controls()
-            self.status_bar.showMessage("这看起来是欢迎语的重复内容，已忽略", 4000)
             return
 
         self._set_session_task_state(task_state)
