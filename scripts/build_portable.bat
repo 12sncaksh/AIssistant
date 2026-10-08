@@ -16,6 +16,13 @@ if not errorlevel 1 (
     set "PYTHON=python"
 )
 
+rem 版本号唯一来源：src\version.py（关于窗口读同一个值）
+pushd src
+for /f "delims=" %%v in ('%PYTHON% -c "import version;print(version.__version__)"') do set "APP_VERSION=%%v"
+popd
+if not defined APP_VERSION goto version_missing
+set "PKG=Aissistant_v%APP_VERSION%_test_portable.zip"
+
 echo [2/6] Installing build dependencies into the selected Python...
 %PYTHON% -m pip install -r requirements.txt
 if errorlevel 1 goto build_failed
@@ -68,20 +75,22 @@ copy /y "config\templates\mcp.example.json" "dist\Aissistant\config\templates\mc
 if errorlevel 1 goto templates_missing
 copy /y "config\templates\live2d_emotions.example.json" "dist\Aissistant\config\templates\live2d_emotions.example.json" >nul
 if errorlevel 1 goto templates_missing
+copy /y "config\templates\dsh_acp_overlay.example.yml" "dist\Aissistant\config\templates\dsh_acp_overlay.example.yml" >nul
+if errorlevel 1 goto templates_missing
 
 echo [6/6] Creating ZIP package...
 where tar.exe >nul 2>nul
 if errorlevel 1 goto tar_missing
-if exist Aissistant_v1.102.6_test_portable.zip del /q Aissistant_v1.102.6_test_portable.zip
-tar.exe -a -c -f "Aissistant_v1.102.6_test_portable.zip" -C "dist" "Aissistant"
+if exist %PKG% del /q %PKG%
+tar.exe -a -c -f "%PKG%" -C "dist" "Aissistant"
 if errorlevel 1 goto package_failed
-if not exist "Aissistant_v1.102.6_test_portable.zip" goto package_failed
+if not exist "%PKG%" goto package_failed
 rem verify the archive can be opened and is free of local chat history
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; try { $z=[System.IO.Compression.ZipFile]::OpenRead('Aissistant_v1.102.6_test_portable.zip'); $names=@($z.Entries.FullName); $z.Dispose() } catch { Write-Host 'ZIP check failed: archive cannot be opened.'; Write-Host $_.Exception.Message; exit 1 }; if ($names.Count -lt 1000) { Write-Host 'ZIP check failed: too few entries.'; exit 1 }; if (-not ($names -match '^Aissistant[\\/]Aissistant\.exe$')) { Write-Host 'ZIP check failed: Aissistant/Aissistant.exe is missing.'; exit 1 }; $leak=@($names -like '*chat_history.db'); if ($leak.Count -gt 0) { Write-Host 'ZIP check failed: chat history database was packaged.'; exit 1 }; Write-Host ('ZIP check OK: ' + $names.Count + ' entries, no chat history.')"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; try { $z=[System.IO.Compression.ZipFile]::OpenRead('%PKG%'); $names=@($z.Entries.FullName); $z.Dispose() } catch { Write-Host 'ZIP check failed: archive cannot be opened.'; Write-Host $_.Exception.Message; exit 1 }; if ($names.Count -lt 1000) { Write-Host 'ZIP check failed: too few entries.'; exit 1 }; if (-not ($names -match '^Aissistant[\\/]Aissistant\.exe$')) { Write-Host 'ZIP check failed: Aissistant/Aissistant.exe is missing.'; exit 1 }; $leak=@($names -like '*chat_history.db'); if ($leak.Count -gt 0) { Write-Host 'ZIP check failed: chat history database was packaged.'; exit 1 }; Write-Host ('ZIP check OK: ' + $names.Count + ' entries, no chat history.')"
 if errorlevel 1 goto package_failed
 
 echo.
-echo Build complete: Aissistant_v1.102.6_test_portable.zip
+echo Build complete: %PKG%
 pause
 exit /b 0
 
@@ -100,8 +109,14 @@ echo See README.md ("resources not shipped in this repository") for details.
 pause
 exit /b 1
 
+:version_missing
+echo Failed to read the project version from src\version.py.
+echo Check that src\version.py defines __version__ and that Python runs in this shell.
+pause
+exit /b 1
+
 :templates_missing
-echo Failed to copy config\templates into the package. Check config\templates\*.example.json.
+echo Failed to copy config\templates into the package. Check config\templates\*.example.*
 pause
 exit /b 1
 

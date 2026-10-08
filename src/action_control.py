@@ -47,6 +47,21 @@ class ActionHandler:
     _timeout_confirm_callback = None  # 命令超时时询问用户是否继续等待的回调
     _pet_command_callback = None      # 桌宠 Live2D 控制回调（由 GUI 主线程注册，线程安全队列转发）
     _pet_param_catalog = []           # 当前桌宠模型的 Live2D 参数表 [{id,name,group}]，供大模型查询
+    _sandbox_mode = "workspace-write"  # 权限预设对应的沙箱模式（read-only / workspace-write / danger-full-access）
+
+    # 与 DSH 内置权限预设表保持一致：沙箱边界 + 审批策略由上层绑定
+    SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+
+    # read-only 沙箱下直接拒绝的状态改变类工具（只读工具不受影响）
+    READ_ONLY_BLOCKED_TOOLS = (
+        "run_command", "write_file", "shutdown", "reboot", "lock_screen",
+        "mouse_move", "mouse_click", "verified_mouse_click",
+        "keyboard_type", "keyboard_hotkey",
+    )
+    READ_ONLY_REJECT_MESSAGE = (
+        "当前处于「只读」权限模式，沙箱拒绝任何写入或状态改变操作，已拒绝执行 {tool}。"
+        "需要执行时请在「设置 → 权限模式」里切换到工作区可写或完全权限模式。"
+    )
 
     PET_EMOTION_NAMES = (
         "happy", "sad", "angry", "surprised", "shy", "wink", "cry", "sleepy",
@@ -63,6 +78,30 @@ class ActionHandler:
     def set_pet_param_catalog(cls, catalog):
         """登记当前桌宠模型可用的 Live2D 参数表。"""
         cls._pet_param_catalog = list(catalog or [])
+
+    @classmethod
+    def set_sandbox_mode(cls, mode):
+        """设置沙箱模式（对应权限预设）：read-only / workspace-write / danger-full-access。"""
+        value = str(mode or "").strip().lower()
+        cls._sandbox_mode = value if value in cls.SANDBOX_MODES else "workspace-write"
+        return cls._sandbox_mode
+
+    @classmethod
+    def get_sandbox_mode(cls):
+        return cls._sandbox_mode
+
+    @classmethod
+    def is_full_access(cls):
+        """完全权限模式：放开沙箱边界（工作区外的读写范围、子agent的工作区路径限制）。
+
+        注意：破坏性命令黑名单（_check_command_blocked）和受保护写入路径（BLOCKED_WRITE_PATHS、
+        .git 目录、auth.json）不在此列，它们在所有权限模式下都拦截。
+        """
+        return cls._sandbox_mode == "danger-full-access"
+
+    @classmethod
+    def is_read_only(cls):
+        return cls._sandbox_mode == "read-only"
 
     @classmethod
     def load_apps(cls, config_path=None):
@@ -1206,6 +1245,9 @@ class ActionHandler:
             norm = os.path.normpath(path)
         if norm == ws_norm or norm.startswith(ws_norm + os.sep):
             return norm, None
+        if cls.is_full_access():
+            # 完全权限模式下沙箱不再限制子agent的访问范围（相对路径仍解析到工作区内）
+            return norm, None
         return path, f"当前子agent的工作区被限制在 {workspace}，禁止访问工作区外的路径：{path}"
 
     @staticmethod
@@ -1241,11 +1283,16 @@ class ActionHandler:
 
     @staticmethod
     def _run_command(command: str, timeout: int = COMMAND_TIMEOUT_SECONDS, cwd: str | None = None):
-        """执行 PowerShell 命令，返回 (成功, 消息, 数据)。带超时和输出截断。"""
+        """执行 PowerShell 命令，返回 (成功, 消息, 数据)。带超时和输出截断。
+
+        破坏性命令黑名单在任何权限模式下都生效：这些命令正常干活基本用不到，只会用来搞破坏，
+        属于保命拦截而非沙箱边界。完全权限模式（danger-full-access）放开的是子agent的工作区路径限制，
+        以及工具层与审批层的其它沙箱约束。
+        """
         blocked_reason = ActionHandler._check_command_blocked(command)
         if blocked_reason:
             return False, "已阻止危险命令：" + blocked_reason, None
-        if cwd:
+        if not ActionHandler.is_full_access() and cwd:
             outside = ActionHandler._find_outside_workspace_paths(command, cwd)
             if outside:
                 return False, (
@@ -1301,6 +1348,10 @@ class ActionHandler:
     @classmethod
     def execute_tool(cls, tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         arguments = arguments or {}
+        # 只读沙箱：状态改变类工具在执行前直接拒绝
+        if cls.is_read_only() and tool_name in cls.READ_ONLY_BLOCKED_TOOLS:
+            logging.warning("只读权限模式拒绝了工具 %s", tool_name)
+            return cls._result(False, cls.READ_ONLY_REJECT_MESSAGE.format(tool=tool_name))
         if cls._apps is None:
             cls.load_apps()
 
@@ -1540,11 +1591,14 @@ class ActionHandler:
                 if ws_err:
                     return cls._result(False, ws_err)
                 lower_path = os.path.abspath(path).lower()
+                # 受保护写入路径在任何权限模式下都拦截：往系统目录和版本库里写基本只有搞破坏才会用到，
+                # 属于保命拦截而非沙箱边界（完全权限模式放开的是工作区外的读写范围）。
                 for blocked_area in ActionHandler.BLOCKED_WRITE_PATHS:
                     if lower_path.startswith(blocked_area):
                         return cls._result(False, f"已阻止写入受保护路径：{path}（{blocked_area}）。")
                 if "\\.git\\" in lower_path or lower_path.endswith("\\.git"):
                     return cls._result(False, "已阻止写入 .git 目录（避免破坏版本库）。")
+                # 凭证文件同样在所有权限模式下都不允许覆盖
                 if lower_path.endswith("auth.json"):
                     return cls._result(False, "已阻止覆盖 config/auth.json（该文件包含密钥配置）。")
                 try:

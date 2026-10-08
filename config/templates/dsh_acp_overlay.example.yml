@@ -1,0 +1,33 @@
+# Aissistant · DSH 路由覆盖补丁（配置模板）
+#
+# 运行时文件：config/dsh_acp_overlay.yml（已被 .gitignore 忽略，不入库）
+# 本文件只作字段说明与手写起点，程序不会读取它。
+#
+# 用途
+#   DSH 桥接启动 `dsh --profile acp` 时，如果配置了 dsh_provider，就会额外带上
+#   `--patch config/dsh_acp_overlay.yml`，在 profile 自带的 patch 之上再覆盖一次 ACP 路由，
+#   让桥接会话使用你选择的 provider / model，而不是 profile 里钉死的那一个。
+#   （否则内网网关的 Key 会被拿去请求公网 API，表现为认证失败。）
+#
+# 何时需要它
+#   一般不需要：在「设置 → 配置 → DSH 桥接」里填了 dsh_provider（和可选的 dsh_model）后，
+#   程序会自动生成这份 overlay；不填 provider 则不生成，也不给 dsh 传 --patch。
+#   只有想在路由之外追加其它 ACP 配置项时，才需要参照本模板手写——
+#   注意程序下一次同步路由时会重写 config/dsh_acp_overlay.yml。
+#
+# 格式
+#   与 DSH 的 patch 文件一致：一个列表，每项用 id 指定目标模块，config 里写要覆盖的键值。
+#
+# 字段
+#   id              : 目标模块 id，ACP 桥接固定为 acp。
+#   config.provider : provider id（你在 DSH 里使用的模型提供方 / 网关名）。
+#   config.model    : 该 provider 下的模型 id；省略或留空表示沿用 provider 的默认模型。
+#
+# 注意：推理档位（reasoning_effort）不在这个文件里。它由 DSH 在 ACP 会话里动态公布，
+# 桥接改用 session/set_config_option 下发（见 README「DSH 桥接」）。只有当模型在
+# DSH 的 settings.yaml 里声明了 reasoningEfforts，DSH 才会公布该选项。
+
+- id: acp
+  config:
+    provider: your-provider-id
+    model: your-model-id

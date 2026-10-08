@@ -21,6 +21,7 @@ import random
 import re
 import mimetypes
 import traceback
+import faulthandler
 import requests
 import edge_tts
 import pygame
@@ -50,7 +51,14 @@ from dsh_acp_client import (  # DSH（DeepSeek Harness）桥接
     DSHSessionThread,
     current_connection,
     reset_connection,
+    probe_session_options,
+    config_option_choices,
+    find_config_option,
+    parse_model_selection_value,
+    MODEL_OPTION_CATEGORY,
+    REASONING_OPTION_CATEGORY,
 )
+from version import __version__ as APP_VERSION
 import json
 # PyQt6 导入
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
@@ -66,7 +74,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QLabel, QSplitter, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,QFileDialog, QInputDialog, QListView, QRubberBand,
     QMenuBar, QMenu, QStatusBar, QSizePolicy, QGroupBox, QComboBox, QCheckBox, QTextBrowser, QAbstractItemView, QProgressBar,
-    QToolButton, QStackedWidget, QFrame, QStyle,
+    QToolButton, QStackedWidget, QFrame, QStyle, QTabWidget, QScrollArea,
     QSystemTrayIcon, QFontComboBox, QSpinBox, QColorDialog,
 )
 from PyQt6.QtGui import (
@@ -1517,6 +1525,10 @@ SUBAGENT_PROMPTS = {
 }
 
 # ======================== 运行日志 ========================
+# 崩溃取证文件句柄：必须由模块级引用持住，否则会被 GC 关闭导致 faulthandler 失效
+_CRASH_LOG_HANDLE = None
+
+
 def setup_logging():
     """初始化运行日志：logs/app.log，滚动 2MB×3，并捕获未处理异常。"""
     log_dir = os.path.join(get_runtime_dir(), "logs")
@@ -1541,6 +1553,17 @@ def setup_logging():
         traceback.print_exception(exc_type, exc_value, exc_tb)
         logging.critical("未捕获异常", exc_info=(exc_type, exc_value, exc_tb))
     sys.excepthook = _excepthook
+
+    # 硬崩溃取证：C++ 层的访问违例（如 Qt6Core.dll 的 0xc0000005）不会走 excepthook，
+    # app.log 里什么都留不下，只能靠 Windows 事件查看器看到“模块+偏移”。开启 faulthandler 后，
+    # 崩溃瞬间会把所有线程的 Python 调用栈写进同目录的 crash.log，便于定位到具体槽函数。
+    global _CRASH_LOG_HANDLE
+    if _CRASH_LOG_HANDLE is None:
+        try:
+            _CRASH_LOG_HANDLE = open(os.path.join(log_dir, "crash.log"), "a", encoding="utf-8")
+            faulthandler.enable(_CRASH_LOG_HANDLE, all_threads=True)
+        except Exception:  # noqa: BLE001 - 取证功能失败不能影响启动
+            _CRASH_LOG_HANDLE = None
     return log_path
 
 
@@ -1569,6 +1592,75 @@ REASONING_EFFORT_VALUES = frozenset(value for _, value in REASONING_EFFORT_CHOIC
 # 由高到低的档位顺序：网关只支持较低档位时，按这个顺序逐级下调重试。
 REASONING_EFFORT_ORDER = tuple(value for _, value in REASONING_EFFORT_CHOICES if value)[::-1]
 REASONING_EFFORT_LABELS = {value: label for label, value in REASONING_EFFORT_CHOICES if value}
+
+# ======================== 权限模式（对齐 DSH 网页端权限预设） ========================
+# 与 DSH 内置预设表一一对应：每个预设把「沙箱边界」和「审批策略」捆绑在一起。
+#   read-only          → sandbox: read-only          | approval: ask
+#   workspace-write    → sandbox: workspace-write    | approval: ask   （默认）
+#   danger-full-access → sandbox: danger-full-access | approval: never （完全权限模式）
+PERMISSION_MODE_CHOICES = (
+    (
+        "只读（沙箱拒绝一切写入）",
+        "read-only",
+        "沙箱：read-only ｜ 审批：ask。只能读取文件和查询信息；写文件、执行命令、关机重启、键鼠操作会被沙箱直接拒绝。",
+    ),
+    (
+        "工作区可写（默认）",
+        "workspace-write",
+        "沙箱：workspace-write ｜ 审批：ask。可读写工作区；执行命令、写文件、关机重启、外部 MCP 工具仍会逐次弹窗确认。",
+    ),
+    (
+        "完全权限（免确认，等同 DSH danger-full-access）",
+        "danger-full-access",
+        "沙箱：danger-full-access ｜ 审批：never。所有工具调用不再弹确认框，沙箱不再限制工作区外的"
+        "读写范围，DSH 桥接也以 danger-full-access 启动；破坏性命令黑名单与受保护写入路径"
+        "（C:\\Windows、Program Files、.git 等）仍然拦截。请只在信任的任务里开启。",
+    ),
+)
+PERMISSION_MODE_VALUES = frozenset(value for _, value, _ in PERMISSION_MODE_CHOICES)
+PERMISSION_MODE_LABELS = {value: label for label, value, _ in PERMISSION_MODE_CHOICES}
+PERMISSION_MODE_DESCRIPTIONS = {value: desc for _, value, desc in PERMISSION_MODE_CHOICES}
+DEFAULT_PERMISSION_MODE = "workspace-write"
+FULL_ACCESS_MODE = "danger-full-access"
+READ_ONLY_MODE = "read-only"
+
+# 档位高低序：只读 < 工作区可写 < 完全权限。数值变大 = 提权（模型能做的事变多）。
+PERMISSION_MODE_RANK = {
+    READ_ONLY_MODE: 0,
+    "workspace-write": 1,
+    FULL_ACCESS_MODE: 2,
+}
+PERMISSION_MODE_BUSY_MESSAGE = "任务进行中：只能收紧权限（例如切到只读）；要提权请等这次任务结束。"
+
+# DSH 推理档位（ACP 的 reasoning_effort）：这里列出 pi-ai 适配器允许的等级全集，
+# 真正可选的值取决于所选模型在 DSH 里声明的 reasoningEfforts——没声明时 DSH 不会公布该选项。
+DSH_REASONING_CHOICES = (
+    ("关闭推理（off）", "off"),
+    ("最低（minimal）", "minimal"),
+    ("低（low）", "low"),
+    ("中（medium）", "medium"),
+    ("高（high）", "high"),
+    ("极高（xhigh）", "xhigh"),
+    ("最高（max）", "max"),
+)
+
+# 权限模式会改变模型可做的事，必须在系统提示词里明确告知，否则模型会按旧规则反复试探。
+READ_ONLY_PROMPT_NOTICE = (
+    "【只读权限模式已开启】当前沙箱为 read-only：写文件、执行命令、关机重启和键鼠操作都会被系统直接拒绝。"
+    "请只用只读工具（read_file / list_dir / 各类查询工具）完成任务；确实需要写入时，先说明原因并请用户"
+    "在聊天框旁的权限按钮，或「设置 → 模型与接口 → 工具与权限」切换到「工作区可写」或「完全权限」。"
+)
+FULL_ACCESS_PROMPT_NOTICE = (
+    "【完全权限模式已开启】用户已选择 danger-full-access 权限预设：沙箱不再限制工作区外的读写范围，"
+    "所有工具调用都不再弹确认框，因此你的每一条命令都会立即真实执行。"
+    "两道拦截不随权限模式放开，命中会直接报错，不要尝试绕过："
+    "①破坏性命令黑名单（Remove-Item -Recurse/-Force、rm -rf、del /s、diskpart、format、bcdedit、"
+    "Clear-Disk、reg delete、vssadmin delete、-EncodedCommand 等）；"
+    "②受保护写入路径与凭证文件（C:\\Windows、Program Files、ProgramData、$Recycle.Bin、"
+    "Recovery、System Volume Information、.git 目录、config/auth.json）。"
+    "需要删除或覆盖时请改用不含这些模式的做法，并先向用户说明。"
+    "请只做用户明确要求的事，绝不能在用户没明确要求时动用户的数据。"
+)
 
 # 单次响应体上限：正常回复远小于此值；超过视为网关异常，直接报错而不是把半截 JSON 丢给解析器。
 API_RESPONSE_MAX_CHARS = 5_000_000
@@ -1652,6 +1744,7 @@ class ConfigManager:
         self.settings = QSettings("AI_Assistant", "Desktop_AI_Helper")
         self._auth_config = None
         self._file_config = None
+        self._permission_mode = None  # 权限模式进程内缓存（见 get_permission_mode）
 
     def get_api_key(self):
         key = str(self.settings.value("api_key", "") or "").strip()
@@ -1734,6 +1827,29 @@ class ConfigManager:
         value = str(value or "").strip().lower()
         self.settings.setValue("reasoning_effort", value if value in REASONING_EFFORT_VALUES else "")
 
+    # --- 权限模式（对齐 DSH 权限预设：沙箱模式 + 审批策略） ---
+    def get_permission_mode(self):
+        # 进程内缓存优先：QSettings 在受限环境里可能写入失败，权限模式不能因此变成空操作
+        if self._permission_mode is not None:
+            return self._permission_mode
+        value = str(self._get_setting_or_file("permission_mode", DEFAULT_PERMISSION_MODE) or "").strip().lower()
+        mode = value if value in PERMISSION_MODE_VALUES else DEFAULT_PERMISSION_MODE
+        self._permission_mode = mode
+        return mode
+
+    def set_permission_mode(self, value):
+        value = str(value or "").strip().lower()
+        mode = value if value in PERMISSION_MODE_VALUES else DEFAULT_PERMISSION_MODE
+        self._permission_mode = mode
+        self.settings.setValue("permission_mode", mode)
+        return mode
+
+    def is_full_access_mode(self):
+        return self.get_permission_mode() == FULL_ACCESS_MODE
+
+    def is_read_only_mode(self):
+        return self.get_permission_mode() == READ_ONLY_MODE
+
     def get_dsh_bridge_enabled(self):
         value = self._get_setting_or_file("dsh_bridge_enabled", False)
         if isinstance(value, str):
@@ -1760,6 +1876,13 @@ class ConfigManager:
 
     def set_dsh_model(self, value):
         self.settings.setValue("dsh_model", str(value or "").strip())
+
+    def get_dsh_reasoning_effort(self):
+        """DSH 推理档位（ACP 的 reasoning_effort 选项值）；空串表示跟随 DSH / 模型默认。"""
+        return str(self._get_setting_or_file("dsh_reasoning_effort", "")).strip()
+
+    def set_dsh_reasoning_effort(self, value):
+        self.settings.setValue("dsh_reasoning_effort", str(value or "").strip())
 
     def get_searxng_url(self):
         return str(self._get_setting_or_file("searxng_url", "http://localhost:18080")).strip()
@@ -2562,6 +2685,20 @@ class MessageDatabase:
         except sqlite3.OperationalError:
             return []
 
+    def session_has_user_messages(self, session_id):
+        """该会话是否已经有用户消息；用于判断「空会话」能否复用 session_id。"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT 1 FROM messages
+                    WHERE session_id = ? AND role = 'user' AND is_system = 0
+                    LIMIT 1
+                """, (session_id,))
+                return cursor.fetchone() is not None
+        except sqlite3.OperationalError:
+            return True
+
     def ensure_session(self, session_id, title=""):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
@@ -2588,6 +2725,37 @@ class MessageDatabase:
             ]
         except Exception:
             return []
+
+    def find_session_by_first_user_message(self, content):
+        """找出「第一条用户消息与 content 完全相同」的已有会话，用于避免重复建会话。
+
+        必须直接在 SQL 里比较「每个会话最早的那条用户消息」：先按 content 捞一行、
+        再回头校验首条消息的写法会被「该内容出现在别的会话的后续消息里」提前命中，
+        从而漏掉真正首条匹配的会话。
+        """
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT m.session_id
+                    FROM messages m
+                    WHERE m.role = 'user' AND m.is_system = 0
+                      AND m.id = (
+                          SELECT m2.id FROM messages m2
+                          WHERE m2.session_id = m.session_id
+                            AND m2.role = 'user' AND m2.is_system = 0
+                          ORDER BY m2.timestamp ASC, m2.id ASC LIMIT 1
+                      )
+                      AND TRIM(m.content) = ?
+                    LIMIT 1
+                """, (text,))
+                row = cursor.fetchone()
+                return str(row[0]) if row else ""
+        except sqlite3.OperationalError:
+            return ""
 
     def save_message(self, session_id, role, content, is_system=False, sources=None):
         sources_json = None
@@ -3199,6 +3367,21 @@ class APICallThread(QThread):
         if tool_name == "delegate_to_agent":
             return self._handle_delegate_tool_call(tool_call_id, arguments, depth)
 
+        # 只读模式：这类工具会被沙箱拒绝，先拦下来，避免白弹一次确认框
+        if (
+            self.config is not None
+            and self.config.is_read_only_mode()
+            and tool_name in ActionHandler.READ_ONLY_BLOCKED_TOOLS
+        ):
+            return self._tool_failure_response(
+                tool_call_id,
+                tool_name,
+                arguments,
+                "当前处于「只读」权限模式，该操作被沙箱拒绝。请改用只读工具，"
+                "或在聊天框旁的权限按钮，或「设置 → 模型与接口 → 工具与权限」里切换到「工作区可写」或「完全权限」。",
+                step_prefix,
+            )
+
         needs_user_approval = tool_name in {"shutdown", "reboot", "run_command", "write_file"}
         if not needs_user_approval and MCPManager.is_mcp_tool(tool_name):
             # 外部 MCP 工具默认每次都要用户点头；server 配置里写了 autoApprove 才免
@@ -3654,6 +3837,10 @@ class APICallThread(QThread):
         })
 
     def _request_confirmation(self, call_id, tool_name, arguments):
+        # 完全权限模式（danger-full-access）：审批策略为 never，任何工具都直接放行，不弹确认框
+        if self.config is not None and self.config.is_full_access_mode():
+            logging.info("完全权限模式：自动授权工具 %s", tool_name)
+            return True
         event = threading.Event()
         with self._confirmation_lock:
             self._confirmation_events[call_id] = event
@@ -3955,6 +4142,50 @@ class RoleManagerDialog(QDialog):
 
 
 # ======================== 配置对话框 ========================
+class DshOptionsProbeThread(QThread):
+    """后台起一个临时 ACP 连接，读取 DSH 公布的模型 / 推理档位。
+
+    探测只做 initialize + session/new（不发 prompt、不建会话映射），
+    所以不会污染聊天上下文；失败原因原样带回界面。
+    """
+
+    finished_ok = pyqtSignal(object, str)   # (configOptions, error)
+
+    def __init__(self, config, provider=None, model=None, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.provider = provider
+        self.model = model
+
+    def run(self):
+        try:
+            options, error = probe_session_options(
+                self.config, provider=self.provider, model=self.model
+            )
+        except Exception as exc:  # noqa: BLE001 - 探测线程不能让异常逃逸
+            options, error = [], str(exc)
+        self.finished_ok.emit(options, error)
+
+
+# 探测线程不挂在对话框上：探测要跑十几秒到几分钟，这期间用户若关掉对话框，
+# 作为其子对象的 QThread 会随父对象一起销毁，Qt 随即以
+# “QThread: Destroyed while thread is still running” 直接 abort —— 程序闪退、
+# 且因为走的是 C++ abort，Python 侧的 sys.excepthook / app.log 一条异常都留不下。
+# 这里用进程级强引用把线程保活到它自己结束，与任何窗口的生命周期解耦。
+_LIVE_PROBE_THREADS = set()
+
+
+def _track_probe_thread(thread):
+    """保活探测线程，并在它结束后释放引用（结束后才允许 deleteLater 销毁）。"""
+    _LIVE_PROBE_THREADS.add(thread)
+
+    def _release(*_args):
+        # 只做集合操作，不碰 C++ 侧状态：即使包装对象已被销毁也不会抛错
+        _LIVE_PROBE_THREADS.discard(thread)
+
+    thread.finished.connect(_release)
+
+
 class ConfigDialog(QDialog):
     voices_loaded = pyqtSignal(list)   # 信号用于传递声音列表
 
@@ -3970,6 +4201,20 @@ class ConfigDialog(QDialog):
         layout = QFormLayout(self)
 
         if section == "config":
+            # 配置页原先是一个 22 行的单页 QFormLayout，既没有 Tab 也没有滚动区，
+            # 任何屏幕都放不全。这里只重组容器：控件名、信号与行为完全不变，
+            # _apply_dsh_bridge_state 仍按属性名跨 Tab 生效。
+            self.tabs = QTabWidget()
+            self.tabs.setDocumentMode(True)
+            base_tab, base_layout = self._make_tab_page()
+            dsh_tab, dsh_layout = self._make_tab_page()
+            tools_tab, tools_layout = self._make_tab_page()
+            self.tabs.addTab(base_tab, "基础模型")
+            self.tabs.addTab(dsh_tab, "DSH 桥接")
+            self.tabs.addTab(tools_tab, "工具与权限")
+            layout.addRow(self.tabs)
+            self.resize(700, 460)
+
             self._secret_initial_values = {
                 key: str(config.settings.value(key, "") or "").strip()
                 for key in ("api_key", "tavily_api_key", "amap_api_key")
@@ -3981,10 +4226,11 @@ class ConfigDialog(QDialog):
                 "下面的 Base URL / API Key / 模型 / 推理强度将不再生效。\n"
                 "取消勾选：回到本地直连模型。"
             )
-            layout.addRow(self.dsh_bridge_checkbox)
+            dsh_layout.addRow(self.dsh_bridge_checkbox)
             self.dsh_bridge_hint = QLabel(
-                "⚠ 已启用 DSH 桥接：下面的 Base URL / API Key / 模型 / 推理强度已停用（灰色），"
+                "DSH 桥接已启用：请先在 DSH 网页端配置 Provider，再用本页探测并选择模型。"
                 "对话与工具执行全部交给本机 DSH 运行时。"
+                "「基础模型」页的本地 API 设置此时不生效。"
             )
             self.dsh_bridge_hint.setWordWrap(True)
             self.dsh_bridge_hint.setStyleSheet(
@@ -3992,23 +4238,95 @@ class ConfigDialog(QDialog):
                 " border: 1px solid #d9822b; border-radius: 6px; padding: 6px 8px;"
             )
             self.dsh_bridge_hint.setVisible(config.get_dsh_bridge_enabled())
-            layout.addRow("", self.dsh_bridge_hint)
+            dsh_layout.addRow("", self.dsh_bridge_hint)
+
+            # DSH 桥接专属：模型与推理档位。候选项由 DSH 的 ACP 会话公布，用「探测」拉取；
+            # 探测失败也能手填，桥接侧只在 DSH 确实提供该模型 / 档位时才下发。
+            self.dsh_provider_edit = QLineEdit(config.get_dsh_provider())
+            self.dsh_provider_edit.setPlaceholderText("DSH provider id，例如 opencode-ds")
+            self.dsh_provider_edit.setToolTip(
+                "对应 config/dsh_acp_overlay.yml 里的 provider；留空表示不改动 DSH 原有路由。"
+            )
+            dsh_layout.addRow("DSH Provider:", self.dsh_provider_edit)
+
+            self._dsh_model_values = {}
+            self.dsh_model_combo = QComboBox()
+            self.dsh_model_combo.setEditable(True)
+            self.dsh_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            current_dsh_model = config.get_dsh_model()
+            self.dsh_model_combo.addItem(current_dsh_model or "", current_dsh_model or "")
+            self.dsh_model_combo.setToolTip(
+                "点下面的「探测」可从 DSH 拉取真实模型列表（按 provider 分组）；也可直接填模型 id。"
+            )
+            dsh_layout.addRow("DSH 模型:", self.dsh_model_combo)
+            self.dsh_model_combo.currentIndexChanged.connect(self._sync_dsh_provider_from_model)
+            self.dsh_model_combo.currentIndexChanged.connect(self._schedule_dsh_options_probe)
+            self.dsh_model_combo.lineEdit().textEdited.connect(self._schedule_dsh_options_probe)
+
+            self.dsh_reasoning_combo = QComboBox()
+            self.dsh_reasoning_combo.setEditable(True)
+            self.dsh_reasoning_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            self._fill_dsh_reasoning_combo(config.get_dsh_reasoning_effort())
+            self.dsh_reasoning_combo.setToolTip(
+                "ACP 的 reasoning_effort 档位，与 DSH 网页端 composer 的推理强度同源；\n"
+                "只有所选模型声明了 reasoningEfforts 时 DSH 才会公布档位，否则本项会被忽略。"
+            )
+            dsh_layout.addRow("DSH 推理深度:", self.dsh_reasoning_combo)
+
+            self.dsh_probe_button = QPushButton("探测 DSH 可用模型 / 推理档位")
+            self.dsh_probe_button.clicked.connect(self._probe_dsh_options)
+            dsh_layout.addRow("", self.dsh_probe_button)
+
+            self.dsh_probe_status = QLabel(
+                "模型列表与推理档位由 DSH 的 ACP 会话公布，点上面的按钮读取；"
+                "探测会临时启动一次 dsh --profile acp，不发送任何消息。"
+            )
+            self.dsh_probe_status.setWordWrap(True)
+            dsh_layout.addRow("", self.dsh_probe_status)
+            self._dsh_probe_thread = None
+            self._dsh_probe_pending = False
+            self._dsh_probe_timer = QTimer(self)
+            self._dsh_probe_timer.setSingleShot(True)
+            self._dsh_probe_timer.timeout.connect(self._probe_dsh_options)
+
+            # 权限模式：与 DSH 网页端的权限预设选择器同源（沙箱边界 + 审批策略捆绑）
+            self.permission_combo = QComboBox()
+            for label, value, description in PERMISSION_MODE_CHOICES:
+                self.permission_combo.addItem(label, value)
+                self.permission_combo.setItemData(
+                    self.permission_combo.count() - 1, description, Qt.ItemDataRole.ToolTipRole
+                )
+            current_permission = config.get_permission_mode()
+            self.permission_combo.setCurrentIndex(
+                max(0, self.permission_combo.findData(current_permission))
+            )
+            self.permission_combo.setToolTip(
+                "权限预设同时决定「沙箱边界」和「是否需要弹窗确认」，与 DSH 网页端的权限选择器一致。\n"
+                "默认是工作区可写；完全权限模式请只在信任的任务里临时开启。"
+            )
+            tools_layout.addRow("权限模式:", self.permission_combo)
+
+            self.permission_hint = QLabel("")
+            self.permission_hint.setWordWrap(True)
+            tools_layout.addRow("", self.permission_hint)
+            self.permission_combo.currentIndexChanged.connect(self._on_permission_mode_changed)
+            self._on_permission_mode_changed(self.permission_combo.currentIndex())
 
             self.api_key_edit = self._make_secret_edit(config.get_api_key(), "sk-...")
-            layout.addRow("API Key:", self.api_key_edit)
+            base_layout.addRow("API Key:", self.api_key_edit)
 
             self.base_url_edit = QLineEdit(config.get_base_url())
             self.base_url_edit.setPlaceholderText("https://api.openai.com/v1")
-            layout.addRow("API Base URL:", self.base_url_edit)
+            base_layout.addRow("API Base URL:", self.base_url_edit)
 
             self.model_edit = QLineEdit(config.get_model())
             self.model_edit.setPlaceholderText("gpt-3.5-turbo")
-            layout.addRow("模型名称:", self.model_edit)
+            base_layout.addRow("模型名称:", self.model_edit)
 
             self.vision_model_edit = QLineEdit(config.get_vision_model())
             self.vision_model_edit.setPlaceholderText("支持图片输入的视觉模型；留空则使用聊天模型")
             self.vision_model_edit.setToolTip("视觉键鼠实验会使用这个模型分析屏幕截图。")
-            layout.addRow("视觉模型:", self.vision_model_edit)
+            base_layout.addRow("视觉模型:", self.vision_model_edit)
 
             self.reasoning_combo = QComboBox()
             for label, value in REASONING_EFFORT_CHOICES:
@@ -4020,17 +4338,17 @@ class ConfigDialog(QDialog):
                 "共七档：关闭 + 低 / 中 / 高 / 极高 / 最高 / 极限。"
                 "仅对支持 reasoning_effort 的模型生效，不支持时请关闭。"
             )
-            layout.addRow("推理强度:", self.reasoning_combo)
+            base_layout.addRow("推理强度:", self.reasoning_combo)
 
             self.searxng_url_edit = QLineEdit(config.get_searxng_url())
             self.searxng_url_edit.setPlaceholderText("http://localhost:18080")
-            layout.addRow("SearXNG URL:", self.searxng_url_edit)
+            tools_layout.addRow("SearXNG URL:", self.searxng_url_edit)
 
             self.tavily_api_key_edit = self._make_secret_edit(config.get_tavily_api_key(), "tvly-...")
-            layout.addRow("Tavily Key:", self.tavily_api_key_edit)
+            tools_layout.addRow("Tavily Key:", self.tavily_api_key_edit)
 
             self.amap_api_key_edit = self._make_secret_edit(config.get_amap_api_key(), "高德开放平台 Web服务 Key")
-            layout.addRow("高德 Key:", self.amap_api_key_edit)
+            tools_layout.addRow("高德 Key:", self.amap_api_key_edit)
 
             self.dsh_bridge_checkbox.toggled.connect(self._apply_dsh_bridge_state)
             self._apply_dsh_bridge_state(self.dsh_bridge_checkbox.isChecked())
@@ -4097,6 +4415,22 @@ class ConfigDialog(QDialog):
         if section == "voice":
             QTimer.singleShot(100, self.load_voices_async)
 
+    def _make_tab_page(self):
+        """建一个配置 Tab 页，返回 (页控件, 页内 QFormLayout)。
+
+        内容套在 QScrollArea 里：窗口被拖小时出现滚动条，而不是把控件裁掉。
+        否则中文 QLabel 在 wordWrap 下的 minimumSizeHint 等于整句宽度
+        （中文没有空格，Qt 找不到可断行的「单词」），会把窗口硬顶到 700px 以上。
+        """
+        page = QWidget()
+        page_layout = QFormLayout(page)
+        page_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        return scroll, page_layout
+
     def _make_secret_edit(self, value, placeholder):
         edit = QLineEdit(value)
         edit.setPlaceholderText(placeholder)
@@ -4157,12 +4491,171 @@ class ConfigDialog(QDialog):
         ):
             widget.setEnabled(not enabled)
             widget.setStyleSheet(disabled_style if enabled else "")
+        # DSH 专属项反过来：桥接开着才有意义，关闭时禁用并置暗（与本地模型栏对称）
+        for widget in (
+            self.dsh_provider_edit,
+            self.dsh_model_combo,
+            self.dsh_reasoning_combo,
+            self.dsh_probe_button,
+        ):
+            widget.setEnabled(enabled)
+            widget.setStyleSheet("" if enabled else disabled_style)
+        self.dsh_probe_status.setEnabled(True)
         self.dsh_bridge_checkbox.setText(
             "启用 DSH 桥接（交给本机 DSH 运行时）"
             if not enabled
             else "启用 DSH 桥接（已开启：由本机 DSH 运行时接管）"
         )
         self.dsh_bridge_hint.setVisible(enabled)
+
+    def _fill_dsh_reasoning_combo(self, current=""):
+        """填充 DSH 推理档位下拉框；current 不在预置档位里时原样保留（适配器可用自定义词汇）。"""
+        current = str(current or "").strip()
+        self.dsh_reasoning_combo.clear()
+        self.dsh_reasoning_combo.addItem("跟随 DSH / 模型默认", "")
+        for label, value in DSH_REASONING_CHOICES:
+            self.dsh_reasoning_combo.addItem(label, value)
+        index = self.dsh_reasoning_combo.findData(current)
+        if index < 0 and current:
+            self.dsh_reasoning_combo.addItem(current, current)
+            index = self.dsh_reasoning_combo.count() - 1
+        self.dsh_reasoning_combo.setCurrentIndex(max(0, index))
+
+    def _sync_dsh_provider_from_model(self, index):
+        """从下拉框选中的模型反填 provider，保证两栏一致。"""
+        value = self.dsh_model_combo.itemData(index)
+        if value:
+            provider, _ = parse_model_selection_value(value)
+            if provider:
+                self.dsh_provider_edit.setText(provider)
+
+    def _selected_dsh_model(self):
+        value = self.dsh_model_combo.currentData()
+        if value:
+            provider, model = parse_model_selection_value(value)
+            if model:
+                return provider or self.dsh_provider_edit.text().strip(), model
+        return self.dsh_provider_edit.text().strip(), self.dsh_model_combo.currentText().strip()
+
+    def _schedule_dsh_options_probe(self, *_args):
+        if not self.dsh_bridge_checkbox.isChecked():
+            return
+        if self._dsh_probe_thread is not None and self._dsh_probe_thread.isRunning():
+            self._dsh_probe_pending = True
+            return
+        self._dsh_probe_timer.start(450)
+
+    def _probe_dsh_options(self):
+        """后台探测 DSH 公布的模型 / 推理档位（临时起一个 ACP 连接，不发任何消息）。"""
+        if not self.dsh_bridge_checkbox.isChecked():
+            self.dsh_probe_status.setText("请先勾选「启用 DSH 桥接」，模型列表由 DSH 运行时提供。")
+            return
+        if self._dsh_probe_thread is not None and self._dsh_probe_thread.isRunning():
+            self._dsh_probe_pending = True
+            return
+        provider, model = self._selected_dsh_model()
+        self._dsh_probe_pending = False
+        self.dsh_probe_button.setEnabled(False)
+        self.dsh_probe_status.setText(
+            "正在连接本机 DSH 读取可用模型 / 推理档位（首次启动可能要十几秒）..."
+        )
+        # 不传父对象：见 _track_probe_thread 的说明，避免对话框关闭时连坐销毁运行中的线程。
+        thread = DshOptionsProbeThread(self.config, provider=provider, model=model)
+        thread.finished_ok.connect(self._on_dsh_options_probed)
+        thread.finished.connect(self._on_dsh_probe_thread_finished)
+        _track_probe_thread(thread)          # 先挂“释放保活引用”，保证它早于 deleteLater 执行
+        thread.finished.connect(thread.deleteLater)
+        self._dsh_probe_thread = thread
+        thread.start()
+
+    def _on_dsh_probe_thread_finished(self):
+        """线程真正结束后再清引用：这样连点「探测」也不会丢掉仍在运行的那一个。"""
+        thread = self.sender()
+        if self._dsh_probe_thread is thread:
+            self._dsh_probe_thread = None
+        if self._dsh_probe_pending and self.dsh_bridge_checkbox.isChecked():
+            self._dsh_probe_pending = False
+            self._dsh_probe_timer.start(0)
+
+    def _on_dsh_options_probed(self, options, error):
+        """探测结果回填：模型下拉按 provider 分组，推理档位用 DSH 公布的原始档位名。"""
+        self.dsh_probe_button.setEnabled(self.dsh_bridge_checkbox.isChecked())
+        # 回填会 clear()/addItem() 整个下拉；若用户此时正开着下拉弹窗，先收起，
+        # 避免在弹窗视图存活期间重建模型项。
+        self.dsh_model_combo.hidePopup()
+        requested_provider, requested_model = self._dsh_probe_thread.provider, self._dsh_probe_thread.model
+        if (requested_provider, requested_model) != self._selected_dsh_model():
+            self._dsh_probe_pending = True
+            return
+        if error:
+            self.dsh_probe_status.setText(f"探测失败：{error}")
+            return
+        options = list(options or [])
+        model_option = find_config_option(options, "", MODEL_OPTION_CATEGORY)
+        reasoning_option = find_config_option(options, "", REASONING_OPTION_CATEGORY)
+        if model_option is not None:
+            choices = config_option_choices(model_option)
+            current_provider, _ = parse_model_selection_value(model_option.get("currentValue"))
+            typed_model = self.dsh_model_combo.currentText().strip()
+            self.dsh_model_combo.blockSignals(True)
+            self.dsh_model_combo.clear()
+            self._dsh_model_values = {}
+            for item in choices:
+                _, item_model = parse_model_selection_value(item["value"])
+                if not item_model:
+                    continue
+                label = f"{item['group']} / {item['name']}" if item["group"] else item["name"]
+                self.dsh_model_combo.addItem(label, item["value"])
+                self._dsh_model_values[item_model] = item["value"]
+            index = self.dsh_model_combo.findData(str(model_option.get("currentValue") or ""))
+            if index < 0 and typed_model:
+                index = self.dsh_model_combo.findData(self._dsh_model_values.get(typed_model, ""))
+            self.dsh_model_combo.setCurrentIndex(max(0, index))
+            self.dsh_model_combo.blockSignals(False)
+            if current_provider:
+                self.dsh_provider_edit.setText(current_provider)
+        if reasoning_option is not None:
+            self.dsh_reasoning_combo.clear()
+            self.dsh_reasoning_combo.addItem("跟随 DSH / 模型默认", "")
+            for item in config_option_choices(reasoning_option):
+                label = item["name"]
+                if item["description"]:
+                    label = f"{item['name']}（{item['description']}）"
+                self.dsh_reasoning_combo.addItem(label, item["value"])
+            index = self.dsh_reasoning_combo.findData(
+                str(reasoning_option.get("currentValue") or "")
+            )
+            self.dsh_reasoning_combo.setCurrentIndex(max(0, index))
+            self.dsh_probe_status.setText(
+                f"已读取 DSH：{len(self._dsh_model_values)} 个模型、"
+                f"{len(config_option_choices(reasoning_option))} 档推理。选好后点「确定」保存。"
+            )
+        else:
+            self._fill_dsh_reasoning_combo("")
+            self.dsh_probe_status.setText(
+                f"已读取 DSH：{len(self._dsh_model_values)} 个模型。当前模型没有声明 "
+                "reasoningEfforts，DSH 不提供推理档位（可在 DSH 的 settings.yaml 里给该模型补上）。"
+            )
+
+    def _on_permission_mode_changed(self, index):
+        """权限模式提示随选择变色：完全权限用红色警告，只读用蓝色说明。"""
+        value = str(self.permission_combo.itemData(index) or DEFAULT_PERMISSION_MODE)
+        self.permission_hint.setText(PERMISSION_MODE_DESCRIPTIONS.get(value, ""))
+        if value == FULL_ACCESS_MODE:
+            self.permission_hint.setStyleSheet(
+                "color: #ff7b7b; font-weight: bold; background-color: #3a1d1d;"
+                " border: 1px solid #d94848; border-radius: 6px; padding: 6px 8px;"
+            )
+        elif value == READ_ONLY_MODE:
+            self.permission_hint.setStyleSheet(
+                "color: #7fb2ff; background-color: #1b2735;"
+                " border: 1px solid #3d6ea8; border-radius: 6px; padding: 6px 8px;"
+            )
+        else:
+            self.permission_hint.setStyleSheet(
+                "color: #9aa0a6; background-color: #23262a;"
+                " border: 1px solid #34383d; border-radius: 6px; padding: 6px 8px;"
+            )
 
     def accept(self):
         if self.section == "config":
@@ -4175,6 +4668,8 @@ class ConfigDialog(QDialog):
             self._save_secret_override("tavily_api_key", self.tavily_api_key_edit)
             self._save_secret_override("amap_api_key", self.amap_api_key_edit)
             self.config.set_dsh_bridge_enabled(self.dsh_bridge_checkbox.isChecked())
+            self.config.set_permission_mode(self.permission_combo.currentData())
+            self._save_dsh_selection()
         elif self.section == "prompt":
             current_prompt = self.system_prompt_edit.toPlainText()
             if self._prompt_reset_requested:
@@ -4188,6 +4683,23 @@ class ConfigDialog(QDialog):
             self.config.set_tts_enabled(self.tts_checkbox.isChecked())
             self.config.set_tts_voice(self.voice_combo.currentData())
         super().accept()
+
+    def _save_dsh_selection(self):
+        """保存 DSH 的 provider / 模型 / 推理档位。
+
+        模型下拉的 data 是探测得来的 ACP ["provider","model"] JSON 串；手填时退回
+        「Provider 输入框 + 下拉框文本」的组合。
+        """
+        model_value = self.dsh_model_combo.currentData()
+        if model_value is None:
+            model_value = self.dsh_model_combo.currentText().strip()
+        provider, model = parse_model_selection_value(model_value)
+        if not provider:
+            provider = self.dsh_provider_edit.text().strip()
+            model = self.dsh_model_combo.currentText().strip() or model
+        self.config.set_dsh_provider(provider)
+        self.config.set_dsh_model(model)
+        self.config.set_dsh_reasoning_effort(str(self.dsh_reasoning_combo.currentData() or ""))
 
     def _save_secret_override(self, key, edit):
         value = edit.text().strip()
@@ -4659,10 +5171,14 @@ class ChatMessageWidget(QWidget):
             if len(text) > 80:
                 suggested_width = max(suggested_width, int(max_width * 0.82))
             return max(self.MIN_BUBBLE_WIDTH, min(int(suggested_width), max_width))
-        metrics = QFontMetrics(self.message_text.font())
-        lines = text.splitlines() or [""]
-        longest_line_width = max(metrics.horizontalAdvance(line) for line in lines) if lines else 0
-        suggested_width = longest_line_width + self.BUBBLE_HORIZONTAL_PADDING
+        # 纯文本同样交给文档布局引擎测量自然宽度（与 markdown 分支同源），
+        # 取代贴边的 QFontMetrics.horizontalAdvance，从而带上 Qt 自带的防折行余量。
+        doc = self.message_text.document()
+        previous_text_width = doc.textWidth()
+        doc.setTextWidth(-1)
+        document_width = math.ceil(doc.idealWidth())
+        doc.setTextWidth(previous_text_width)
+        suggested_width = document_width + self.BUBBLE_HORIZONTAL_PADDING
         if len(text) > 80:
             suggested_width = max(suggested_width, int(max_width * 0.82))
         return max(self.MIN_BUBBLE_WIDTH, min(int(suggested_width), max_width))
@@ -8774,15 +9290,35 @@ class MainWindow(QMainWindow):
     def _get_default_system_prompt(self):
         return self._generate_dynamic_system_prompt() + "\n\n" + SYSTEM_SAFETY_RULES
 
+    def _get_permission_mode_notice(self):
+        """权限模式会改变模型实际能做的事，必须随系统提示词一起下发，免得它按旧规则反复试探。"""
+        mode = self.config.get_permission_mode()
+        if mode == FULL_ACCESS_MODE:
+            return FULL_ACCESS_PROMPT_NOTICE
+        if mode == READ_ONLY_MODE:
+            return READ_ONLY_PROMPT_NOTICE
+        return ""
+
     def _get_effective_system_prompt(self):
         mode = self.config.get_system_prompt_mode()
         if mode == "none":
             return ""
         if mode == "custom":
-            return self.config.get_custom_system_prompt()
-        return self._get_default_system_prompt()
+            prompt = self.config.get_custom_system_prompt()
+        else:
+            prompt = self._get_default_system_prompt()
+        notice = self._get_permission_mode_notice()
+        if not notice:
+            return prompt
+        if not str(prompt or "").strip():
+            return notice
+        if notice in prompt:
+            return prompt
+        return prompt.rstrip() + "\n\n" + notice
 
     def refresh_action_handler_config(self):
+        # 权限模式先落到工具层沙箱，让内置工具与配置保持一致
+        ActionHandler.set_sandbox_mode(self.config.get_permission_mode())
         ActionHandler.configure(
             searxng_url=self.config.get_searxng_url(),
             tavily_api_key=self.config.get_tavily_api_key(),
@@ -8947,6 +9483,18 @@ class MainWindow(QMainWindow):
         self.mode_button.setMenu(mode_menu)
         toolbar.addWidget(self.mode_button)
 
+        # 权限模式快捷切换：对齐 DSH 网页端，权限选择器就放在输入框旁边（常驻可点）
+        self.permission_button = QToolButton()
+        self.permission_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.permission_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        permission_quick_menu = QMenu(self.permission_button)
+        self.permission_quick_actions, self.permission_quick_group = self._build_permission_actions(
+            permission_quick_menu
+        )
+        permission_quick_menu.aboutToShow.connect(self._sync_permission_action_enabled)
+        self.permission_button.setMenu(permission_quick_menu)
+        toolbar.addWidget(self.permission_button)
+
         self.mic_btn = QToolButton()
         self.mic_btn.setText("🎙")
         self.mic_btn.setToolTip("语音输入")
@@ -8990,6 +9538,8 @@ class MainWindow(QMainWindow):
         composer_layout.addLayout(toolbar)
         left_layout.addWidget(self.composer)
         self._update_model_indicator()
+        self._refresh_permission_mode_actions()
+        self._update_permission_button()
         self._update_mode_button()
         self._resize_composer_input()
 
@@ -9216,6 +9766,7 @@ class MainWindow(QMainWindow):
         pet_menu.addAction("打开模型目录").triggered.connect(self.open_model_directory)
 
         settings_menu = menubar.addMenu("设置")
+
         model_menu = settings_menu.addMenu("模型与接口")
         model_menu.addAction("模型与 API").triggered.connect(self.show_config_dialog)
         model_menu.addAction("提示词").triggered.connect(self.show_prompt_dialog)
@@ -9893,24 +10444,46 @@ class MainWindow(QMainWindow):
         self.chat_stream_filter.reset()
         self._restore_input_controls()
 
+    def _current_session_has_user_messages(self):
+        """当前会话是否已有用户消息：决定「新对话」能否复用 session_id。"""
+        try:
+            return bool(self.db.session_has_user_messages(self.current_session_id))
+        except Exception:
+            return True   # 查不到就当作已有内容，宁可新建也不冒合并的风险
+
+    def _new_session_id(self):
+        return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
     def _show_temporary_session(self, status_message=""):
-        """显示未持久化的新会话，直到用户发送消息才创建数据库记录。"""
-        self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.session_is_persisted = False
+        """显示未持久化的新会话，直到用户发送消息才创建数据库记录。
+
+        只有「从没落库、也没有用户消息」的空会话才复用同一个 session_id：
+        每次点「新对话」都换 id，会让同一段内容留下多条近似重复的会话记录；
+        而已经落库的会话绝不能复用，否则欢迎语会一轮轮追加进同一条会话，
+        标题/摘要会堆成一串重复的问候。
+        """
+        reuse = (not self.session_is_persisted) and not self._current_session_has_user_messages()
+        if not reuse:
+            self.current_session_id = self._new_session_id()
+            self.session_is_persisted = False
         self._set_session_task_state(None, session_id=self.current_session_id)
         self.chat_list.clear()
         self.load_system_prompt()
-        self.add_message(
-            "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)",
-            is_user=False,
-            store=False,
-        )
+        self._show_welcome_message()
         self.refresh_session_list()
         if status_message:
             self.status_bar.showMessage(status_message, 3000)
         self._set_kaomoji_display(
             text="(｡•ᴗ•｡)",
             style="font-weight: bold; background-color: #f5f5f5; padding: 5px; font-size: 18px; color: #333333;",
+        )
+
+    def _show_welcome_message(self):
+        """欢迎语只在界面上显示：store=False 时不应写进数据库。"""
+        self.add_message(
+            "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)",
+            is_user=False,
+            store=False,
         )
 
     def _create_task_placeholder(self, task_state=None):
@@ -10528,6 +11101,44 @@ class MainWindow(QMainWindow):
         self.attach_clear_btn.show()
         self._resize_composer_input()
 
+    @staticmethod
+    def _looks_like_welcome_echo(text):
+        """判断一段输入是否只是欢迎语本身的重复粘贴。
+
+        欢迎语气泡里的文字可以选中复制，误操作会把「你好呀！…」重复贴上很多遍再发送，
+        在会话里留下一条没有信息量的巨长用户消息（并污染标题与摘要）。
+        """
+        body = str(text or "").strip()
+        if len(body) < 40:
+            return False
+        unit = "你好呀！我是你的桌面 AI 助手，有什么想做的吗？(｡•ᴗ•｡)"
+        stripped = body.replace(unit, "").strip()
+        if not stripped:
+            return True
+        # 去掉所有欢迎语后，若剩下的只是标点/空白，同样视为重复粘贴
+        return not stripped.strip(" \t\r\n，。！？、；：,.!?;:~～…—-_*#`\"'()（）[]【】")
+
+    def _adopt_existing_session_for(self, first_user_message):
+        """当前是空会话、而库里已存在首条消息相同的历史会话时，接管那条会话。
+
+        否则同一个开头被重复发送一次就会多出一条标题相同、只有摘要长度不同的
+        重复会话——正是会话栏里出现两条近似记录的原因。
+        """
+        if self.session_is_persisted:
+            return
+        if self._current_session_has_user_messages():
+            return
+        try:
+            existing = self.db.find_session_by_first_user_message(first_user_message)
+        except Exception:
+            return
+        if not existing or existing == self.current_session_id:
+            return
+        self.current_session_id = existing
+        self.session_is_persisted = True
+        # 空会话上刚建的任务状态搬到接管过来的 session_id 下，避免它随着旧 id 一起悬空
+        self._set_session_task_state(self.current_task_state, session_id=existing)
+
     def _clear_attachments(self):
         self._pending_attachments = []
         self._pending_image_attachments = []
@@ -10572,7 +11183,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少配置", "请先在 设置->API配置 中设置API Key")
             return
 
+        if not attachments and not image_attachments and self._looks_like_welcome_echo(user_msg):
+            # 欢迎语气泡是可选中文本；误选/误发时不应把它当成一次真实提问存进会话
+            self.input_text.clear()
+            self._restore_input_controls()
+            self.status_bar.showMessage("这看起来是欢迎语的重复内容，已忽略", 4000)
+            return
+
         self._set_session_task_state(task_state)
+        self._adopt_existing_session_for(full_msg)
         self.add_message(full_msg, is_user=True)
         api_messages = self.conversation_history.copy()
         if image_attachments and api_messages:
@@ -10968,6 +11587,28 @@ class MainWindow(QMainWindow):
         self.model_indicator.setText(label)
         self.model_indicator.setToolTip(f"当前模型：{model}\n点击打开配置")
 
+    def _update_permission_button(self):
+        """输入框旁的权限模式快捷按钮：常驻显示当前预设，并随档位变色。"""
+        if not hasattr(self, "permission_button"):
+            return
+        mode = self.config.get_permission_mode()
+        if mode == FULL_ACCESS_MODE:
+            self.permission_button.setText("⚠ 完全权限")
+            self.permission_button.setStyleSheet("color: #ff7b7b; font-weight: bold;")
+            tip = (
+                "完全权限模式（danger-full-access）：所有工具调用都不再弹确认框，"
+                "沙箱不再限制工作区外的读写范围；破坏性命令黑名单与受保护写入路径仍然拦截。"
+            )
+        elif mode == READ_ONLY_MODE:
+            self.permission_button.setText("权限：只读")
+            self.permission_button.setStyleSheet("color: #7fb2ff;")
+            tip = "只读模式（read-only）：写文件、执行命令、关机重启和键鼠操作会被直接拒绝。"
+        else:
+            self.permission_button.setText("权限：默认")
+            self.permission_button.setStyleSheet("")
+            tip = "工作区可写（默认）：执行命令、写文件、关机重启等高风险操作会逐次弹窗确认。"
+        self.permission_button.setToolTip(tip + "\n点击选择其它权限模式。")
+
     def _resize_composer_input(self):
         if not hasattr(self, "input_text"):
             return
@@ -11008,6 +11649,124 @@ class MainWindow(QMainWindow):
         self.default_mode_action.setChecked(not roleplay)
         self.roleplay_mode_action.setChecked(roleplay)
 
+    def set_permission_mode(self, mode, announce=True):
+        """切换权限模式（沙箱 + 审批），并让工具层、系统提示词、DSH 桥接同步生效。
+
+        任务进行中只允许「收紧」，不允许「提权」：桥接的沙箱与审批是子进程启动时的环境变量，
+        提权在子进程重启前不会真正生效，否则会出现「界面已提到完全权限、实际还在工作区可写」的假象。
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in PERMISSION_MODE_VALUES:
+            mode = DEFAULT_PERMISSION_MODE
+        current = self.config.get_permission_mode()
+        if self._permission_change_blocked(mode):
+            logging.info("任务进行中，拒绝切换到 %s（当前 %s）", mode, current)
+            if announce:
+                self.status_bar.showMessage(PERMISSION_MODE_BUSY_MESSAGE, 5000)
+            return False
+        changed = mode != current
+        tightened = PERMISSION_MODE_RANK[mode] < PERMISSION_MODE_RANK[current]
+        self.config.set_permission_mode(mode)
+        self.refresh_action_handler_config()
+        # DSH 子进程靠环境变量 DSH_PERMISSION_MODE 决定沙箱与审批策略，改模式后标记重启，下一次提问生效
+        connection = current_connection()
+        if connection is not None:
+            try:
+                connection.set_permission_mode(mode)
+            except Exception:
+                logging.warning("切换 DSH 权限模式失败", exc_info=True)
+        # 桥接收紧必须立刻掐掉在跑的旧子进程：approval=never 的进程根本不会发授权请求，
+        # 只靠客户端侧判断拦不住，本轮会在「界面已收紧」的假象下继续按旧档执行。
+        interrupted = False
+        if changed and tightened and connection is not None and self._is_turn_running():
+            logging.info("权限收紧：中断当前桥接回合并结束旧的 dsh 子进程")
+            self._stop_generation()
+            try:
+                connection.close()
+            except Exception:
+                logging.warning("结束 DSH 子进程失败", exc_info=True)
+            interrupted = True
+        if changed:
+            self.runtime_system_prompt = self._get_effective_system_prompt()
+            if self.conversation_history and self.conversation_history[0].get("role") == "system":
+                if self.runtime_system_prompt.strip():
+                    self.conversation_history[0]["content"] = self.runtime_system_prompt
+                else:
+                    self.conversation_history.pop(0)
+            elif self.runtime_system_prompt.strip():
+                self.conversation_history.insert(
+                    0,
+                    {"role": "system", "content": self.runtime_system_prompt},
+                )
+        self._refresh_permission_mode_actions()
+        self._update_permission_button()
+        if not announce:
+            return True
+        if mode == FULL_ACCESS_MODE:
+            self.status_bar.showMessage(
+                "⚠ 已开启完全权限模式：所有工具调用不再弹确认框，请谨慎下达指令", 8000
+            )
+        elif mode == READ_ONLY_MODE:
+            self.status_bar.showMessage("已切换到只读模式：写入与命令会被沙箱拒绝", 4000)
+        else:
+            self.status_bar.showMessage("已切换到工作区可写模式（默认）", 3000)
+        if interrupted:
+            self.status_bar.showMessage("权限已收紧，当前任务已中断（新档位从下一次提问生效）", 5000)
+        return True
+
+    def _is_turn_running(self):
+        """是否有回合正在跑：本地 APICallThread 与桥接 DSHSessionThread 都登记在 session_threads 里。"""
+        for thread in list(self.session_threads.values()):
+            try:
+                if thread is not None and thread.isRunning():
+                    return True
+            except RuntimeError:  # 底层 C++ 对象已释放
+                continue
+        return False
+
+    def _permission_change_blocked(self, mode):
+        """任务进行中禁止提权；收紧（含完全权限 → 工作区可写、只读 ← 工作区可写）随时允许。"""
+        if not self._is_turn_running():
+            return False
+        target = PERMISSION_MODE_RANK.get(mode, 1)
+        current = PERMISSION_MODE_RANK.get(self.config.get_permission_mode(), 1)
+        return target > current
+
+    def _sync_permission_action_enabled(self):
+        """菜单弹出时按当前状态置灰不可选的档位：进行中只留得住「收紧」。"""
+        for attr in ("permission_mode_actions", "permission_quick_actions"):
+            actions = getattr(self, attr, None)
+            if not actions:
+                continue
+            for value, action in actions.items():
+                action.setEnabled(not self._permission_change_blocked(value))
+
+    def _build_permission_actions(self, menu):
+        """按权限预设表给一个菜单建一组互斥动作，返回 ({value: QAction}, QActionGroup)。"""
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        actions = {}
+        for label, value, description in PERMISSION_MODE_CHOICES:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setActionGroup(group)
+            action.setToolTip(description)
+            action.triggered.connect(
+                lambda checked=False, mode=value: self.set_permission_mode(mode)
+            )
+            actions[value] = action
+        return actions, group
+
+    def _refresh_permission_mode_actions(self):
+        """输入框快捷菜单的勾选状态跟随当前权限配置。"""
+        current = self.config.get_permission_mode()
+        for attr in ("permission_mode_actions", "permission_quick_actions"):
+            actions = getattr(self, attr, None)
+            if not actions:
+                continue
+            for value, action in actions.items():
+                action.setChecked(value == current)
+
     def _set_quick_mode(self, roleplay):
         self.config.set_roleplay_mode(bool(roleplay))
         self.runtime_system_prompt = self._get_effective_system_prompt()
@@ -11036,14 +11795,44 @@ class MainWindow(QMainWindow):
         )
 
     def show_config_dialog(self):
+        before_mode = self.config.get_permission_mode()
         dialog = ConfigDialog(self.config, self, section="config")
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 对话框是直接写 ConfigManager 的：先回滚到旧档，再走统一入口，规则与快捷切换保持一致
+            requested_mode = self.config.get_permission_mode()
+            if requested_mode != before_mode:
+                self.config.set_permission_mode(before_mode)
+                if not self.set_permission_mode(requested_mode, announce=False):
+                    self.status_bar.showMessage(PERMISSION_MODE_BUSY_MESSAGE, 5000)
             self.refresh_action_handler_config()
             self.runtime_system_prompt = self._get_effective_system_prompt()
             self.load_system_prompt()
             self._update_model_indicator()
-            # 桥接配置可能变化：没有会话在跑时重建连接，让新的 provider / 模型生效。
-            if self.config.get_dsh_bridge_enabled() and not self.session_threads:
+            self._refresh_permission_mode_actions()
+            self._update_permission_button()
+            # 权限模式可能变化：推给共享的 DSH 连接（有会话在跑时不打断，下次提问生效）
+            connection = current_connection()
+            if connection is not None:
+                try:
+                    connection.set_permission_mode(self.config.get_permission_mode())
+                    # 模型 / 推理档位同理：空闲时立刻补写到活着的 ACP 会话，
+                    # 有回合在跑就只记下来，等下一次提问复用会话时生效。
+                    changed = connection.set_model_selection(
+                        self.config.get_dsh_provider(),
+                        self.config.get_dsh_model(),
+                        self.config.get_dsh_reasoning_effort(),
+                    )
+                    if changed and not self._is_turn_running():
+                        connection.sync_model_selection()
+                except Exception:
+                    logging.warning("同步 DSH 权限/模型设置失败", exc_info=True)
+            # 路由覆盖（--patch overlay）是 dsh 的启动参数：没有会话在跑时重建连接，
+            # 让新的 provider / 模型下次提问生效。
+            if (
+                self.config.get_dsh_bridge_enabled()
+                and not self._is_turn_running()
+                and not self.session_threads
+            ):
                 reset_connection()
             self.reasoning_quick_combo.setCurrentIndex(
                 max(0, self.reasoning_quick_combo.findData(self.config.get_reasoning_effort()))
@@ -11396,7 +12185,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "关于AI助手",
-                          "Aissistant v1.102.6-test (PyQt6版本)\n"
+                          f"Aissistant v{APP_VERSION}-test (PyQt6版本)\n"
                           "功能：多会话聊天、图片/文件附件、视觉键鼠、UI Automation、Live2D、语音输入与回复\n"
                           "技术栈：Python + PyQt6 + OpenAI兼容API + Live2D + edge-tts")
 
