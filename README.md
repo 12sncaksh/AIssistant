@@ -266,7 +266,7 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 ## 打包免安装版
 
 在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v<版本>_test_portable.zip`
-（当前为 `Aissistant_v1.102.7_test_portable.zip`）。版本号取自 `src/version.py` 的
+（当前为 `Aissistant_v1.102.8_test_portable.zip`）。版本号取自 `src/version.py` 的
 `__version__`，和「关于」窗口显示的是同一个值，升级只改一处。
 
 - 脚本先检查 `generated\kws\` 与 `assets\web_resources\dist\pet.html`：缺了会打印下载与放置说明并中止
