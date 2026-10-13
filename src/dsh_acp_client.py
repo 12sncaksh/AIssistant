@@ -10,10 +10,12 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -21,15 +23,37 @@ import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from dsh_acp_permission_patch import ensure_permission_api
+import thread_registry
+
 PROTOCOL_VERSION = 1
 DEFAULT_COMMAND = "dsh"
 DEFAULT_PROFILE = "acp"
 PROMPT_TIMEOUT_SECONDS = 1800
 PERMISSION_TIMEOUT_SECONDS = 300
-# 权限模式：与 DSH 内置权限预设表一致，通过 DSH_PERMISSION_MODE 环境变量传给 dsh 子进程。
-# dsh-base 的 cordis.patch.yml 用它同时决定沙箱与审批策略：
-#   read-only / workspace-write → sandbox 对应模式，审批 ask（会经 ACP 请求本客户端授权）
-#   danger-full-access          → sandbox 不再限制，审批 never（完全权限模式，不弹确认框）
+CONTEXT_OVERFLOW_MARKERS = (
+    "context overflow",
+    "context length exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "too many tokens",
+)
+# 「会话已不存在」的 DSH 错误标记。故意收窄：像 "invalid session" 这种子串会
+# 误伤 "invalid session configuration" 之类的普通错误，触发无谓的 reset+retry。
+INVALID_SESSION_MARKERS = (
+    "session not found",
+    "session does not exist",
+    "session no longer exists",
+    "no such session",
+    "unknown session",
+    "session expired",
+)
+# DSH 的 sessionId 是 UUID；据此把「本地会话键」和「DSH sessionId」区分开。
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# 权限模式：环境变量设定 DSH 的新会话默认值；已有会话由自定义 ACP 请求同步并校验。
+# dsh-base 用 DSH_PERMISSION_MODE 配置默认沙箱与审批策略；会话级请求直接追加权限预设事件。
 DSH_PERMISSION_MODES = ("read-only", "workspace-write", "danger-full-access")
 DEFAULT_PERMISSION_MODE = "workspace-write"
 FULL_ACCESS_MODE = "danger-full-access"
@@ -150,6 +174,18 @@ class DshAcpError(RuntimeError):
     """桥接层自身的失败：进程启动、协议错误或超时。"""
 
 
+def is_context_overflow_error(error):
+    """Return True only for provider/DSH context-size failures."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+def is_invalid_session_error(error):
+    """Return True only when DSH reports the session itself no longer exists."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in INVALID_SESSION_MARKERS)
+
+
 def _data_url_to_image_block(url):
     """把 data:image/...;base64,xxx 转成 ACP 的 image 内容块。"""
     if not isinstance(url, str) or not url.startswith("data:") or "," not in url:
@@ -248,6 +284,67 @@ def parse_model_selection_value(value):
     return "", text
 
 
+def valid_dsh_providers(options):
+    """从一份 configOptions 里取出 DSH 当前可用的 provider 集合。
+
+    DSH 的 model 选项是按 provider 分组的两层列表，每个候选值都是
+    ["provider","model"] 的 JSON；把 provider 拍平成集合，用来校验路由覆盖。
+    """
+    option = find_config_option(options or [], "", MODEL_OPTION_CATEGORY)
+    providers = set()
+    for choice in config_option_choices(option):
+        provider, _ = parse_model_selection_value(choice.get("value"))
+        if provider:
+            providers.add(provider)
+    return providers
+
+
+def known_dsh_providers(config):
+    """读「上次探测确认可用」的 provider 集合；没有记录时返回空集合（表示未知）。"""
+    getter = getattr(config, "get_dsh_known_providers", None) if config is not None else None
+    if not callable(getter):
+        return set()
+    try:
+        return {str(item).strip() for item in (getter() or []) if str(item).strip()}
+    except Exception:
+        return set()
+
+
+def rejected_dsh_providers(config):
+    """读「实测判定失效」的 provider 集合。
+
+    单独存一份的原因：`set_dsh_provider("")` 会被 config.json 的文件回退盖回来，
+    光清配置项挡不住旧值，必须有一份显式的拒绝名单。
+    """
+    getter = getattr(config, "get_dsh_rejected_providers", None) if config is not None else None
+    if not callable(getter):
+        return set()
+    try:
+        return {str(item).strip() for item in (getter() or []) if str(item).strip()}
+    except Exception:
+        return set()
+
+
+def remember_known_dsh_providers(config, options):
+    """把这次探测确认可用的 provider 记下来，供 sync_launch_overlay 校验路由。
+
+    这样 config.json 里残留一个失效 provider 时，下一次启动就不会再拿它去写
+    overlay 把桥接打死，而是直接跟随 DSH 自己的路由。
+    """
+    if config is None:
+        return
+    setter = getattr(config, "set_dsh_known_providers", None)
+    if not callable(setter):
+        return
+    providers = valid_dsh_providers(options)
+    if not providers:
+        return
+    try:
+        setter(providers)
+    except Exception:
+        logging.warning("记录 DSH 可用 provider 失败", exc_info=True)
+
+
 def build_prompt_blocks(content, fallback_text=""):
     """把 Aissistant 的消息内容转成 ACP 的 prompt 内容块。"""
     if isinstance(content, list):
@@ -279,6 +376,20 @@ def sync_launch_overlay(config, root=None):
     provider = str(getattr(config, "get_dsh_provider", lambda: "")() or "").strip() if config is not None else ""
     model = str(getattr(config, "get_dsh_model", lambda: "")() or "").strip() if config is not None else ""
     if not provider:
+        return ""
+    # DSH 的 provider / 模型会经常变：配置里残留的旧值一旦写进 overlay，DSH 会直接
+    # 回 Internal error 把桥接打死。所以只有确认它在上次探测到的可用集合里才写，
+    # 否则干脆不写，让 DSH 用它自己的 profile 路由。
+    known = known_dsh_providers(config)
+    rejected = rejected_dsh_providers(config)
+    # 明确出现在可用集合里的 provider 一律放行（哪怕曾被判失效，DSH 后来又加回来了）；
+    # 否则：只要探测过（known 非空）或它已被实测判失效，就不写 overlay，改为跟随 DSH。
+    if provider not in known and (known or provider in rejected):
+        logging.warning(
+            "DSH provider %s 不可用（可用：%s），跳过路由覆盖，改为跟随 DSH",
+            provider,
+            ", ".join(sorted(known)) or "未知",
+        )
         return ""
     lines = [
         "# Generated by Aissistant: override the ACP route.",
@@ -355,7 +466,10 @@ class DshAcpConnection:
     """持有一个 `dsh --profile acp` 子进程与其 JSON-RPC 管道（进程内单例）。"""
 
     def __init__(self, command=DEFAULT_COMMAND, profile=DEFAULT_PROFILE, cwd=None, overlay_path="",
-                 permission_mode=DEFAULT_PERMISSION_MODE, provider="", model="", reasoning=""):
+                 permission_mode=DEFAULT_PERMISSION_MODE, provider="", model="", reasoning="",
+                 config=None):
+        # 配置对象只用于「路由自愈」：provider 失效时清掉配置项、成功后回写实际路由。
+        self.config = config
         self.command = command or DEFAULT_COMMAND
         self.profile = profile or DEFAULT_PROFILE
         self.cwd = cwd or default_workspace()
@@ -363,6 +477,7 @@ class DshAcpConnection:
         self.permission_mode = (
             permission_mode if permission_mode in DSH_PERMISSION_MODES else DEFAULT_PERMISSION_MODE
         )
+        self._process_permission_mode = None
         # 期望的模型 / 推理档位：会话建立或复用时按 DSH 公布的可选项落到 ACP 会话上
         self.desired_provider = str(provider or "").strip()
         self.desired_model = str(model or "").strip()
@@ -383,6 +498,9 @@ class DshAcpConnection:
         self._config_options = {}
         # 每个会话最后一次已处理的 (provider, model, reasoning)，避免复用会话时反复下发 / 反复提示
         self._applied_selection = {}
+        # 每个 DSH sessionId 最近一次已注入的角色设定文本：ACP 的 session/new 不接受
+        # 系统提示词，只能在 prompt blocks 里补给，这里按会话记账避免每轮重复注入。
+        self._session_role_prompt = {}
         self._store = SessionMapStore(default_session_map_path())
         self._stderr_tail = []
         self.update_handler = None
@@ -393,6 +511,11 @@ class DshAcpConnection:
 
     def _spawn(self):
         argv = [self.command, "--profile", self.profile]
+        try:
+            patched_module = ensure_permission_api()
+            logging.info("DSH ACP 会话权限接口可用：%s", patched_module)
+        except Exception as exc:
+            raise DshAcpError(f"无法启用 DSH 会话权限接口：{exc}") from exc
         if self.overlay_path:
             argv += ["--patch", self.overlay_path]
         if os.name == "nt":
@@ -412,11 +535,15 @@ class DshAcpConnection:
                 bufsize=1,
                 cwd=self.cwd,
                 env=env,
+                # 明确不弹控制台窗口（在全局补丁之外再写一次，让意图在调用点可见）
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError as exc:
             raise DshAcpError(f"无法启动 DSH（{self.command}）：{exc}") from exc
-        threading.Thread(target=self._pump_stdout, daemon=True).start()
-        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        self._process_permission_mode = self.permission_mode
+        # 管道泵随连接存活，数量由连接数封顶，因此不设并发上限，只登记保活
+        thread_registry.spawn(self._pump_stdout, name="DSH-stdout", group="dsh_pump")
+        thread_registry.spawn(self._pump_stderr, name="DSH-stderr", group="dsh_pump")
 
     def _notify_status(self, text, session_id=None):
         """状态提示按会话分流，避免后台会话占住当前状态栏。"""
@@ -490,9 +617,16 @@ class DshAcpConnection:
                 self._notify_update(message.get("params") or {})
             return
         if "method" in message:
-            threading.Thread(
-                target=self._answer_reverse_request, args=(message,), daemon=True
-            ).start()
+            # 每个反向请求起一个线程：走注册表以设上限，突发请求不会无限堆积
+            try:
+                thread_registry.spawn(
+                    self._answer_reverse_request,
+                    name="DSH-reverse",
+                    group="dsh_reverse",
+                    args=(message,),
+                )
+            except thread_registry.ConcurrencyLimit as exc:
+                logging.warning("已忽略一个反向请求：%s", exc)
             return
         waiter = self._pending.pop(message.get("id"), None)
         if waiter is not None:
@@ -596,6 +730,7 @@ class DshAcpConnection:
             self._session_origin = {}
             self._config_options = {}
             self._applied_selection = {}
+            self._session_role_prompt = {}
             with self._handler_lock:
                 self._session_handlers = {}
             self._spawn()
@@ -627,6 +762,7 @@ class DshAcpConnection:
         cached = self._sessions.get(key)
         if cached:
             self._session_origin[key] = "reused"
+            self.apply_permission_preset(cached)
             # 配置可能在会话存活期间改过：复用前把模型 / 推理档位对齐一次
             self.apply_model_selection(cached)
             return cached
@@ -636,26 +772,160 @@ class DshAcpConnection:
             self._sessions[key] = persisted
             self._session_origin[key] = "resumed"
             self._notify_status("已恢复上次的 DSH 会话上下文")
+            self.apply_permission_preset(persisted)
             self.apply_model_selection(persisted)
             return persisted
         if persisted:
             self._store.pop(key)
             self._notify_status("上次的 DSH 会话已不可恢复，将新建会话")
 
-        result = self.request(
-            "session/new",
-            {"cwd": self.cwd, "mcpServers": build_acp_mcp_servers()},
-            timeout=180,
-        )
-        session_id = result.get("sessionId")
-        if not session_id:
-            raise DshAcpError("DSH 未返回 sessionId，无法建立会话")
-        self._remember_config_options(session_id, result)
+        session_id, _result = self.create_session()
         self._sessions[key] = session_id
         self._session_origin[key] = "created"
         self._store.set(key, session_id)
+        self.apply_permission_preset(session_id)
         self.apply_model_selection(session_id)
         return session_id
+
+    def create_session(self, mcp_servers=None, timeout=180):
+        """新建一个 DSH 会话，返回 (sessionId, 原始响应)。
+
+        路由覆盖（``--patch overlay``）是这里唯一可能把 DSH 打死的东西：config 里的
+        provider 失效时 DSH 直接回 Internal error。此时分两级自愈：
+
+        1. 丢掉覆盖、把该 provider 记进拒绝名单，用「跟随 DSH」的新进程重试；
+        2. 成功后再看 DSH 公布的 provider × model 矩阵，按同名 model 把用户真正想要的
+           provider 修回来，带 overlay 重建一次，最后回写实际生效的路由。
+
+        两级都失败就如实抛错，不做无上限重试。
+        """
+        params = {
+            "cwd": self.cwd,
+            "mcpServers": build_acp_mcp_servers() if mcp_servers is None else list(mcp_servers),
+        }
+        try:
+            result = self.request("session/new", params, timeout=timeout)
+        except DshAcpError:
+            if not self._drop_route_override():
+                raise
+            self.ensure_initialized()
+            result = self.request("session/new", params, timeout=timeout)
+            # 已经用「跟随 DSH」建起来了：DSH 这时会公布完整的 provider × model
+            # 矩阵，据此把用户真正想要的 provider 修回来，再带 overlay 建一次。
+            if self._repair_route_from_options(result):
+                self.ensure_initialized()
+                result = self.request("session/new", params, timeout=timeout)
+                self._remember_actual_route(result)
+        session_id = str((result or {}).get("sessionId") or "")
+        if not session_id:
+            raise DshAcpError("DSH 未返回 sessionId，无法建立会话")
+        self._remember_config_options(session_id, result)
+        remember_known_dsh_providers(self.config, self.session_config_options(session_id))
+        return session_id, result
+
+    def _drop_route_override(self):
+        """丢掉失效的路由覆盖，退回 DSH 自己的 profile 路由。
+
+        只对「配置了 --patch overlay」的会话生效；返回 True 表示调用方可以重试。
+        """
+        with self._state_lock:
+            if not self.overlay_path:
+                return False
+            self.overlay_path = ""
+            self._needs_restart = True
+        self._forget_configured_route()
+        logging.warning("DSH 路由覆盖不可用，已退回 DSH 自身路由重试")
+        self._notify_status("DSH 配置里的 provider 不可用，正在自动修正路由")
+        return True
+
+    def _repair_route_from_options(self, result):
+        """用 DSH 自己公布的 provider 列表修正配置里的失效 provider。
+
+        不带 overlay 时 DSH 会公布完整的 provider × model 矩阵（实测 gpt 与
+        deepseek-official 两组都在），所以按「同名 model」反查 provider，比盲猜或
+        读静态 settings.yaml 都可靠 —— 静态文件里的 provider 名字自己就会漂。
+        返回修正后的 provider；无法修正时返回空串（保持「跟随 DSH」）。
+        """
+        config = self.config
+        model = str(self.desired_model or "").strip()
+        bad = str(self.desired_provider or "").strip()
+        if config is None or not model:
+            return ""
+        options = list((result or {}).get("configOptions") or [])
+        providers = valid_dsh_providers(options)
+        if not providers or bad in providers:
+            return ""
+        option = find_config_option(options, "", MODEL_OPTION_CATEGORY)
+        for choice in config_option_choices(option):
+            provider, choice_model = parse_model_selection_value(choice.get("value"))
+            if not provider or choice_model != model:
+                continue
+            setter = getattr(config, "set_dsh_provider", None)
+            if not callable(setter):
+                return ""
+            try:
+                setter(provider)
+            except Exception:
+                logging.warning("回写修正后的 DSH provider 失败", exc_info=True)
+                return ""
+            # 先让它进入「已知可用」集合：这个值刚由 DSH 亲自公布，否则
+            # sync_launch_overlay 的校验会把它当成没探测过的值而拒绝写覆盖。
+            remember_known_dsh_providers(config, options)
+            self.desired_provider = provider
+            overlay = sync_launch_overlay(config)
+            with self._state_lock:
+                self.overlay_path = overlay
+                self._needs_restart = True
+            logging.warning(
+                "DSH provider %s 不可用，已按 DSH 公布的模型列表修正为 %s", bad, provider
+            )
+            self._notify_status(f"已自动把 DSH provider 修正为 {provider}")
+            return provider
+        return ""
+
+    def _forget_configured_route(self):
+        """把失效的 provider 记进拒绝名单，并尽量清掉配置里的值。
+
+        `set_dsh_provider("")` 在 config.json 仍有非空值时会被文件回退盖回来，
+        所以真正让「跟随 DSH」生效的是拒绝名单：sync_launch_overlay 会跳过它。
+        """
+        if self.config is None:
+            return
+        bad = str(self.desired_provider or "").strip()
+        reject = getattr(self.config, "add_dsh_rejected_provider", None)
+        if bad and callable(reject):
+            try:
+                reject(bad)
+            except Exception:
+                logging.warning("记录失效 DSH provider 失败", exc_info=True)
+        setter = getattr(self.config, "set_dsh_provider", None)
+        if not callable(setter):
+            return
+        try:
+            setter("")
+        except Exception:
+            logging.warning("清空 DSH provider 配置失败", exc_info=True)
+
+    def _remember_actual_route(self, result):
+        """把 DSH 实际生效的 provider / model 回写进配置，供下次启动直接使用。"""
+        if self.config is None:
+            return
+        option = find_config_option(
+            list((result or {}).get("configOptions") or []), "", MODEL_OPTION_CATEGORY
+        )
+        provider, model = parse_model_selection_value((option or {}).get("currentValue"))
+        if not provider:
+            return
+        try:
+            setter = getattr(self.config, "set_dsh_provider", None)
+            if callable(setter):
+                setter(provider)
+            setter_model = getattr(self.config, "set_dsh_model", None)
+            if callable(setter_model) and model:
+                setter_model(model)
+            logging.info("已把 DSH 实际路由回写为 %s/%s", provider, model)
+        except Exception:
+            logging.warning("回写 DSH 路由失败", exc_info=True)
 
     def _resume_session(self, session_id):
         """尝试恢复已持久化的 DSH 会话；不可恢复或 cwd 变更时返回 False。"""
@@ -671,7 +941,18 @@ class DshAcpConnection:
             )
         except DshAcpError:
             return False
-        self._remember_config_options(session_id, result)
+        # ACP 的 session/resume 只表示「DSH 接受了请求」，并不保证它仍持有原上下文
+        # （ACP 没有 compaction 通知）。这里只拦得住「DSH 换了 sessionId」的情况；
+        # 「id 没变但上下文已丢」由调用方对 resumed 也补一轮 seed 来兜底。
+        returned = str((result or {}).get("sessionId") or "")
+        if returned and returned != str(session_id):
+            logging.warning(
+                "session/resume 返回了不同的 sessionId（%s → %s），按新建处理",
+                str(session_id)[:12],
+                returned[:12],
+            )
+            return False
+        self._remember_config_options(returned or session_id, result)
         return True
 
     # ---------------- 模型 / 推理档位（ACP 会话配置项） ----------------
@@ -731,6 +1012,26 @@ class DshAcpConnection:
         self._remember_config_options(session_id, result)
         return self.session_config_options(session_id)
 
+    def apply_permission_preset(self, session_id):
+        """Synchronize and verify the effective permission preset on one DSH session."""
+        session_id = str(session_id or "")
+        if not session_id:
+            raise DshAcpError("无法设置 DSH 权限：sessionId 为空")
+        try:
+            result = self.request(
+                "session/set_permission_preset",
+                {"sessionId": session_id, "preset": self.permission_mode},
+                timeout=30,
+            )
+        except DshAcpError as exc:
+            raise DshAcpError(f"设置 DSH 会话权限失败：{exc}") from exc
+        actual = result.get("permissionPreset") if isinstance(result, dict) else None
+        if actual != self.permission_mode:
+            raise DshAcpError(
+                f"DSH 会话权限校验失败：期望 {self.permission_mode}，实际 {actual or '未知'}"
+            )
+        logging.info("DSH 会话 %s 权限已确认：%s", session_id, actual)
+
     def apply_model_selection(self, session_id):
         """把期望的模型 / 推理档位落到某个 ACP 会话。
 
@@ -745,14 +1046,17 @@ class DshAcpConnection:
         with self._state_lock:
             if self._applied_selection.get(session_id) == signature:
                 return
-            # 先记账：即使这次下发失败也不在每次提问时重试 / 重报，配置再变时签名不同会重新尝试
-            self._applied_selection[session_id] = signature
+        # 逐项记账：只有真正下发成功、或确认 DSH 当前值已等于目标值时才写签名。
+        # 跳过项（模型未声明档位 / 未提供该档位）不计入，否则签名会被永久占位，
+        # 之后模型切换到位、档位可用了也不会再补发，表现为「设置保存了但不生效」。
+        applied = True
         if self.desired_provider and self.desired_model:
             option = find_config_option(options, MODEL_CONFIG_ID, MODEL_OPTION_CATEGORY)
             if option is not None:
                 want = model_selection_value(self.desired_provider, self.desired_model)
                 available = {item["value"] for item in config_option_choices(option)}
                 if want not in available:
+                    applied = False
                     logging.warning(
                         "DSH 未提供模型 %s/%s，沿用当前模型 %s",
                         self.desired_provider, self.desired_model, option.get("currentValue"),
@@ -764,31 +1068,61 @@ class DshAcpConnection:
                     try:
                         options = self._set_config_option(session_id, MODEL_CONFIG_ID, want)
                     except DshAcpError as exc:
+                        applied = False
                         logging.warning("切换 DSH 模型失败：%s", exc)
                         self._notify_status(f"切换 DSH 模型失败：{exc}")
-        if not self.desired_reasoning:
-            return
-        option = find_config_option(options, REASONING_CONFIG_ID, REASONING_OPTION_CATEGORY)
-        if option is None:
-            self._notify_status(
-                "该 DSH 模型未声明推理档位（reasoningEfforts），推理深度设置已跳过"
-            )
-            return
-        available = {item["value"] for item in config_option_choices(option)}
-        if self.desired_reasoning not in available:
-            self._notify_status(f"DSH 未提供推理档位 {self.desired_reasoning}，已跳过")
-            return
-        if str(option.get("currentValue") or "") == self.desired_reasoning:
-            return
-        try:
-            self._set_config_option(session_id, REASONING_CONFIG_ID, self.desired_reasoning)
-        except DshAcpError as exc:
-            logging.warning("设置 DSH 推理档位失败：%s", exc)
-            self._notify_status(f"设置 DSH 推理档位失败：{exc}")
+        if self.desired_reasoning:
+            option = find_config_option(options, REASONING_CONFIG_ID, REASONING_OPTION_CATEGORY)
+            if option is None:
+                # 模型没声明 reasoningEfforts：暂时记不下签名，等模型切好后重试
+                applied = False
+                self._notify_status(
+                    "该 DSH 模型未声明推理档位（reasoningEfforts），推理深度设置已跳过"
+                )
+            else:
+                available = {item["value"] for item in config_option_choices(option)}
+                if self.desired_reasoning not in available:
+                    applied = False
+                    self._notify_status(f"DSH 未提供推理档位 {self.desired_reasoning}，已跳过")
+                elif str(option.get("currentValue") or "") != self.desired_reasoning:
+                    try:
+                        self._set_config_option(
+                            session_id, REASONING_CONFIG_ID, self.desired_reasoning
+                        )
+                    except DshAcpError as exc:
+                        applied = False
+                        logging.warning("设置 DSH 推理档位失败：%s", exc)
+                        self._notify_status(f"设置 DSH 推理档位失败：{exc}")
+        if applied:
+            with self._state_lock:
+                self._applied_selection[session_id] = signature
 
     def session_origin(self, session_key=None):
         """最近一次 ensure_session 的结果：created / resumed / reused。"""
         return self._session_origin.get(str(session_key or ""), "")
+
+    # ---------------- 角色设定补给 ----------------
+
+    def role_prompt_needed(self, session_id, role_text):
+        """某个 DSH 会话是否还没收到当前版本的角色设定。
+
+        ACP 的 session/new / session/resume 都不接受系统提示词，角色只能在
+        prompt blocks 里补给。新会话、恢复的会话、以及角色文本发生变化时必须
+        注入；同一会话的后续轮次直接复用上下文里的旧块，不再重复。
+        """
+        role_text = str(role_text or "").strip()
+        if not role_text:
+            return False
+        with self._state_lock:
+            return self._session_role_prompt.get(str(session_id or "")) != role_text
+
+    def mark_role_prompt(self, session_id, role_text):
+        """记下某个 DSH 会话已收到的角色设定版本。"""
+        role_text = str(role_text or "").strip()
+        if not role_text:
+            return
+        with self._state_lock:
+            self._session_role_prompt[str(session_id or "")] = role_text
 
     def prompt(self, blocks, session_key=None):
         session_id = self.ensure_session(session_key)
@@ -799,7 +1133,19 @@ class DshAcpConnection:
         )
 
     def cancel(self, session_key=None):
-        session_id = self._sessions.get(session_key or "")
+        """中断某个会话正在跑的回合。
+
+        调用方可能给出本地会话键（MainWindow 的 current_session_id），也可能给出
+        DSH 侧的 sessionId，这里两种都认。DSH 的 sessionId 是 UUID，所以即便映射
+        已经被 forget_session 清掉（删除会话是先 forget 再 stop 的场景），
+        仍然可以直接把 UUID 当 sessionId 发出去；否则取消通知发不出，暂停就变成空操作。
+        """
+        token = str(session_key or "")
+        with self._state_lock:
+            sessions = dict(self._sessions)
+        session_id = sessions.get(token)
+        if not session_id and _UUID_RE.fullmatch(token):
+            session_id = token
         if not session_id:
             return
         try:
@@ -807,20 +1153,44 @@ class DshAcpConnection:
         except Exception:
             pass
 
+    def reset_session(self, session_key):
+        """Drop one DSH mapping after a pre-execution context overflow.
+
+        ACP has no portable "clear history" method. Forgetting the local mapping
+        is therefore the interoperable recovery path; the next prompt creates a
+        fresh DSH session and persists its new id.
+        """
+        key = str(session_key or "")
+        with self._state_lock:
+            old_id = self._sessions.pop(key, None)
+            self._session_origin.pop(key, None)
+            if old_id:
+                self._config_options.pop(str(old_id), None)
+                self._applied_selection.pop(str(old_id), None)
+                self._session_role_prompt.pop(str(old_id), None)
+        self._store.pop(key)
+        return old_id
+
     def forget_session(self, session_key):
         """丢弃某个本地会话到 DSH 会话的映射（删除本地会话时调用）。"""
         key = session_key or ""
         with self._state_lock:
-            self._sessions.pop(key, None)
+            old_id = self._sessions.pop(key, None)
             self._session_origin.pop(key, None)
+            if old_id:
+                self._config_options.pop(str(old_id), None)
+                self._applied_selection.pop(str(old_id), None)
+                self._session_role_prompt.pop(str(old_id), None)
         return self._store.pop(key)
 
     def close(self):
         with self._state_lock:
             proc = self._proc
             self._proc = None
+            self._process_permission_mode = None
             self._sessions = {}
             self._session_origin = {}
+            self._session_role_prompt = {}
             with self._handler_lock:
                 self._session_handlers = {}
             self._initialized = False
@@ -887,12 +1257,20 @@ def get_connection(config=None):
                 provider=provider,
                 model=model,
                 reasoning=reasoning,
+                config=config,
             )
+        else:
+            _connection.set_permission_mode(_permission_mode_of(config))
         return _connection
 
 
 def probe_session_options(config=None, timeout=180, provider=None, model=None):
-    """起一个临时 ACP 连接读取目标模型公布的模型 / 推理档位。"""
+    """起一个临时 ACP 连接读取目标模型公布的模型 / 推理档位。
+
+    即使 config 里的 provider 已经失效（DSH 直接回 Internal error），create_session
+    也会自动退回「跟随 DSH」并重试一次，所以这个探测总能拿到 DSH 权威的
+    provider × model 列表，并顺手把配置修好。
+    """
     current_provider, current_model, reasoning = _dsh_selection_of(config)
     provider = current_provider if provider is None else str(provider or "").strip()
     model = current_model if model is None else str(model or "").strip()
@@ -904,21 +1282,16 @@ def probe_session_options(config=None, timeout=180, provider=None, model=None):
         provider=provider,
         model=model,
         reasoning=reasoning,
+        config=config,
     )
     try:
         connection.ensure_initialized()
-        result = connection.request(
-            "session/new",
-            {"cwd": connection.cwd, "mcpServers": []},
-            timeout=timeout,
-        )
-        session_id = str(result.get("sessionId") or "")
+        session_id, result = connection.create_session(mcp_servers=[], timeout=timeout)
         if session_id:
-            connection._remember_config_options(session_id, result)
             connection.set_model_selection(provider, model, reasoning)
             connection.apply_model_selection(session_id)
             return connection.session_config_options(session_id), ""
-        return list(result.get("configOptions") or []), ""
+        return list((result or {}).get("configOptions") or []), ""
     except Exception as exc:  # noqa: BLE001 - 探测失败要把原因原样带回 UI
         return [], str(exc)
     finally:
@@ -938,322 +1311,3 @@ def reset_connection():
         _connection = None
     if connection is not None:
         connection.close()
-
-
-class DSHSessionThread(QThread):
-    """信号面与 APICallThread 一致，供 MainWindow 直接接线。"""
-
-    response_received = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    stream_chunk = pyqtSignal(str)
-    tool_confirmation_requested = pyqtSignal(str, str, object)
-    status_update = pyqtSignal(str)
-    computer_state = pyqtSignal(str)
-    task_state_updated = pyqtSignal(object)
-    stopped = pyqtSignal()
-
-    def __init__(self, messages, config, task_state=None, session_id=None):
-        super().__init__()
-        self.messages = messages
-        self.config = config
-        self.session_id = str(session_id or "")
-        self.task_state = dict(task_state) if isinstance(task_state, dict) else {}
-        self.is_running = True
-        self._reply_parts = []
-        self._tool_index = 0
-        self._plan_index = 0
-        self._confirmation_lock = threading.Lock()
-        self._confirmation_events = {}
-        self._confirmation_answers = {}
-        self._session_key = ""
-        self._connection = get_connection(config)
-
-    # ---------------- 对外接口（与 APICallThread 对齐） ----------------
-
-    def stop(self):
-        self.is_running = False
-        self._release_pending_confirmations()
-        try:
-            self._connection.cancel(self.session_id)
-        except Exception:
-            pass
-
-    def set_tool_confirmation(self, call_id, approved):
-        with self._confirmation_lock:
-            self._confirmation_answers[call_id] = bool(approved)
-            event = self._confirmation_events.get(call_id)
-        if event is not None:
-            event.set()
-
-    def _release_pending_confirmations(self):
-        with self._confirmation_lock:
-            events = list(self._confirmation_events.values())
-        for event in events:
-            event.set()
-
-    # ---------------- 线程主体 ----------------
-
-    def run(self):
-        try:
-            self._touch("planning", "连接 DSH")
-            self._set_step("connect", "连接 DSH 运行时", "in_progress", "正在启动本机 DSH。")
-            self.status_update.emit("正在连接 DSH…")
-
-            connection = self._connection
-            # 会话建立前的兜底通道；建立后按 sessionId 精确分流。
-            connection.status_handler = self.status_update.emit
-            connection.ensure_started()
-            connection.ensure_initialized()
-            self._session_key = connection.ensure_session(self.session_id)
-            connection.register_session_handler(self._session_key, self)
-            self._set_step("connect", "连接 DSH 运行时", "completed", "已连接本机 DSH。")
-
-            if not self.is_running:
-                self.stopped.emit()
-                return
-
-            self._touch("executing", "DSH 正在处理")
-            self._set_step("analyze", "分析需求", "completed", "已把消息交给 DSH。")
-            self._set_step("execute", "DSH 执行", "in_progress", "DSH 正在推理与调用工具。")
-            self.status_update.emit("DSH 正在思考…")
-
-            blocks = self._build_prompt_blocks()
-            seed = self._history_seed_blocks(connection.session_origin(self.session_id))
-            if seed:
-                blocks = seed + blocks
-                self.status_update.emit("新 DSH 会话：已附带最近几轮本地上下文")
-            try:
-                result = connection.prompt(blocks, self.session_id)
-            finally:
-                connection.unregister_session_handler(self._session_key)
-            if not self.is_running:
-                self.stopped.emit()
-                return
-
-            content = "".join(self._reply_parts).strip()
-            if not content:
-                stop_reason = result.get("stopReason") if isinstance(result, dict) else ""
-                content = (
-                    "DSH 这一轮没有返回文本内容"
-                    + (f"（stopReason={stop_reason}）。" if stop_reason else "。")
-                )
-            self._set_step("execute", "DSH 执行", "completed", "DSH 已完成本轮。")
-            self._set_step("finalize", "整理最终答复", "completed", "已生成最终答复。")
-            self.task_state["final_response"] = content
-            self._touch("completed", "已完成")
-
-            if not self._reply_parts and content:
-                self.stream_chunk.emit(content)
-            self.response_received.emit(content)
-        except DshAcpError as exc:
-            self._fail(str(exc))
-            self.error_occurred.emit(f"DSH 桥接失败：{exc}")
-        except Exception as exc:  # noqa: BLE001 - 兜底，避免线程静默退出
-            self._fail(str(exc))
-            self.error_occurred.emit(f"DSH 桥接异常：{exc}")
-
-    def _fail(self, detail):
-        self.task_state["last_error"] = detail
-        self._set_step("execute", "DSH 执行", "failed", detail)
-        self._touch("failed", "执行失败")
-
-    # ---------------- 消息构造 ----------------
-
-    def _latest_user_content(self):
-        for message in reversed(self.messages or []):
-            if isinstance(message, dict) and message.get("role") == "user":
-                return message.get("content")
-        return ""
-
-    def _build_prompt_blocks(self):
-        content = self._latest_user_content()
-        fallback = content if isinstance(content, str) else ""
-        blocks = build_prompt_blocks(content, fallback)
-        if self._connection.image_prompt_enabled:
-            return blocks
-        if not any(block.get("type") == "image" for block in blocks):
-            return blocks
-        kept = [block for block in blocks if block.get("type") != "image"]
-        dropped = len(blocks) - len(kept)
-        self.status_update.emit(
-            f"当前 DSH 路由未声明图片输入，已跳过 {dropped} 张图片"
-        )
-        kept.append({
-            "type": "text",
-            "text": f"（本条消息附带 {dropped} 张图片，但当前 DSH 模型不支持图片输入，已忽略。）",
-        })
-        return kept
-
-    def _history_seed_blocks(self, origin):
-        """新会话（非恢复）时，把最近几轮本地对话作为背景补给 DSH，避免完全失忆。"""
-        if origin == "resumed":
-            return []
-        recap = self._history_recap_text()
-        if not recap:
-            return []
-        return [{"type": "text", "text": recap}]
-
-    def _history_recap_text(self):
-        """把本地历史压成一段文字：最近 HISTORY_SEED_TURNS 轮，单条超长截断。"""
-        history = list(self.messages or [])
-        for index in range(len(history) - 1, -1, -1):
-            message = history[index]
-            if isinstance(message, dict) and message.get("role") == "user":
-                history = history[:index]
-                break
-        lines = []
-        for message in history[-HISTORY_SEED_TURNS * 2:]:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            text = _message_text(message.get("content")).strip()
-            if not text:
-                continue
-            if len(text) > HISTORY_SEED_CHARS:
-                text = text[:HISTORY_SEED_CHARS] + "…（截断）"
-            lines.append(("用户：" if role == "user" else "助手：") + text)
-        if not any(line.startswith("用户：") for line in lines):
-            return ""
-        return (
-            "【背景：本窗口此前的对话摘录，仅供你理解上下文】\n"
-            + "\n".join(lines)
-            + "\n【以上是历史记录，不要复述、不要评价本段；请直接回答接下来的这条用户消息。】"
-        )
-
-    # ---------------- 连接层回调（按会话分发） ----------------
-
-    def handle_session_update(self, params):
-        self._on_update(params)
-
-    def handle_permission_request(self, params):
-        return self._on_permission(params)
-
-    def handle_status(self, text):
-        self.status_update.emit(text)
-
-    # ---------------- 事件映射 ----------------
-
-    def _on_update(self, params):
-        update = (params or {}).get("update") or {}
-        kind = update.get("sessionUpdate")
-        if kind == "agent_message_chunk":
-            text = (update.get("content") or {}).get("text", "")
-            if text:
-                self._reply_parts.append(text)
-                self.stream_chunk.emit(text)
-        elif kind == "agent_thought_chunk":
-            self.status_update.emit("DSH 正在思考…")
-        elif kind == "tool_call":
-            self._tool_index += 1
-            title = _tool_title(update)
-            self._set_step(
-                f"dsh_tool_{self._tool_index}",
-                f"DSH 调用工具：{title}",
-                "in_progress",
-                "DSH 正在执行该工具。",
-            )
-            self._touch("executing", f"DSH 调用工具：{title}")
-            self.status_update.emit(f"DSH 正在执行：{title}")
-        elif kind == "tool_call_update":
-            status = str(update.get("status") or "")
-            if status in ("completed", "failed"):
-                self._set_step(
-                    f"dsh_tool_{self._tool_index}",
-                    f"DSH 调用工具：{_tool_title(update)}",
-                    "completed" if status == "completed" else "failed",
-                    f"工具状态：{status}",
-                )
-        elif kind == "plan":
-            entries = update.get("entries") or []
-            for entry in entries:
-                self._plan_index += 1
-                self._set_step(
-                    f"dsh_plan_{self._plan_index}",
-                    str(entry.get("content") or "DSH 计划步骤"),
-                    "in_progress" if entry.get("status") in (None, "in_progress") else "completed",
-                    str(entry.get("priority") or ""),
-                )
-        elif kind == "session_info_update":
-            title = update.get("title")
-            if title:
-                self.status_update.emit(f"DSH 会话：{title}")
-
-    def _full_access(self):
-        """完全权限模式：审批策略等价于 never，DSH 的授权请求不再交给用户确认。"""
-        getter = getattr(self.config, "is_full_access_mode", None) if self.config is not None else None
-        if getter is None:
-            return False
-        try:
-            return bool(getter())
-        except Exception:
-            return False
-
-    def _on_permission(self, params):
-        """在独立线程里等待用户授权，避免阻塞 ACP 读取线程。"""
-        tool_call = params.get("toolCall") or {}
-        self._tool_index += 1
-        call_id = f"dsh_perm_{self._tool_index}"
-        title = _tool_title(tool_call)
-        arguments = _tool_arguments(tool_call)
-        if self._full_access():
-            # 完全权限模式：直接放行，不弹确认框
-            logging.info("完全权限模式：自动放行 DSH 权限请求 %s", title)
-            self.status_update.emit(f"完全权限模式：自动放行 {title}")
-            return True
-        event = threading.Event()
-        with self._confirmation_lock:
-            self._confirmation_events[call_id] = event
-        try:
-            self.tool_confirmation_requested.emit(call_id, title, arguments)
-            if not self.is_running:
-                return False
-            if not event.wait(PERMISSION_TIMEOUT_SECONDS):
-                return False
-            with self._confirmation_lock:
-                return bool(self._confirmation_answers.pop(call_id, False))
-        finally:
-            with self._confirmation_lock:
-                self._confirmation_events.pop(call_id, None)
-
-    # ---------------- 任务状态（复用主程序的任务面板结构） ----------------
-
-    def _touch(self, status, current_step):
-        if not self.task_state:
-            return
-        self.task_state["status"] = status
-        self.task_state["current_step"] = current_step
-        self.task_state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        self.task_state_updated.emit(dict(self.task_state))
-
-    def _set_step(self, key, title, status, detail=""):
-        if not self.task_state:
-            return
-        steps = self.task_state.setdefault("plan_steps", [])
-        now = time.strftime("%Y-%m-%dT%H:%M:%S")
-        for step in steps:
-            if step.get("key") != key:
-                continue
-            step["title"] = title
-            step["status"] = status
-            step["detail"] = detail
-            step["updated_at"] = now
-            if status == "in_progress" and not step.get("started_at"):
-                step["started_at"] = now
-            if status in ("completed", "failed"):
-                step["finished_at"] = now
-            self.task_state_updated.emit(dict(self.task_state))
-            return
-        steps.append(
-            {
-                "key": key,
-                "title": title,
-                "status": status,
-                "detail": detail,
-                "started_at": now if status == "in_progress" else "",
-                "finished_at": now if status in ("completed", "failed") else "",
-                "updated_at": now,
-            }
-        )
-        self.task_state_updated.emit(dict(self.task_state))

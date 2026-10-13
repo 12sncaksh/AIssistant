@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 from PyQt6.QtCore import QCoreApplication, QTimer  # noqa: E402
 
-from dsh_acp_client import DSHSessionThread, reset_connection, sync_launch_overlay  # noqa: E402
+from dsh_session_thread import DSHSessionThread  # noqa: E402
+from dsh_acp_client import reset_connection, sync_launch_overlay  # noqa: E402
 
 
 class FileConfig:
@@ -24,6 +25,11 @@ class FileConfig:
         self.root = root
         with open(os.path.join(root, "config", "config.json"), "r", encoding="utf-8-sig") as handle:
             self.data = json.load(handle)
+        # 路由自愈要求 provider / model 可写（真实 ConfigManager 同样可写）
+        self.provider = self._get("dsh_provider")
+        self.model = self._get("dsh_model")
+        self.known = set()
+        self.rejected = set()
 
     def _get(self, key, default=""):
         return str(self.data.get(key, default) or "").strip()
@@ -35,10 +41,30 @@ class FileConfig:
         return self._get("dsh_profile", "acp") or "acp"
 
     def get_dsh_provider(self):
-        return self._get("dsh_provider")
+        return self.provider
+
+    def set_dsh_provider(self, value):
+        self.provider = str(value or "").strip()
 
     def get_dsh_model(self):
-        return self._get("dsh_model")
+        return self.model
+
+    def set_dsh_model(self, value):
+        self.model = str(value or "").strip()
+
+    def get_dsh_known_providers(self):
+        return sorted(self.known)
+
+    def set_dsh_known_providers(self, providers):
+        self.known = {str(item).strip() for item in (providers or []) if str(item).strip()}
+
+    def get_dsh_rejected_providers(self):
+        return sorted(self.rejected)
+
+    def add_dsh_rejected_provider(self, provider):
+        value = str(provider or "").strip()
+        if value:
+            self.rejected.add(value)
 
 
 def main():

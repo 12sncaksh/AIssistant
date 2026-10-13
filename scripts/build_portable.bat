@@ -21,7 +21,7 @@ pushd src
 for /f "delims=" %%v in ('%PYTHON% -c "import version;print(version.__version__)"') do set "APP_VERSION=%%v"
 popd
 if not defined APP_VERSION goto version_missing
-set "PKG=Aissistant_v%APP_VERSION%_test_portable.zip"
+set "PKG=Aissistant_v%APP_VERSION%_fast.zip"
 
 echo [2/6] Installing build dependencies into the selected Python...
 %PYTHON% -m pip install -r requirements.txt

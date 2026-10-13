@@ -34,6 +34,17 @@ archive/
 工作文档
 docs/
 
+# ---- 开发期临时产物与测试脚本（不公开）----
+# lab/ 是开发时的界面截图（由 scripts/shot_config_dialog.py 生成），README 不引用它。
+lab/
+# 真机验证清单、散落在根目录的临时测试脚本：内部使用。
+TEST_CHECKLIST.md
+test_qthread_shutdown.py
+# 测试脚本一律不发布：本仓库只公开源码与运行 / 打包 / 自检脚本。
+# 注意：scripts/test_dsh_bridge.py 在更早的提交里已经入库，本规则不会自动移除它
+#（它在本项目里的定位是「桥接自检」入口，README 的 DSH 一节引用了它）。
+scripts/test_*.py
+
 # ---- 本地备份 / 临时文件 ----
 *.bak
 *.bak-*

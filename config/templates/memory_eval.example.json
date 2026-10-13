@@ -1,0 +1,371 @@
+{
+  "version": 1,
+  "note": "记忆检索评测样本。每个 case 自带一段小语料（corpus），离线即可复现；expect_any 列出必须出现在召回片段里的关键词（任选其一命中即算召回成功），expect_none=true 表示这是负例、这一轮应当召回为空。改阈值/加词法/改 query 之前之后都用同一批样本跑，才有资格说“变好了”。",
+  "background": [
+    {"role": "user", "text": "这个 bug 要不要改一下？我看着有点别扭"},
+    {"role": "assistant", "text": "可以先记下来，等这一版跑完再一起处理"},
+    {"role": "user", "text": "继续"},
+    {"role": "assistant", "text": "好，我接着上面那一条往下说"},
+    {"role": "user", "text": "为什么？"},
+    {"role": "assistant", "text": "因为那样会破坏现有的兼容性，代价不划算"},
+    {"role": "user", "text": "现在几点了"},
+    {"role": "assistant", "text": "我这边看不到系统时间，你瞄一眼右下角就行"},
+    {"role": "user", "text": "帮我把这个文件夹整理一下吧"},
+    {"role": "assistant", "text": "可以，先看看里面都有哪些文件再动手"},
+    {"role": "user", "text": "那这个呢"},
+    {"role": "assistant", "text": "这个也能做，不过优先级低一些，先放着"},
+    {"role": "user", "text": "桌宠今天看着挺精神的"},
+    {"role": "assistant", "text": "谢谢，刚给它换了个表情试试"},
+    {"role": "user", "text": "中午吃点什么好"},
+    {"role": "assistant", "text": "随便吃点清淡的吧，别太油"},
+    {"role": "user", "text": "刚才那个问题先记一下"},
+    {"role": "assistant", "text": "记下了，等你回来再接着处理"},
+    {"role": "user", "text": "这两个还需要吗"},
+    {"role": "assistant", "text": "先留着，用不用得上过两天就知道了"},
+    {"role": "user", "text": "好，先这样"},
+    {"role": "assistant", "text": "好，随时叫我"}
+  ],
+  "cases": [
+    {
+      "id": "short-01",
+      "category": "短指代",
+      "note": "「那这个」指代上一轮的检索阈值，只有当前消息时无从检索",
+      "corpus": [
+        {"role": "user", "text": "我项目的检索阈值设的是 0.7，你觉得合理吗"},
+        {"role": "assistant", "text": "相对阈值 0.7 是和最高分比较，绝对下限 0.55 才是固定分数线"},
+        {"role": "assistant", "text": "交接点在 0.55 除以 0.7 约等于 0.786，最高分低于它时 0.7 根本不参与"},
+        {"role": "user", "text": "那相关带大概是多少"},
+        {"role": "assistant", "text": "实测同义改写 0.953，相关带 0.553 到 0.655，无关 0.425 到 0.510"}
+      ],
+      "context": [
+        {"role": "user", "text": "所以 0.7 管的是高分区，一接管就切进相关带"},
+        {"role": "assistant", "text": "对，调 0.7 之前先解决缺第二路信号的问题"}
+      ],
+      "query": "那这个要不要改？",
+      "expect_any": ["0.7", "相对阈值", "0.786"]
+    },
+    {
+      "id": "short-02",
+      "category": "短指代",
+      "note": "「继续」指代上一轮的词法检索落地细节",
+      "corpus": [
+        {"role": "user", "text": "加一路词法检索要注意什么"},
+        {"role": "assistant", "text": "FTS5 默认的 unicode61 会把一整串汉字当成一个 token，对中文等于没用"},
+        {"role": "assistant", "text": "可以用 trigram 分词器，或者复用项目里已有的字符 n-gram 自己算 BM25，零新依赖"},
+        {"role": "user", "text": "BM25 的打分规则是什么"},
+        {"role": "assistant", "text": "词出现越多分越高但有上限、越稀有的词权重越大、文档越长越打折"}
+      ],
+      "context": [
+        {"role": "user", "text": "那两路分数怎么合"},
+        {"role": "assistant", "text": "分数不能直接加，量纲不一样，要用 RRF 只看名次"}
+      ],
+      "query": "继续",
+      "expect_any": ["trigram", "分词", "BM25", "n-gram"]
+    },
+    {
+      "id": "short-03",
+      "category": "短指代",
+      "note": "「为什么」指代上一轮的结论",
+      "corpus": [
+        {"role": "assistant", "text": "pull 最要命的失败模式是模型不知道自己不知道"},
+        {"role": "assistant", "text": "所以前沿没有一家是纯 pull，都是小 push 加大 pull"},
+        {"role": "assistant", "text": "常驻块负责永远在场，工具负责要细节自己去翻"},
+        {"role": "assistant", "text": "还可以在常驻块里写一句菜单索引，告诉模型历史细节可以调用 search_memory 查"}
+      ],
+      "context": [
+        {"role": "user", "text": "如果上了 pull，还需要常驻块吗"},
+        {"role": "assistant", "text": "需要，它就是那个小 push"}
+      ],
+      "query": "为什么？",
+      "expect_any": ["常驻块", "菜单索引", "search_memory"]
+    },
+    {
+      "id": "short-04",
+      "category": "短指代",
+      "note": "「那两个」指代常驻块和 RRF",
+      "corpus": [
+        {"role": "assistant", "text": "常驻块管永远在场，RRF 管第一层召回排序，pull 管要不要查"},
+        {"role": "assistant", "text": "pull 取代的是第二层取舍，不是第一层召回，所以 RRF 和它互补而不是替代"},
+        {"role": "assistant", "text": "pull 反而让 RRF 更好落地，因为工具返回 top-k 列表，不进门、没有阈值"}
+      ],
+      "context": [
+        {"role": "user", "text": "那 pull 上线之后，之前那两件还需要吗"},
+        {"role": "assistant", "text": "一个必须留，一个不是必须但没浪费"}
+      ],
+      "query": "那两个还需要吗？",
+      "expect_any": ["常驻块", "RRF"]
+    },
+    {
+      "id": "short-05",
+      "category": "短指代",
+      "note": "「它」指代上一轮提到的 web 端插件",
+      "corpus": [
+        {"role": "assistant", "text": "dsh-whale-widget 是 root.inject 了 webServer 和 credentials，还有 webserver 的 index-inject"},
+        {"role": "assistant", "text": "这种插件只有在 web profile 里才有宿主，ACP 桥接里没有 webServer，加载不起来"},
+        {"role": "assistant", "text": "工具型插件是 ctx.inject 里的 tools，那类在桥接里是可用的"}
+      ],
+      "context": [
+        {"role": "user", "text": "那 wallpaper-plugin 在桥接模式能用吗"},
+        {"role": "assistant", "text": "它注册的是 preset 系列工具，属于工具型"}
+      ],
+      "query": "它呢？",
+      "expect_any": ["webServer", "index-inject", "工具型", "tools"]
+    },
+    {
+      "id": "exact-01",
+      "category": "精确词",
+      "note": "函数名/参数名这类字面命中，余弦容易漏",
+      "corpus": [
+        {"role": "assistant", "text": "memory_retriever 里的 _select_hits 是两道门槛取较高者"},
+        {"role": "assistant", "text": "threshold 等于 max(best 乘 min_ratio, min_score)"},
+        {"role": "assistant", "text": "min_ratio 默认 0.7，min_score 默认 0.55"},
+        {"role": "assistant", "text": "memory_runtime 的 _retrieval_params 只透传 min_score，根本没传 min_ratio"}
+      ],
+      "query": "memory_retriever.py 里的比例门 min_ratio 是多少",
+      "expect_any": ["min_ratio"]
+    },
+    {
+      "id": "exact-02",
+      "category": "精确词",
+      "note": "版本号这种字面串，语义向量基本抓不住",
+      "corpus": [
+        {"role": "assistant", "text": "dsh_acp_permission_patch 里 EXPECTED_PACKAGE_VERSION 锁的是 0.1.5-rc.3"},
+        {"role": "assistant", "text": "它会在原地改 @deepseek-ai/dsh-acp 的 lib/index.js，并留一份 index.js.aissistant-backup"},
+        {"role": "assistant", "text": "版本对不上会直接 RuntimeError，而不是硬改"}
+      ],
+      "query": "桥接用的 DSH ACP 包版本锁定在哪个版本",
+      "expect_any": ["0.1.5-rc.3"]
+    },
+    {
+      "id": "exact-03",
+      "category": "精确词",
+      "note": "工具名与日志标记属于字面线索",
+      "corpus": [
+        {"role": "assistant", "text": "桥接模式下如果 control_pet 没暴露给 DSH，桌宠就不会有 [pet-exp] 日志"},
+        {"role": "assistant", "text": "排查方法是看有没有 pet-exp 输出，而不是看表情有没有变"},
+        {"role": "assistant", "text": "视觉键鼠那类工具在桥接侧是另一套注册路径"}
+      ],
+      "query": "桥接模式下怎么确认桌宠表情到底有没有生效",
+      "expect_any": ["control_pet", "pet-exp"]
+    },
+    {
+      "id": "exact-04",
+      "category": "精确词",
+      "note": "文件名精确匹配",
+      "corpus": [
+        {"role": "assistant", "text": "记忆索引落在 data/memory_index.db，是 SQLite，开了 WAL"},
+        {"role": "assistant", "text": "表是 memory_index，字段有 message_id、session_id、role、text、content_hash、identity"},
+        {"role": "assistant", "text": "还有 session_summaries 和 memory_meta 两张表"}
+      ],
+      "query": "记忆索引的 SQLite 文件叫什么名字",
+      "expect_any": ["memory_index.db"]
+    },
+    {
+      "id": "sem-01",
+      "category": "语义改写",
+      "note": "问法与语料用词完全不同",
+      "corpus": [
+        {"role": "assistant", "text": "RRF 的破法很暴力：不看分数，只看名次"},
+        {"role": "assistant", "text": "公式是每个文档在各路里的名次倒数之和，k 取 60 做平滑"},
+        {"role": "assistant", "text": "它最大的好处是免标定，换 embedding 模型或换语料，公式照常工作"}
+      ],
+      "query": "怎么才能不用调那个相似度数值",
+      "expect_any": ["RRF", "名次", "免标定"]
+    },
+    {
+      "id": "sem-02",
+      "category": "语义改写",
+      "note": "口语化提问对抽象概念",
+      "corpus": [
+        {"role": "assistant", "text": "模型不知道自己不知道，这是 pull 最要命的失败模式"},
+        {"role": "assistant", "text": "push 至少每次都会试着捞一把，pull 没想到要查就永远查不到"},
+        {"role": "assistant", "text": "所以要用一个小的常驻块兜底，把最重要的东西永远摆在上下文里"}
+      ],
+      "query": "怎么防止模型漏掉我很早以前说过的重要事情",
+      "expect_any": ["常驻块", "push", "pull"]
+    },
+    {
+      "id": "sem-03",
+      "category": "语义改写",
+      "note": "口语化提问对技术描述",
+      "corpus": [
+        {"role": "assistant", "text": "检索 query 别只用当前那条用户消息，拼上最近一到两轮"},
+        {"role": "assistant", "text": "拼太长会把查询向量平均成一锅粥，反而更差"},
+        {"role": "assistant", "text": "近期轮次同时要排除在结果之外，否则同一段话会注入两次"}
+      ],
+      "query": "用户只发一句“那这个呢”的时候该怎么搜得到东西",
+      "expect_any": ["近期", "轮", "query"]
+    },
+    {
+      "id": "sem-04",
+      "category": "语义改写",
+      "note": "英文术语对中文描述",
+      "corpus": [
+        {"role": "assistant", "text": "前沿做法是入库前先整理一遍，术语叫 write-time consolidation"},
+        {"role": "assistant", "text": "新消息进来时用一次 LLM 提炼成事实，而不是原样切片"},
+        {"role": "assistant", "text": "顺带做去重合并、解决矛盾、丢弃寒暄，代价是每轮多 2.3 秒"}
+      ],
+      "query": "怎么让记忆库本身别那么脏",
+      "expect_any": ["事实", "提炼", "入库", "consolidation"]
+    },
+    {
+      "id": "neg-01",
+      "category": "负例",
+      "note": "语料里完全没有天气相关内容，应当召回为空",
+      "corpus": [
+        {"role": "user", "text": "检索阈值 0.7 合理吗"},
+        {"role": "assistant", "text": "0.7 是相对阈值，和最高分比较"},
+        {"role": "user", "text": "词法那一路怎么落地"},
+        {"role": "assistant", "text": "复用字符 n-gram 自己算 BM25，零新依赖"}
+      ],
+      "query": "今天天气怎么样",
+      "expect_none": true
+    },
+    {
+      "id": "neg-02",
+      "category": "负例",
+      "note": "语料里没有餐饮内容",
+      "corpus": [
+        {"role": "assistant", "text": "常驻块要字段化，偏好、能力索引、任务上下文各带预算"},
+        {"role": "assistant", "text": "偏好条目必须带来源，冲突时标记失效而不是删除"},
+        {"role": "user", "text": "那评测集呢"},
+        {"role": "assistant", "text": "二十到三十条就够，关键是用同一批样本前后对比"}
+      ],
+      "query": "帮我推荐一家杭州的火锅店",
+      "expect_none": true
+    },
+    {
+      "id": "neg-03",
+      "category": "负例",
+      "note": "纯计算请求，没有可检索的记忆",
+      "corpus": [
+        {"role": "user", "text": "记忆检索的召回宽度要放多宽"},
+        {"role": "assistant", "text": "两路各取三十到五十条再融合，只取十二条等于白融"},
+        {"role": "user", "text": "融合之后的分数是什么量级"},
+        {"role": "assistant", "text": "大概 0.01 到 0.03，一进门就会被 0.55 全杀掉"}
+      ],
+      "query": "帮我算一下 923 乘以 17 等于多少",
+      "expect_none": true
+    },
+    {
+      "id": "neg-04",
+      "category": "负例",
+      "note": "用户没提过宠物，属于“库里确实没有”的情形",
+      "corpus": [
+        {"role": "user", "text": "先把常驻块做出来"},
+        {"role": "assistant", "text": "常驻块不参与打分，所以没有阈值问题"},
+        {"role": "user", "text": "那自动提炼偏好呢"},
+        {"role": "assistant", "text": "只提炼稳定偏好，带来源、不覆盖、控频控本"}
+      ],
+      "query": "我之前说我养的那只猫叫什么名字",
+      "expect_none": true
+    },
+    {
+      "id": "pref-01",
+      "category": "长期偏好",
+      "note": "偏好类信息应当被稳定召回",
+      "corpus": [
+        {"role": "user", "text": "我平时不喜欢表格，能不用就不用"},
+        {"role": "user", "text": "回答简洁一点，别铺垫太多"},
+        {"role": "assistant", "text": "好，后面尽量短句直给"},
+        {"role": "user", "text": "代码块可以用，但别堆标题"}
+      ],
+      "query": "我之前说过我喜欢的回答风格吗",
+      "expect_any": ["表格", "简洁"]
+    },
+    {
+      "id": "pref-02",
+      "category": "长期偏好",
+      "note": "长期环境事实",
+      "corpus": [
+        {"role": "user", "text": "我这台机器用 conda 环境 ai_assistant，Python 是 3.12"},
+        {"role": "user", "text": "平时跑测试就用这个环境，别装新依赖"},
+        {"role": "assistant", "text": "记住了，优先用标准库和已有依赖"}
+      ],
+      "query": "我的项目用的什么 Python 环境",
+      "expect_any": ["3.12", "conda", "ai_assistant"]
+    },
+    {
+      "id": "pref-03",
+      "category": "长期偏好",
+      "note": "工作方式约定",
+      "corpus": [
+        {"role": "user", "text": "改我之前先把原文件备份一份"},
+        {"role": "user", "text": "CRLF 的文件不要直接整体重写，用临时脚本按二进制读写"},
+        {"role": "assistant", "text": "明白，锚点还会先验证唯一再替换"}
+      ],
+      "query": "我对改代码这件事有什么要求",
+      "expect_any": ["备份", "CRLF", "补丁"]
+    },
+    {
+      "id": "tail-01",
+      "category": "长尾",
+      "note": "答案落在语料尾部，考的是召回宽度而不是打分",
+      "corpus": [
+        {"role": "user", "text": "今天先聊点别的，桌宠那个 Live2D 参数你会调吗"},
+        {"role": "assistant", "text": "可以，先用 list_live2d_params 看模型支持哪些参数"},
+        {"role": "user", "text": "表情持续多久合适"},
+        {"role": "assistant", "text": "默认六秒，五百到三万毫秒之间"},
+        {"role": "user", "text": "还有个事，我这界面流式输出是被屏蔽的"},
+        {"role": "assistant", "text": "那长内容要分段发，一次输出太长会被吞掉，你回继续我再发下一段"}
+      ],
+      "query": "输出太长被吞掉的时候怎么办",
+      "expect_any": ["分段", "继续"]
+    },
+    {
+      "id": "tail-02",
+      "category": "长尾",
+      "note": "答案在语料靠后位置",
+      "corpus": [
+        {"role": "user", "text": "DSH 插件生态在桥接模式能用吗"},
+        {"role": "assistant", "text": "插件是按 profile 装的，装进 acp 那个 profile 才生效"},
+        {"role": "assistant", "text": "工具型插件可用，依赖 webServer 的 UI 插件在 ACP 里没有宿主"},
+        {"role": "user", "text": "那我直接 dsh plugin add 行不行"},
+        {"role": "assistant", "text": "有风险，ACP 包版本被锁在 0.1.5-rc.3 还打了原地补丁，装插件可能把版本推走导致桥接起不来"}
+      ],
+      "query": "直接 dsh plugin add 有什么风险",
+      "expect_any": ["0.1.5-rc.3", "补丁", "版本"]
+    },
+    {
+      "id": "tail-03",
+      "category": "长尾",
+      "note": "具体数字落在语料尾部",
+      "corpus": [
+        {"role": "user", "text": "常驻块要做成什么结构"},
+        {"role": "assistant", "text": "字段化，偏好、能力索引、任务上下文，各带字符预算"},
+        {"role": "user", "text": "预算给多少"},
+        {"role": "assistant", "text": "偏好六百，能力三百，任务四百，总量压在一千五百字符以内"},
+        {"role": "user", "text": "评测怎么搞"},
+        {"role": "assistant", "text": "先攒二十到三十条样本，短指代、精确词、负例都要有，改一次跑一次"}
+      ],
+      "query": "评测集准备多少条比较合适",
+      "expect_any": ["20", "30"]
+    },
+    {
+      "id": "pos-01",
+      "category": "位置型（另有专门路径）",
+      "note": "位置型提问语义检索本来就不擅长，这条用来暴露这个盲区",
+      "corpus": [
+        {"role": "user", "text": "我想把用户偏好提成一个常驻块，先试试自动提炼"},
+        {"role": "assistant", "text": "可以，但只提炼稳定偏好，别做通用事实抽取"},
+        {"role": "user", "text": "评测集要多少条"},
+        {"role": "assistant", "text": "二十到三十条"}
+      ],
+      "query": "这个会话第一句话是什么",
+      "expect_any": ["常驻块", "偏好"]
+    },
+    {
+      "id": "pos-02",
+      "category": "位置型（另有专门路径）",
+      "note": "同上，考会话开头",
+      "corpus": [
+        {"role": "user", "text": "当前项目的检索阈值设在 0.7 合理吗"},
+        {"role": "assistant", "text": "它只在最高分高于 0.786 时才成为真闸门"},
+        {"role": "user", "text": "那要不要调"},
+        {"role": "assistant", "text": "调它优先级最低，先补第二路信号"}
+      ],
+      "query": "我们最开始聊的是什么",
+      "expect_any": ["0.7", "阈值"]
+    }
+  ]
+}

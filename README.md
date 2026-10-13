@@ -7,6 +7,9 @@
 - 大模型流式对话（OpenAI 兼容接口）；也可把整轮对话交给本机 DSH 运行时处理，
   模型与推理深度可在设置里选（一键探测 DSH 可用档位），见「DSH 桥接」
 - 结构化工具调用（function calling）：联网搜索、天气/路线、系统状态、磁盘只读扫描、文件读写、锁屏/关机等
+- 长期记忆：结构化「常驻块」（用户偏好 / 能力 / 任务，可从对话自动提炼，条目标失效而不删除）+ 本地历史
+  语义检索（向量 + 中文 BM25 词法 + RRF 融合），检索方式可在「模型按需查询（pull）」与「每轮自动注入
+  （push）」之间一键切换，见「长期记忆」一节
 - MCP（Model Context Protocol）扩展：支持 stdio 本地 server 与远程 HTTP/SSE server，工具自动并入工具表；
   程序自身的系统/电源/桌宠能力也以自带 MCP server 的形式提供
 - 语音：sherpa-onnx 唤醒「小柚」、讯飞语音听写、edge-tts 语音回复
@@ -137,7 +140,7 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 
 | server | 工具 | 是否免确认 |
 | --- | --- | --- |
-| `aissistant` | `system_status`、`health_check`、`disk_scan`、`network_info`、`speedtest`、`ping_host`、`get_weather`、`get_forecast`、`get_route`、`recommend_food_by_*`、`open_app`、`open_url` | 是（`autoApprove: true`） |
+| `aissistant` | `system_status`、`health_check`、`disk_scan`、`network_info`、`speedtest`、`ping_host`、`get_weather`、`get_forecast`、`get_route`、`recommend_food_by_*`、`open_app`、`open_url`、`search_memory` | 是（`autoApprove: true`） |
 | `aissistant-power` | `lock_screen`、`shutdown`、`reboot` | **否，每次都要确认** |
 | `aissistant-pet` | `control_pet`、`set_live2d_param`、`list_live2d_params` | 是（`autoApprove: true`） |
 
@@ -182,6 +185,28 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 - 菜单「设置 → MCP 工具管理」（查看状态并即时启用/禁用 server）
 - 或命令行 `python scripts\list_mcp_tools.py`
 
+## 长期记忆
+
+本程序带一套**完全离线**的长期记忆（向量走后本机 Ollama 或内置的本地哈希后端，不联网）：
+
+- **常驻块**：结构化保存「用户偏好 / 能力 / 任务」三类，各自有字符预算；条目标失效而不是删除，
+  保留可追溯的原文。每轮对话都会注入，是「最重要的东西」的兜底。偏好可由对话自动提炼。
+- **历史检索**：本地 SQLite 索引 + 向量检索 + 中文 BM25 词法检索，两者用 RRF（倒数排名融合）
+  合并。融合分只用于**排序**，不与相似度阈值混用（阈值只属于 push 那条路）。
+- **检索方式**（一个下拉两档，同时作用于本地对话与 DSH 桥接）：
+
+  | 档位 | 谁决定查 | 什么时候响 | 主要缺点 |
+  | --- | --- | --- | --- |
+  | 模型按需查询（`pull`，默认） | 模型自己调 `search_memory` | 它觉得需要时 | 它可能想不到要查 |
+  | 每轮自动注入（`push`） | 系统按相关度门槛自动拼查询 | 每轮 | 内容多，可能答非所问 |
+
+  `pull` 档下自动注入会让位，同一段历史不会重复灌两遍；常驻块与「用户原话触发」的按需检索
+  （如「把完整聊天记录整理一下」）在两档下都保留。
+- **落盘痕迹**：`search_memory` 每次调用都会往 `data/memory_pull.log` 追加一行（时间 / pid /
+  通道 / 会话 / query 原文 / 命中数 / 错误）。DSH 桥接的调用跑在 MCP 子进程里、不进主程序日志，
+  所以这份痕迹是判断「模型到底调没调」的依据。查看：`python scripts\show_pull_trace.py`。
+- **运行时数据**（索引库、常驻块、评测样本、痕迹）都在 `data/`，**不入库**。
+
 ## 权限模式
 
 聊天输入框旁的「权限」按钮、菜单「设置 → 权限模式」、以及「设置 → 模型与接口 → 模型与 API」
@@ -197,8 +222,7 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 - 也可写进 `config/config.json`：`"permission_mode": "danger-full-access"`（模板见 `config/templates/config.example.json`）。
 - 输入框旁的权限按钮常驻显示当前档位：默认是「权限：默认」，切到完全权限变成红色 **⚠ 完全权限**，
   只读模式显示蓝色 **权限：只读**，点开菜单即可切换。
-- **任务进行中只能收紧、不能提权**：提权（含「只读 → 工作区可写」）要等这轮跑完，菜单里对应项会置灰；
-  收紧随时可用，切到更低档会顺手中断当前任务。
+- **任务进行中禁止切换权限模式**：三个档位均置灰，仅当前档位保持选中；等本轮结束后再切换。
 - 完全权限意味着模型发出的命令会**立即真实执行**，不再有人工确认闸门，只在信任的任务里临时开启。
 - 有三道硬保护不受权限模式影响：**破坏性命令黑名单**（`Remove-Item -Recurse/-Force`、`rm -rf`、`diskpart`、
   `format`、`bcdedit`、`reg delete` 等照样被直接拦截）、**受保护写入路径**（`C:\Windows`、`Program Files`、
@@ -254,6 +278,13 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 - **权限**：当前「权限模式」通过 `DSH_PERMISSION_MODE` 环境变量传给 `dsh` 子进程（`read-only` /
   `workspace-write` / `danger-full-access`），切档后下一次提问前自动重启子进程；完全权限模式下
   ACP 的授权请求不再弹窗，由本程序直接放行。详见「权限模式」。
+- **角色设定**：ACP 的 `session/new` / `session/resume` 都不接受系统提示词，DSH 只会用自己
+  profile 里的默认人设（`You are a coding agent…`）。所以本程序会把当前角色 / 系统提示词作为
+  prompt 的第一段（`【角色设定】…【以上是必须长期保持的角色设定】`）补给 DSH，结构为
+  **角色设定 → 本地历史记忆 → 当前提问**。新建会话、恢复会话、上下文溢出后重建会话，以及
+  切换角色时都会重新注入；同一 DSH 会话的后续轮次复用上下文里的旧块，不再每轮重复。
+  实现落点在 `src/dsh_session_thread.py` 的 `_with_role_prompt` 与 `src/dsh_acp_client.py`
+  的 `role_prompt_needed` / `mark_role_prompt`。
 - **路由覆盖**：`config/dsh_acp_overlay.yml` 是给 `dsh --patch` 用的路由补丁，填了 `dsh_provider` 后
   自动生成，把 ACP 会话的路由覆盖回你选的 provider / model；字段说明与手写起点见模板
   `config/templates/dsh_acp_overlay.example.yml`。
@@ -265,9 +296,9 @@ sherpa-onnx-cli text2token --tokens generated\kws\tokens.txt --tokens-type ppiny
 
 ## 打包免安装版
 
-在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v<版本>_test_portable.zip`
-（当前为 `Aissistant_v1.102.8_test_portable.zip`）。版本号取自 `src/version.py` 的
-`__version__`，和「关于」窗口显示的是同一个值，升级只改一处。
+在 Windows 运行 `scripts\build_portable.bat`，生成 `Aissistant_v<版本>_fast.zip`
+（当前为 `Aissistant_v0.0.1_fast.zip`）。版本号取自 `src/version.py` 的
+`__version__`，关于窗口会标注 fast 版，升级只需改版本号一处。
 
 - 脚本先检查 `generated\kws\` 与 `assets\web_resources\dist\pet.html`：缺了会打印下载与放置说明并中止
   （免安装包必须自带 Live2D 页面与唤醒词模型，所以要先把「仓库不包含的资源」补齐）。
@@ -288,8 +319,20 @@ src/                     # 全部 Python 源码
   vision_input.py        # 视觉键鼠控制器（mss + Pillow + pyautogui）
   accessibility_input.py # UI Automation 读取
   input_guard.py         # 键鼠接管钩子
+  memory_runtime.py      # 长期记忆编排：常驻块 + 检索 + pull/push 开关 + 跨进程会话身份
+  memory_retriever.py    # 向量检索与记忆块格式化
+  memory_lexical.py      # 中文 BM25 + RRF（倒数排名融合）
+  memory_store.py        # 记忆索引与常驻块的 SQLite 存储
+  memory_embeddings.py   # embedding 后端（Ollama API / 本地哈希）
+  memory_indexer.py      # 把历史消息写进索引
+  core_memory.py         # 常驻块字段化存储与偏好提炼（可编辑界面见 core_memory_dialog.py）
+  tools_memory.py        # search_memory 工具入口
+  pull_trace.py          # pull 调用的落盘痕迹（跨进程可见）
+  recall_intent.py       # 「用户原话触发」的按需检索判断
+  context_builder.py     # 本地路径的上下文拼装（常驻块 / 记忆块 / 摘要块）
 config/templates/        # 配置模板（随包发布：auth / config / apps / mcp / live2d_emotions / dsh_acp_overlay）
-scripts/                 # 启动 / 打包 / 自检脚本（run*.bat、build_portable.bat、Aissistant.spec 等）
+scripts/                 # 运行 / 打包 / 自检脚本（run*.bat、build_portable.bat、Aissistant.spec 等）
+                         # 单元测试脚本（test_*.py）不随仓库发布
 assets/                  # 图标与 web_resources（Live2D 页面、引擎、模型，多为本地资源）
 mcp_servers/             # 自带 MCP server（系统/电源/桌宠）+ demo 示例
 generated/               # 运行时生成：kws 唤醒词模型、chat_backgrounds

@@ -33,6 +33,9 @@ TOOL_NAMES = (
     "recommend_food_by_coordinates",
     "open_app",
     "open_url",
+    # 记忆检索（pull）：让 DSH 侧那个 agent 自己决定要不要翻本地历史。
+    # 它跑在独立进程里，靠 memory_index.db 里落库的"当前会话"定位该查哪个会话。
+    "search_memory",
 )
 
 server = MCPServer(SERVER_NAME, version="1.0.0")

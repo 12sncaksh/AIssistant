@@ -4,4 +4,4 @@
 （scripts/build_portable.bat）用 Python 读同一个值来命名 ZIP。
 """
 
-__version__ = "1.102.8"
+__version__ = "0.0.1"

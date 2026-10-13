@@ -9,6 +9,8 @@ import threading
 import time
 from ctypes import wintypes
 
+import thread_registry
+
 
 class InputGuard:
     WH_KEYBOARD_LL = 13
@@ -75,12 +77,12 @@ class InputGuard:
                 cls._mouse_injected_logged = False
                 cls._mouse_callback_seen = False
                 cls._mouse_callback_error_logged = False
-                cls._thread = threading.Thread(
-                    target=cls._hook_thread_main,
+                # 走注册表：长驻钩子线程也需要强引用保活，并在关窗时可见
+                cls._thread = thread_registry.spawn(
+                    cls._hook_thread_main,
                     name="AissistantInputGuard",
-                    daemon=True,
+                    group="input_guard",
                 )
-                cls._thread.start()
             if cls._ready.wait(1.5) and cls._keyboard_hook and cls._mouse_hook:
                 logging.info("键盘钩子注册成功")
                 logging.info("鼠标钩子注册成功")
