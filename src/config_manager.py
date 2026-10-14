@@ -338,16 +338,21 @@ class ConfigManager(CredentialConfigMixin):
         self.settings.setValue("memory_summary_enabled", bool(enabled))
 
     def get_memory_summary_llm_enabled(self):
-        return self._memory_bool("memory_summary_llm_enabled", False)
+        # 默认开：滚动增量摘要的输入只有"旧摘要 + 新增轮次"，成本低，而 LLM 式
+        # 才能产出"话题清单"形态的目录（抽取式只是挑原句）。失败会自动回退本地。
+        return self._memory_bool("memory_summary_llm_enabled", True)
 
     def set_memory_summary_llm_enabled(self, enabled):
         self.settings.setValue("memory_summary_llm_enabled", bool(enabled))
 
     def get_memory_summary_max_chars(self):
-        return self._memory_int("memory_summary_max_chars", 6000, minimum=200)
+        # 摘要是"目录"不是"文章"：1000 字够装 15~20 个话题，且每轮附加的成本可控。
+        return self._memory_int("memory_summary_max_chars", 1000, minimum=200)
 
     def get_memory_summary_refresh_growth(self):
-        return self._memory_int("memory_summary_refresh_growth", 40, minimum=1)
+        # 滚动步长 24 条 = 12 轮，与 DSH 的 seed 窗口（dsh_seed_turns × 2）同宽，
+        # 保证摘要边界紧贴 seed 起点、中间不留缝。
+        return self._memory_int("memory_summary_refresh_growth", 24, minimum=1)
 
     # --- 会话切换：UI 分页 ---
     # 每页 10 条：分页首次绘制只构造 10 个气泡，长会话切换更跟手；

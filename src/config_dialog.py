@@ -193,11 +193,13 @@ class ConfigDialog(QDialog):
             self.llm_summary_checkbox = QCheckBox("允许使用 LLM 生成会话摘要")
             self.llm_summary_checkbox.setChecked(config.get_memory_summary_llm_enabled())
             self.llm_summary_checkbox.setToolTip(
-                "开启后，长期会话摘要刷新时会调用基础模型 API；会产生额外请求和费用。"
-                "关闭、未配置或调用失败时使用本地摘要。"
+                "开启后，会话摘要每滚动更新一次（默认每 12 轮）才调用一次基础模型 API，"
+                "输入只是「旧摘要 + 新增轮次」，成本很低。关闭、未配置或调用失败时使用本地摘要。"
             )
             tools_layout.addRow(self.llm_summary_checkbox)
             self.llm_summary_hint = QLabel(
+                "摘要是一份「话题目录」（默认 1000 字以内），每轮都会附在上下文里，"
+                "让模型知道此前聊过什么；需要细节时它自己用 search_memory 检索。"
                 "仅影响长期记忆摘要，不会发送完整历史；摘要接口失败时自动回退到本地摘要。"
             )
             self.llm_summary_hint.setWordWrap(True)

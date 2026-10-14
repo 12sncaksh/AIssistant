@@ -8,6 +8,7 @@ import threading
 import time
 from dsh_acp_client import DshAcpError, HISTORY_SEED_CHARS, HISTORY_SEED_TURNS, PERMISSION_TIMEOUT_SECONDS, _message_text, _tool_arguments, _tool_title, build_prompt_blocks, get_connection, is_context_overflow_error, is_invalid_session_error
 from memory_retriever import format_memory_block
+from context_builder import SUMMARY_FOOTER, SUMMARY_HEADER
 import recall_intent
 
 
@@ -417,9 +418,9 @@ class DSHSessionThread(QThread):
     def _with_local_context(self, blocks, origin):
         """给本轮 prompt 补上本地背景。
 
-        优先级：用户明确要求完整回顾 > 针对「最早/第一句」的位置型提问 >
-        语义检索到的相关记忆。固定轮次只在新建 DSH 会话时补给，避免和
-        DSH 自己维护的上下文重复。
+        优先级：用户明确要求完整回顾 > 会话长期摘要 > 针对「最早/第一句」的位置型
+        提问 > 语义检索到的相关记忆。固定轮次只在新建/恢复 DSH 会话时补给，避免和
+        DSH 自己维护的上下文重复；摘要是"配置"不是"检索结果"，每轮都附。
         """
         query = self._latest_user_content()
         query_text = query if isinstance(query, str) else ""
@@ -431,6 +432,11 @@ class DSHSessionThread(QThread):
             return [{"type": "text", "text": full_recall}] + blocks
 
         context_blocks = []
+        summary_text = self._summary_block()
+        if summary_text:
+            context_blocks.append({"type": "text", "text": summary_text})
+            self.status_update.emit("已附带会话长期背景摘要")
+
         start_block = self._session_start_block(query_text)
         if start_block:
             context_blocks.append({"type": "text", "text": start_block})
@@ -466,6 +472,43 @@ class DSHSessionThread(QThread):
             if str(text or "").strip():
                 texts.append(text)
         return texts
+
+    def _summary_block(self):
+        """会话摘要：长期背景的「目录」，**每轮都附**。
+
+        它不是检索结果，是配置（和常驻块同理），所以不受 pull/push 那个旋钮影响。
+        中断恢复时它和 seed 天然互补：seed 管最近 12 轮原文，摘要管更早的全部话题，
+        细节交给模型自己 search_memory。摘要本身由 Aissistant 侧滚动维护、落库在
+        data/memory_index.db 里，这里只是消费它。
+
+        rows 取自存储层（store.session_rows，带 id），不是 self.messages：摘要要覆盖
+        的是"这个会话的全部消息"，而 self.messages 只是当前窗口。
+        """
+        if not self._memory_enabled():
+            return ""
+        runtime = self._memory_runtime()
+        if runtime is None:
+            return ""
+        short_id = str(self.session_id or "")[:12]
+        try:
+            rows = runtime.store.session_rows(self.session_id)
+        except Exception:
+            logging.warning("读取会话消息失败，跳过摘要 session=%s", short_id, exc_info=True)
+            return ""
+        try:
+            text = str(runtime.summary_for(self.session_id, rows) or "").strip()
+        except Exception:
+            logging.warning("构建会话摘要失败 session=%s", short_id, exc_info=True)
+            return ""
+        if not text:
+            return ""
+        logging.info(
+            "[memory-inject] path=bridge-summary session=%s summary=%dchars(rows=%d)",
+            short_id,
+            len(text),
+            len(rows or []),
+        )
+        return f"{SUMMARY_HEADER}\n{text}\n{SUMMARY_FOOTER}"
 
     def _memory_block(self, query_text):
         if not self._memory_enabled():
