@@ -43,8 +43,15 @@ DEFAULT_LLM_TIMEOUT = (5, 60)
 # 以前写成 max(256, min(4096, max_chars // 2))，max_chars 一降到 1000 就只剩
 # 500 token —— 带推理链的模型会把预算全花在思维链上，正文一个字都写不出来
 # （和 core_memory 那次 DEFAULT_EXTRACT_MAX_TOKENS 的坑是同一个机理）。
-# 输出长度由下面的 prompt 约束 + summary[:max_chars] 截断来保证，不靠 token 数。
+# 输出长度由 prompt 约束 + 超长打回重写（_condense_summary）来保证，不靠 token 数。
 DEFAULT_SUMMARY_MAX_TOKENS = 40960
+
+# 超长时不打回截断，而是把摘要发回给模型让它自己精简：
+# 盲切不知道该丢哪条话题，模型知道。这一轮**只带摘要本身**（约 1000 字符），
+# 不带原始对话 —— 所以输入很小，而且它只能压缩自己刚写的东西，不会借机重写。
+# 真库实证过：1000 字上限下，第二版摘要正好顶到 1000 并被切在"不打断手上"中间。
+SUMMARY_CONDENSE_RATIO = 0.9
+SUMMARY_CONDENSE_TRIES = 1
 
 DEFAULT_SUMMARY_ENABLED = True
 DEFAULT_SUMMARY_LLM_ENABLED = True
@@ -229,11 +236,6 @@ def build_llm_summary(
     """
     if config is None:
         raise RuntimeError("未提供 LLM 摘要配置")
-    api_key = str(getattr(config, "get_api_key", lambda: "")() or "").strip()
-    base_url = str(getattr(config, "get_base_url", lambda: "")() or "").strip().rstrip("/")
-    model = str(getattr(config, "get_model", lambda: "")() or "").strip()
-    if not api_key or not base_url or not model:
-        raise RuntimeError("LLM 摘要缺少 Base URL、API Key 或模型配置")
 
     previous = str(previous or "").strip()
     rows = list(rows or [])
@@ -251,6 +253,21 @@ def build_llm_summary(
     else:
         prompt += "这是本会话的第一份摘要，请从头整理。\n\n对话记录：\n"
     prompt += "\n".join(lines)
+
+    summary = _request_summary(prompt, config)
+    # 超长不截断：发回给模型自己精简（它知道该合并/删掉哪条），再留一道按行保险。
+    summary = _condense_summary(summary, max_chars, config)
+    return _trim_summary(summary, max_chars)
+
+
+def _request_summary(prompt, config):
+    """发一次摘要请求，返回正文。空正文按失败处理（推理链吃光预算的老坑）。"""
+    api_key = str(getattr(config, "get_api_key", lambda: "")() or "").strip()
+    base_url = str(getattr(config, "get_base_url", lambda: "")() or "").strip().rstrip("/")
+    model = str(getattr(config, "get_model", lambda: "")() or "").strip()
+    if not api_key or not base_url or not model:
+        raise RuntimeError("LLM 摘要缺少 Base URL、API Key 或模型配置")
+
     response = http_client.session().post(
         base_url + "/chat/completions",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
@@ -261,7 +278,7 @@ def build_llm_summary(
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            # 与 max_chars 解耦：预算给足思考空间，输出长度靠 prompt + 下面的截断。
+            # 与 max_chars 解耦：预算给足思考空间，长度靠 prompt + 精简重写来保证。
             "max_tokens": DEFAULT_SUMMARY_MAX_TOKENS,
             "stream": False,
         },
@@ -279,7 +296,55 @@ def build_llm_summary(
     summary = str(summary or "").strip()
     if not summary:
         raise RuntimeError("摘要接口返回空内容")
-    return summary[:int(max_chars)].strip()
+    return summary
+
+
+SUMMARY_CONDENSE_PROMPT = (
+    "你刚生成的摘要共 {length} 个字符，超过了 {limit} 个字符的上限。\n"
+    "请把它精简到 {target} 个字符以内，然后只返回精简后的摘要正文：\n"
+    "1. 必须保留「最初目标」，它是整段对话的锚点。\n"
+    "2. 合并同类话题；删掉细节结论、参数罗列和过程描述，只留可检索的关键词。\n"
+    "3. 不要新增内容，不要输出解释，不要使用 Markdown 代码围栏。\n\n"
+    "上一次的输出：\n{summary}"
+)
+
+
+def _condense_summary(summary, max_chars, config):
+    """超长就把摘要发回给模型自己精简，而不是切在字符中间。
+
+    这一轮只带摘要本身、不带原始对话：输入很小，而且模型没法借机重写一遍，
+    只能压缩自己刚写的东西。重写失败就原样返回，交给 _trim_summary 兜底。
+    """
+    limit = max(1, int(max_chars))
+    target = max(1, int(limit * SUMMARY_CONDENSE_RATIO))
+    for _ in range(SUMMARY_CONDENSE_TRIES):
+        if len(summary) <= limit:
+            break
+        prompt = SUMMARY_CONDENSE_PROMPT.format(
+            length=len(summary), limit=limit, target=target, summary=summary
+        )
+        try:
+            summary = _request_summary(prompt, config)
+        except Exception:
+            logging.warning("摘要精简重写失败，改用按行截断兜底", exc_info=True)
+            break
+    return summary
+
+
+def _trim_summary(summary, max_chars):
+    """最后一道保险：真到这一步就**按行**切，绝不切在半句话中间。
+
+    正常情况下走不到这里 —— 超长已经被"发回给模型精简"接住了。
+    """
+    limit = max(1, int(max_chars))
+    text = str(summary or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rfind("\n")
+    if cut > 0:
+        return head[:cut].strip()
+    return head.strip()
 
 
 class _LlmConfigSnapshot:
