@@ -93,7 +93,11 @@ def add_message(
         self.conversation_history.append({"role": role, "content": history_content})
         if role == "user" or self.session_is_persisted:
             message_id = self.db.save_message(
-                self.current_session_id, role, stored_body, sources=sources
+                self.current_session_id,
+                role,
+                stored_body,
+                sources=sources,
+                stream_log=stream_log if not is_user else None,
             )
             self.session_is_persisted = True
             self._track_history_row(role, stored_body, sources, message_id)
@@ -101,6 +105,25 @@ def add_message(
             memory = getattr(self, "_memory", None)
             if memory is not None:
                 memory.note_message_saved(self.current_session_id)
+
+
+def split_stored_stream_log(content, stream_log):
+    """把库里存的 content 拆成「显示正文」和「折叠日志」。
+
+    存储约定：`content` = 正文 + "\\n\\n" + 过程日志。正文在前，和气泡里的顺序一致
+    （实时是"最终结果在上、折叠块在下"，重载后必须同序，否则会读成"过程话是答复"）。
+
+    所以日志必定是 content 的**后缀**，用 endswith 精确切开，不用猜分隔符。
+
+    对不上就老实全平铺：用户编辑过消息、或者这是加列之前写的老数据。宁可少一个
+    折叠入口，也不能把正文截错。
+    """
+    body = str(content or "")
+    log = str(stream_log or "")
+    if not log or not body.endswith(log):
+        return body, ""
+    head = body[: len(body) - len(log)].rstrip()
+    return (head, log) if head else (body, "")
 
 
 def _latest_user_text(history):
@@ -490,12 +513,14 @@ def on_response_complete(self, full_response, sid=None):
     # 添加最终回复。气泡里只放"最终结果"，被折叠的那几段挂成 stream_log；
     # 而**存储用全量** —— 分开是因为"给人看的"和"给记忆用的"不是一回事：
     # 只存最终结果的话，摘要和 search_memory 永远看不到前面那几段。
+    # 顺序是「正文 + 过程日志」：重载后要跟实时视图同序（答复在上、折叠在下），
+    # 反过来会让人把过程话当成答复读（`split_stored_stream_log` 靠这个后缀约定切开）。
     self.add_message(
         body,
         is_user=False,
         sources=sources,
         stream_log=stream_log or None,
-        store_text=f"{stream_log}\n\n{body}" if stream_log else None,
+        store_text=f"{body}\n\n{stream_log}" if stream_log else None,
     )
     print(f"[DEBUG] AI回复原文: {clean_response}")
 

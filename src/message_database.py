@@ -70,6 +70,11 @@ class MessageDatabase:
                 if "sources" not in existing_columns:
                     cursor.execute("ALTER TABLE messages ADD COLUMN sources TEXT")
                     print("数据库迁移：messages 表已添加 sources 列")
+                if "stream_log" not in existing_columns:
+                    # 折叠用的「完整流式输出」。content 仍然是全量，这一列只是让界面
+                    # 重载后还能把过程那几段折起来；老行是 NULL，按「没有日志」处理。
+                    cursor.execute("ALTER TABLE messages ADD COLUMN stream_log TEXT")
+                    print("数据库迁移：messages 表已添加 stream_log 列")
                 conn.commit()
             print("数据库初始化成功")
         except Exception as exc:
@@ -168,7 +173,7 @@ class MessageDatabase:
         except Exception:
             return []
 
-    def save_message(self, session_id, role, content, is_system=False, sources=None):
+    def save_message(self, session_id, role, content, is_system=False, sources=None, stream_log=None):
         """写入一条消息；返回新消息的自增 id（失败返回 None）。"""
         sources_json = None
         if sources:
@@ -181,20 +186,21 @@ class MessageDatabase:
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("INSERT OR IGNORE INTO sessions(session_id) VALUES (?)", (session_id,))
-                try:
-                    cursor.execute("""
-                        INSERT INTO messages (session_id, role, content, is_system, sources)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (session_id, role, content, 1 if is_system else 0, sources_json))
-                except sqlite3.OperationalError:
-                    # 只有确认 sources 列确实不存在时才回退到 4 列；否则（锁、IO 等）
-                    # 必须上抛，不能静默丢掉 sources JSON。
-                    if self._sources_available(conn):
-                        raise
-                    cursor.execute("""
-                        INSERT INTO messages (session_id, role, content, is_system)
-                        VALUES (?, ?, ?, ?)
-                    """, (session_id, role, content, 1 if is_system else 0))
+                # 按库里**实际存在**的列拼 INSERT：老库可能还没有 sources / stream_log，
+                # 硬写六列会直接报错。列名全部来自本文件的字面量白名单，不拼用户输入。
+                columns = ["session_id", "role", "content", "is_system"]
+                values = [session_id, role, content, 1 if is_system else 0]
+                if self._sources_available(conn):
+                    columns.append("sources")
+                    values.append(sources_json)
+                if self._stream_log_available(conn):
+                    columns.append("stream_log")
+                    values.append(stream_log)
+                cursor.execute(
+                    "INSERT INTO messages (%s) VALUES (%s)"
+                    % (", ".join(columns), ", ".join("?" for _ in columns)),
+                    tuple(values),
+                )
                 message_id = cursor.lastrowid
                 cursor.execute("""
                     UPDATE sessions
@@ -241,6 +247,8 @@ class MessageDatabase:
                     row[1] for row in cursor.execute("PRAGMA table_info(messages)").fetchall()
                 }
                 select_columns = "role, content, sources" if "sources" in columns else "role, content"
+                if "stream_log" in columns:
+                    select_columns += ", stream_log"
                 query = f"""
                     SELECT {select_columns} FROM messages
                     WHERE session_id = ? AND is_system = 0
@@ -253,15 +261,21 @@ class MessageDatabase:
                 rows = cursor.fetchall()
                 query_ms = (time.perf_counter() - query_started) * 1000
                 has_sources = "sources" in columns
+                has_stream_log = "stream_log" in columns
                 decode_started = time.perf_counter()
-                messages = [
-                    {
+                messages = []
+                for row in rows:
+                    index = 2
+                    sources = []
+                    if has_sources:
+                        sources = self._decode_sources(row[index])
+                        index += 1
+                    messages.append({
                         "role": row[0],
                         "content": row[1],
-                        "sources": self._decode_sources(row[2]) if has_sources else [],
-                    }
-                    for row in rows
-                ]
+                        "sources": sources,
+                        "stream_log": row[index] if has_stream_log else None,
+                    })
                 decode_ms = (time.perf_counter() - decode_started) * 1000
                 text_chars = sum(len(str(item.get("content") or "")) for item in messages)
                 logging.info(
@@ -291,19 +305,40 @@ class MessageDatabase:
             self._sources_column = cached
         return cached
 
+    def _stream_log_available(self, conn):
+        """进程内缓存 schema 探测结果（老库可能还没有这一列）。"""
+        cached = getattr(self, "_stream_log_column", None)
+        if cached is None:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+            cached = "stream_log" in columns
+            self._stream_log_column = cached
+        return cached
+
     def _fetch_rows(self, conn, sql, params):
         has_sources = self._sources_available(conn)
-        columns = "id, role, content, sources" if has_sources else "id, role, content"
+        has_stream_log = self._stream_log_available(conn)
+        columns = "id, role, content"
+        if has_sources:
+            columns += ", sources"
+        if has_stream_log:
+            columns += ", stream_log"
         rows = conn.execute(sql.format(columns=columns), params).fetchall()
-        return [
-            {
+        decoded = []
+        for row in rows:
+            index = 3
+            sources = []
+            if has_sources:
+                sources = self._decode_sources(row[index])
+                index += 1
+            stream_log = row[index] if has_stream_log else None
+            decoded.append({
                 "id": int(row[0]),
                 "role": row[1],
                 "content": row[2],
-                "sources": self._decode_sources(row[3]) if has_sources else [],
-            }
-            for row in rows
-        ]
+                "sources": sources,
+                "stream_log": stream_log,
+            })
+        return decoded
 
     def count_session_messages(self, session_id):
         try:

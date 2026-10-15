@@ -7,6 +7,7 @@ from app_prompts import WORLD_CUP_SCOPE_ALIASES
 from chat_markdown import attach_sources_to_text
 from datetime import datetime
 from dsh_acp_client import current_connection
+from message_actions import split_stored_stream_log
 from task_progress_widget import TaskProgressWidget
 from task_state import create_task_state
 from task_state import now_iso_timestamp
@@ -47,11 +48,15 @@ def _create_history_widgets(self, rows, at_top=False):
             sequence = list(reversed(rows)) if at_top else list(rows)
             for row in sequence:
                 sources = row.get("sources") or []
+                # 折叠日志已经落库：正文与过程日志拆开，重载后和实时视图长得一样
+                # （正文在上、折叠在下）。拆不开的老数据就照旧全平铺。
+                body, stream_log = split_stored_stream_log(row["content"], row.get("stream_log"))
                 self.add_message(
-                    row["content"],
+                    body,
                     is_user=(row["role"] == "user"),
                     store=False,
                     sources=sources,
+                    stream_log=stream_log or None,
                     follow=False,
                     insert_at_top=at_top,
                 )
