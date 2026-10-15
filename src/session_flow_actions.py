@@ -335,11 +335,34 @@ def _stop_session_thread(self, session_id):
         pass
 
 
+def _pet_owner_running(self, owner):
+    """桌宠活动状态的「归属会话」是否还有在跑的线程。"""
+    if not owner:
+        return False
+    thread = self.session_threads.get(owner)
+    if thread is None:
+        return False
+    try:
+        return bool(thread.isRunning())
+    except RuntimeError:
+        return False
+
+
 def _finish_background_reply(self, sid, full_response):
-    """后台会话完成：只落库，不动当前界面、桌宠与语音。"""
+    """后台会话完成：只落库，不动当前界面、桌宠与语音。
+
+    例外：桌宠的忙碌状态如果正是这个后台会话点亮的（或者它的占用者早就不在跑了），
+    就得由它熄灭 —— 后台完成走不到 on_response_complete 的清场分支，不在这里释放的话
+    桌宠会永远停在 working。
+    """
     task_state = self.session_task_states.get(sid) or {}
     self._set_session_notice(sid, "completed", task_state.get("current_step") or "已完成")
     self.session_stream.pop(sid, None)
+    pet = getattr(self, "pet_window", None)
+    if pet is not None:
+        owner = getattr(pet, "_activity_owner", None)
+        if owner is None or owner == sid or not _pet_owner_running(self, owner):
+            pet.set_pet_activity("idle", sid=sid)
     _kaomoji, clean = extract_kaomoji_tag(full_response or "")
     clean = self._format_assistant_text(clean)
     body, sources_block = split_reply_and_sources(clean)
@@ -393,9 +416,9 @@ def _on_computer_state(self, state, sid=None):
         return
     if self.pet_window:
         if str(state) in ("waiting_authorization", "waiting_external"):
-            self.pet_window.set_pet_activity("waiting", "等你确认一下…")
+            self.pet_window.set_pet_activity("waiting", "等你确认一下…", sid=sid)
         elif str(state) not in ("finished", "guard_failed"):
-            self.pet_window.set_pet_activity("working")
+            self.pet_window.set_pet_activity("working", sid=sid)
     labels = {
         "waiting_authorization": "等待用户授权视觉键鼠操作…",
         "q_listener_active": "Q 取消监听已启动，AI 正在准备接管…",
@@ -423,19 +446,24 @@ def _on_computer_state(self, state, sid=None):
     self.computer_overlay.show_status(labels.get(state, "AI 正在操作屏幕…"))
 
 
-def _sync_pet_task_activity(self, task_state):
-    """把任务状态映射成桌宠活动反馈，工作期间用气泡播报当前步骤。"""
+def _sync_pet_task_activity(self, task_state, sid=None):
+    """把任务状态映射成桌宠活动反馈，工作期间用气泡播报当前步骤。
+
+    `sid` 会一并传给桌宠，作为这份状态的「归属会话」（谁点亮谁负责熄灭）。
+    """
     if not self.pet_window:
         return
     state = dict(task_state or {})
     status = str(state.get("status") or "")
     step = str(state.get("current_step") or "").strip()
     if status == "executing":
-        self.pet_window.set_pet_activity("working", step or "正在处理…")
+        self.pet_window.set_pet_activity("working", step or "正在处理…", sid=sid)
     elif status == "planning":
-        self.pet_window.set_pet_activity("thinking")
-    elif status == "failed":
-        self.pet_window.set_pet_activity("idle")
+        self.pet_window.set_pet_activity("thinking", sid=sid)
+    elif status in ("completed", "finished", "failed", "idle", ""):
+        # 明确表示「收工」的状态才归位。这里用白名单而不是 else：不认识的 status
+        # 保持原状，免得把正在跑的状态误清成 idle。
+        self.pet_window.set_pet_activity("idle", sid=sid)
 
 
 def _build_world_cup_clarification(self, user_text: str, task_state: dict) -> dict:
@@ -555,6 +583,18 @@ def switch_session(self, session_id):
     discard_ms = (time.perf_counter() - discard_started) * 1000
     self.current_session_id = session_id
     self.current_task_state = self._get_session_task_state(session_id)
+    # 切会话时把桌宠状态重算成「当前会话」的：桌宠只该反映当前窗口，而后台会话留下的
+    # working / thinking 不会自己消失（它的完成通知被会话判断挡在门外了）。
+    if self.pet_window:
+        thread = self.session_threads.get(session_id)
+        try:
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:
+            running = False
+        if running:
+            self._sync_pet_task_activity(self.current_task_state, sid=session_id)
+        else:
+            self.pet_window.set_pet_activity("idle", sid=session_id)
     self.chat_list.clear()
     prompt_started = time.perf_counter()
     self.load_system_prompt()

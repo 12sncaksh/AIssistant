@@ -28,10 +28,13 @@ def _on_pet_page_loaded(self, ok):
     self._install_pet_drag_stage()
     self._install_pet_activity()
     self._install_pet_params()
+    self._install_pet_gaze()
+    self._install_pet_write()
     if not ok:
         return
     QTimer.singleShot(800, self._verify_pet_model)
     QTimer.singleShot(2200, self._verify_pet_model)
+    QTimer.singleShot(2600, self._verify_pet_write)
 
 
 def _verify_pet_model(self):
@@ -266,9 +269,24 @@ def _set_pet_speaking(self, speaking):
         "window.__petSpeaking = %s;" % ("true" if speaking else "false"))
 
 
-def set_pet_activity(self, name, hint=None):
-    """设置桌宠活动反馈：idle / thinking / working / waiting / done。"""
+def _pet_activity_owner_sid(self):
+    """当前会话 id；拿不到就返回 None（表示这份状态不属于任何会话）。"""
+    try:
+        chat = getattr(self, "chat_window", None)
+        return getattr(chat, "current_session_id", None) if chat is not None else None
+    except RuntimeError:
+        return None
+
+
+def set_pet_activity(self, name, hint=None, sid=None):
+    """设置桌宠活动反馈：idle / thinking / working / waiting / done。
+
+    `sid` 是这份状态的**归属会话**：谁点亮的谁负责熄灭。后台会话收工时
+    （session_flow_actions._finish_background_reply）只会释放自己占的那份，
+    不会误伤当前会话正在用的状态。不传 sid 就按当前会话算。
+    """
     name = str(name or "idle").strip() or "idle"
+    self._activity_owner = sid if sid is not None else _pet_activity_owner_sid(self)
     self._activity_done_timer.stop()
     if name != self._activity:
         self._activity = name

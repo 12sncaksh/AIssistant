@@ -39,6 +39,7 @@ class PetInteractionOverlay(QWidget):
         self.webview = webview
         self._right_press_pos = None
         self._right_dragging = False
+        self._left_swallowed = False   # 工作期间左键被回绝，抬起时也别再转发
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
@@ -46,6 +47,16 @@ class PetInteractionOverlay(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # 工作期间不把点击转发给页面：页面会播作者的 TapBody 互动动作
+            # （自拍/番茄酱/开瓶…），那会打断手上的活。改成生气 + 气泡回绝，
+            # 活动状态和写字层都不动 —— 手照写，只是这一下不理你。
+            is_busy = getattr(self.pet_window, "is_pet_busy", None)
+            if is_busy is not None and is_busy():
+                self._left_swallowed = True
+                self.pet_window.refuse_pet_poke()
+                event.accept()
+                return
+            self._left_swallowed = False
             self._forward_mouse_event(event)
             event.accept()
             return
@@ -61,7 +72,8 @@ class PetInteractionOverlay(QWidget):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
-            self._forward_mouse_event(event)
+            # 官方注视通道已停用（改由 pet_gaze.py 的自研层统一驱动），
+            # 这里不再把移动转发给页面，否则官方 LookUpdater 的加算会和自研层叠加。
             event.accept()
             return
 
@@ -74,10 +86,19 @@ class PetInteractionOverlay(QWidget):
             event.accept()
             return
 
+        # 悬停注视不在这里做：窗口外的光标也要跟，所以由 DesktopPetWindow 的
+        # 全局轮询（pet_gaze.py）统一负责。这里只处理按键相关的事件，
+        # 免得同一帧出现两个位置来源互相打架。
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._left_swallowed:
+                # 按下时已经被回绝了，抬起也别转发 —— 免得页面收到一个没有
+                # pointerdown 的 pointerup。
+                self._left_swallowed = False
+                event.accept()
+                return
             self._forward_mouse_event(event)
             event.accept()
             return
@@ -119,6 +140,14 @@ class PetInteractionOverlay(QWidget):
         if not event_type:
             return
 
+        self._push_pet_pointer_ratio(ratio_x, ratio_y, event_type, buttons)
+
+    def _push_pet_pointer_ratio(self, ratio_x, ratio_y, event_type, buttons):
+        """把 0~1 的归一化位置喂给页面。
+
+        页面拿到的是「比例」而不是像素，所以分母由调用方决定：鼠标事件用桌宠
+        窗口，全屏注视轮询（pet_gaze.py）用整块屏幕 —— 同一套协议两用。
+        """
         script = f"""
         (() => {{
             const ratioX = {ratio_x:.8f};

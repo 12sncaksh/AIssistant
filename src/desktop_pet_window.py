@@ -95,6 +95,11 @@ from pet_live2d import (  # noqa: F401
     _install_pet_activity,
     _push_pet_activity,
 )
+from pet_poke import (  # noqa: F401
+    is_pet_busy,
+    refuse_pet_poke,
+    _hide_pet_poke_bubble,
+)
 from pet_drag import (  # noqa: F401
     begin_drag,
     update_drag,
@@ -106,6 +111,17 @@ from pet_drag import (  # noqa: F401
     _log_pet_drag_probe,
     _play_pet_drop_sequence,
     _advance_pet_stage,
+)
+from pet_gaze import (  # noqa: F401
+    install_pet_gaze,
+    _install_pet_gaze,
+    _push_pet_gaze,
+    _tick_pet_gaze,
+)
+from pet_write import (  # noqa: F401
+    _install_pet_write,
+    _verify_pet_write,
+    _on_pet_write_probe,
 )
 from pet_tray import (  # noqa: F401
     _add_pet_menu_entries,
@@ -152,6 +168,7 @@ class DesktopPetWindow(QWidget):
         self._speech_playing = False
         self._tts_speech_active = False
         self._activity = "idle"
+        self._activity_owner = None   # 这份活动状态属于哪个会话（见 set_pet_activity）
         self._activity_done_timer = QTimer(self)
         self._activity_done_timer.setSingleShot(True)
         self._activity_done_timer.timeout.connect(self._pet_activity_done)
@@ -202,6 +219,7 @@ class DesktopPetWindow(QWidget):
 
         self.interaction_overlay = PetInteractionOverlay(self, self.webview)
         self.interaction_overlay.raise_()
+        install_pet_gaze(self)
 
         self._place_default_position()
         self._pet_model_loaded = False
@@ -232,10 +250,12 @@ class DesktopPetWindow(QWidget):
     def hideEvent(self, event):
         self._bubble_was_visible = self.speech_bubble.isVisible()
         self.speech_bubble.hide()
+        self._gaze_timer.stop()
         super().hideEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._gaze_timer.start()
         should_restore = (
             self._bubble_was_visible
             and (
@@ -301,6 +321,9 @@ DesktopPetWindow._hide_activity_hint = _hide_activity_hint
 DesktopPetWindow._clear_activity_hint = _clear_activity_hint
 DesktopPetWindow._install_pet_activity = _install_pet_activity
 DesktopPetWindow._push_pet_activity = _push_pet_activity
+DesktopPetWindow.is_pet_busy = is_pet_busy
+DesktopPetWindow.refuse_pet_poke = refuse_pet_poke
+DesktopPetWindow._hide_pet_poke_bubble = _hide_pet_poke_bubble
 DesktopPetWindow.begin_drag = begin_drag
 DesktopPetWindow.update_drag = update_drag
 DesktopPetWindow.end_drag = end_drag
@@ -311,6 +334,12 @@ DesktopPetWindow._probe_pet_drag_stage = _probe_pet_drag_stage
 DesktopPetWindow._log_pet_drag_probe = _log_pet_drag_probe
 DesktopPetWindow._play_pet_drop_sequence = _play_pet_drop_sequence
 DesktopPetWindow._advance_pet_stage = _advance_pet_stage
+DesktopPetWindow._install_pet_gaze = _install_pet_gaze
+DesktopPetWindow._push_pet_gaze = _push_pet_gaze
+DesktopPetWindow._tick_pet_gaze = _tick_pet_gaze
+DesktopPetWindow._install_pet_write = _install_pet_write
+DesktopPetWindow._verify_pet_write = _verify_pet_write
+DesktopPetWindow._on_pet_write_probe = _on_pet_write_probe
 DesktopPetWindow._add_pet_menu_entries = _add_pet_menu_entries
 DesktopPetWindow.show_context_menu = show_context_menu
 DesktopPetWindow.restart_application = restart_application

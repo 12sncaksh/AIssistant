@@ -30,9 +30,18 @@ PET_DRAG_STAGE_SCRIPT = r"""
 
   const PROP_PARTS = { Part18: 1, Part21: 1, Part35: 1, Part109: 1, Part123: 1, Part122: 1, Part5: 1, Part121: 1, Part119: 1, Part120: 1, Part4: 1, Part22: 1, Part114: 1, Part6: 1, Part107: 1, Part106: 1, Part110: 1, Part43: 1, Part10: 1, Part15: 1, Part37: 1, Part112: 1, Part124: 1, Part127: 1, Part129: 1, Part130: 1, Part128: 1, ABXY: 1, M: 1 };
 
-  const NEUTRAL = { ParamAngleZ: 0, ParamBodyAngleZ: 0, ParamAngleX: 0, ParamAngleY: 0, ParamEyeLOpen: 1, ParamEyeROpen: 1, ParamEyeBallX: 0, ParamEyeBallY: 0, ParamBrowLForm: 0, ParamBrowRForm: 0, ParamCheek77: 0, ParamCheek22: 0, ParamCheek20: 0, ParamMouthForm: -0.5, ParamMouthOpenY: 0 };
-  const POSE_HOLD = Object.assign({}, NEUTRAL, { ParamEyeLOpen: 0.55, ParamEyeROpen: 0.55, ParamEyeBallX: 0.1, ParamEyeBallY: 0.6, ParamBrowLForm: 1, ParamBrowRForm: 1, ParamCheek77: 1, ParamMouthForm: -0.6, ParamMouthOpenY: 0.3 });
-  const POSE_FALL = Object.assign({}, NEUTRAL, { ParamEyeLOpen: 0, ParamEyeROpen: 0, ParamBrowLForm: -1, ParamBrowRForm: -1, ParamCheek22: 1, ParamMouthForm: -1.5, ParamMouthOpenY: 1 });
+  // ParamCheek75 = 「感叹号」贴图、ParamCheek18 = 「吐魂」贴图
+  // （感叹号.exp3.json / 吐魂.exp3.json 各自都只改这一个参数）。
+  // 两个都必须放进 NEUTRAL 才会进 PARAM_ORDER，被 writePose 每帧绝对写入：
+  // 框架每帧 loadParameters() 会还原参数，没被逐帧写入的会瞬间弹回去，符号会一闪一闪。
+  // 没有这些参数的模型（如 Mao）会在 writePose 里因 index < 0 被跳过，不会报错。
+  const NEUTRAL = { ParamAngleZ: 0, ParamBodyAngleZ: 0, ParamAngleX: 0, ParamAngleY: 0, ParamEyeLOpen: 1, ParamEyeROpen: 1, ParamEyeBallX: 0, ParamEyeBallY: 0, ParamBrowLForm: 0, ParamBrowRForm: 0, ParamCheek77: 0, ParamCheek22: 0, ParamCheek20: 0, ParamCheek75: 0, ParamCheek18: 0, ParamMouthForm: -0.5, ParamMouthOpenY: 0 };
+  // 被拎起来与拖拽中都挂「！」；drag 阶段由 POSE_HOLD 派生，改这里即可同时生效。
+  // 松手走 POSE_FALL（继承 NEUTRAL 的 0），所以落地即收。
+  const POSE_HOLD = Object.assign({}, NEUTRAL, { ParamEyeLOpen: 0.55, ParamEyeROpen: 0.55, ParamEyeBallX: 0.1, ParamEyeBallY: 0.6, ParamBrowLForm: 1, ParamBrowRForm: 1, ParamCheek77: 1, ParamCheek75: 1, ParamMouthForm: -0.6, ParamMouthOpenY: 0.3 });
+  // 松手瞬间「吐魂」就出来，整个坠落阶段（450ms）都吐着；
+  // 爬起来时 recover 会从 POSE_FALL 插值回 NEUTRAL，魂便随起身过程慢慢收回。
+  const POSE_FALL = Object.assign({}, NEUTRAL, { ParamEyeLOpen: 0, ParamEyeROpen: 0, ParamBrowLForm: -1, ParamBrowRForm: -1, ParamCheek22: 1, ParamCheek18: 1, ParamMouthForm: -1.5, ParamMouthOpenY: 1 });
   const PARAM_ORDER = Object.keys(NEUTRAL);
 
   const IDLE_MS = 140;
@@ -214,6 +223,10 @@ PET_DRAG_STAGE_SCRIPT = r"""
     }
     window.__petActivityPre && window.__petActivityPre(model, dt);
     window.__petParamPre && window.__petParamPre(model, dt);
+    // 写字层排在注视层之前：它会给 headExtra 补一个「低头」的 y，而注视层是
+    // 唯一真正把 headExtra 写进 ParamAngleY 的地方，得让它读到最新值。
+    window.__petWritePre && window.__petWritePre(model, dt);
+    window.__petGazePre && window.__petGazePre(model, dt);
     } catch (err) { stageError("pre", err); }
   };
 
@@ -285,7 +298,11 @@ PET_ACTIVITY_SCRIPT = r"""
   // 点击桌宠不再暂停动作层：原生 TapBody 动作与眼神/问号轻微叠加可以接受
 
   const PARAM_IDS = ["ParamEyeBallX", "ParamEyeBallY", "ParamEyeLOpen", "ParamEyeROpen",
-                     "ParamBrowLForm", "ParamBrowRForm", "ParamCheek74", "ParamCheek16"];
+                     "ParamBrowLForm", "ParamBrowRForm", "ParamCheek74", "ParamCheek16",
+                     // ParamCheek75 = 「感叹号」贴图，用于 done 的完成反馈。
+                     // 拖拽演出也在用同一张贴图，但两边阶段互斥（拖拽时本层整体让位），
+                     // 且 idle 阶段拖拽脚本不写任何参数，所以不会打架。
+                     "ParamCheek75"];
   let indexModel = null;
   let indexMap = null;
 
@@ -304,7 +321,7 @@ PET_ACTIVITY_SCRIPT = r"""
     return current + (target - current) * Math.min(1, dt * rate);
   }
 
-  const eased = { eyeX: 0, eyeY: 0, brow: 0, question: 0, star: 0, squint: 0 };
+  const eased = { eyeX: 0, eyeY: 0, brow: 0, question: 0, star: 0, squint: 0, exclaim: 0 };
   let lastTick = performance.now();
 
   function write(model, map, id, value) {
@@ -329,19 +346,32 @@ PET_ACTIVITY_SCRIPT = r"""
       eyeX: thinking ? -0.5 : 0,
       eyeY: thinking ? 0.6 : 0,
       brow: (thinking || done) ? 0.6 : 0,
-      question: ((thinking && (now % 3200) < 1100) || (working && (now % 2800) < 900)) ? 1 : 0,
+      // 思考与工作期间都常驻。旧值 (now % 3200) < 1100 是「亮 1.1s / 灭 2.1s」的闪烁，
+      // 看起来就像刚冒出来就没了；工作状态闪 1.6s 也让人觉得符号时有时无。
+      question: (thinking || working) ? 1 : 0,
       star: done ? 1 : 0,
+      // 完成反馈：星星眼 + 感叹号一起挂（同一个 done 窗口 2.5s）
+      exclaim: done ? 1 : 0,
       squint: working ? 1 : 0
     };
+
+    // 摇头晃脑改走头部参数（只动头，桌子和道具不跟着转），单位是度。
+    // 头部参数必须只有一个写入者，所以这里只登记偏移，由注视层统一相加。
+    if (working) {
+      window.__petHeadExtra = { x: Math.sin(now / 240) * 5.5, z: Math.sin(now / 340) * 3 };
+    } else if (window.__petHeadExtra) {
+      window.__petHeadExtra = null;
+    }
     eased.eyeX = approach(eased.eyeX, wanted.eyeX, dt, 5);
     eased.eyeY = approach(eased.eyeY, wanted.eyeY, dt, 5);
     eased.brow = approach(eased.brow, wanted.brow, dt, 5);
     eased.question = approach(eased.question, wanted.question, dt, 6);
     eased.star = approach(eased.star, wanted.star, dt, 8);
+    eased.exclaim = approach(eased.exclaim, wanted.exclaim, dt, 8);
     eased.squint = approach(eased.squint, wanted.squint, dt, 5);
 
     const total = Math.abs(eased.eyeX) + Math.abs(eased.eyeY) + eased.brow
-      + eased.question + eased.star + eased.squint;
+      + eased.question + eased.star + eased.exclaim + eased.squint;
     if (total < 0.004) { return; }
 
     const map = indexes(model);
@@ -351,6 +381,7 @@ PET_ACTIVITY_SCRIPT = r"""
     write(model, map, "ParamBrowRForm", eased.brow);
     write(model, map, "ParamCheek74", eased.question);
     write(model, map, "ParamCheek16", eased.star);
+    write(model, map, "ParamCheek75", eased.exclaim);
     if (eased.squint > 0.004) {
       const factor = 1 - 0.22 * eased.squint;
       const eyeIds = ["ParamEyeLOpen", "ParamEyeROpen"];
@@ -370,11 +401,12 @@ PET_ACTIVITY_SCRIPT = r"""
     const phase = (window.__petStage && window.__petStage.phase) || "idle";
     const name = phase === "idle" ? state.name : "idle";
     const elapsed = (now - state.at) / 1000;
+    // 注意：working/waiting 不再走整身摇摆 —— 那会把桌子和道具一起转，
+    // 改为通过 __petHeadExtra 只动头（见 __petActivityPre）。
+    // 这条 canvas transform 通道留给以后的多媒体监听（跟音乐律动）。
     let pose = null;
     if (name === "thinking") {
       pose = { lift: -1.5, rot: -2.4 + Math.sin(now / 900) * 1.1, scaleY: 1 };
-    } else if (name === "working" || name === "waiting") {
-      pose = { lift: Math.abs(Math.sin(now / 300)) * 6, rot: Math.sin(now / 650) * 1.5, scaleY: 1 };
     } else if (name === "done" && elapsed < 1.6) {
       const decay = Math.pow(1 - Math.min(1, elapsed / 1.6), 2);
       pose = {
@@ -848,7 +880,10 @@ PET_PARAM_SCRIPT = r"""
     if (phase !== "idle") { return; }
     // 状态仲裁：工作/思考/等待时活动层独占，瞬时情绪让位（除非正在说话）
     const activity = (window.__petActivityState && window.__petActivityState.name) || "idle";
-    if (!speaking && (activity === "thinking" || activity === "working" || activity === "waiting")) {
+    // 例外：工作期间被点击的「生气」是交互反馈，必须看得见。由 pet_poke.py 开一个
+    // 限时窗口（__petPokeUntil），窗口内让情绪层照常写参数与回落。
+    const pokeForce = Number(window.__petPokeUntil || 0) > performance.now();
+    if (!speaking && !pokeForce && (activity === "thinking" || activity === "working" || activity === "waiting")) {
       return;
     }
     const now = performance.now();
