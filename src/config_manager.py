@@ -457,12 +457,17 @@ class ConfigManager(CredentialConfigMixin):
         return str(prompt) if prompt is not None else ""
 
     def get_system_prompt_mode(self):
-        """返回 default、custom 或 none，并兼容旧版 QSettings。"""
+        """返回 default、custom 或 none，并兼容旧版 QSettings。
+
+        `none` 现在的意思是"**不附加角色卡和用户提示词**"——硬规则（工具/安全规则）
+        任何模式都会下发，`none` 也关不掉。
+        """
         mode = str(self.settings.value("system_prompt_mode", "") or "").strip().lower()
         if mode in {"default", "custom", "none"}:
             return mode
         if self.settings.contains("custom_system_prompt"):
-            return "custom" if self.get_custom_system_prompt().strip() else "none"
+            # 键存在但是空串 = 用户写过又清空了 = default，不是 none。
+            return "custom" if self.get_custom_system_prompt().strip() else "default"
         return "default"
 
     def has_custom_system_prompt(self):
@@ -472,24 +477,36 @@ class ConfigManager(CredentialConfigMixin):
         return self.get_system_prompt_mode() == "none"
 
     def get_system_prompt(self):
-        mode = self.get_system_prompt_mode()
-        if mode == "none":
-            return ""
-        if mode == "custom":
+        """**用户自己写的那一段**（不含角色卡，也不含硬规则）。
+
+        以前它在 default 模式下会返回出厂的小柚文本 —— 那是"系统提示词是一整块"
+        时代的遗留。现在提示词是分层的：角色卡由角色卡对话框管、硬规则写死在代码里，
+        这里只该返回用户手写的那段。
+        """
+        if self.get_system_prompt_mode() == "custom":
             return self.get_custom_system_prompt()
-        return self.get_legacy_system_prompt()
+        return ""
 
     def set_system_prompt(self, prompt):
+        """写入用户手写的那段。清空 = 回到 default（**不是** none）。
+
+        这里以前把空串写成 `none`，也就是"不用系统提示词"。现在 `none` 只剩
+        "不附加角色卡和用户提示词"的意思，而硬规则永远在 —— 清空一个附加框，
+        不该顺手把角色卡一起关掉。
+        """
         prompt = str(prompt or "")
         if prompt.strip():
             self.settings.setValue("custom_system_prompt", prompt)
             self.settings.setValue("system_prompt_mode", "custom")
         else:
-            self.settings.setValue("custom_system_prompt", "")
-            self.settings.setValue("system_prompt_mode", "none")
+            self.settings.remove("custom_system_prompt")
+            self.settings.setValue("system_prompt_mode", "default")
 
     def reset_system_prompt(self):
-        """恢复动态默认提示词。"""
+        """清空**用户自己写的那段**附加提示词。
+
+        不是"恢复内置提示词"—— 角色卡和硬规则本来就在，而且删不掉。
+        """
         self.settings.remove("custom_system_prompt")
         self.settings.setValue("system_prompt_mode", "default")
 

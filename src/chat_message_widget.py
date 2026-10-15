@@ -48,6 +48,9 @@ class ChatMessageWidget(QWidget):
     BUBBLE_HORIZONTAL_PADDING = 20
     BUBBLE_VERTICAL_PADDING = 12
     HEIGHT_SAFETY = 4
+    # 展开完整流式输出时的气泡高度上限（像素），超出走内部滚动 ——
+    # 不然一个几千字的日志能把整个会话列表撑成几千像素高。
+    EXPANDED_STREAM_MAX_HEIGHT = 520
     avatar_clicked = pyqtSignal()
 
     def __init__(
@@ -66,6 +69,7 @@ class ChatMessageWidget(QWidget):
         font_size=10,
         code_font_family="Consolas",
         code_font_size=10,
+        stream_log=None,
     ):
         super().__init__(parent)
         self.is_user = is_user
@@ -76,6 +80,10 @@ class ChatMessageWidget(QWidget):
         self.code_color = normalize_hex_color(code_color, DEFAULT_CODE_BLOCK_COLOR)
         self._bubble_text_color = contrast_text_color(self.bubble_color)
         self.sources = sources or []
+        # 完整流式输出（本轮 DSH 发过的所有段）。默认收起、只显示最终结果；
+        # 点气泡底部那行链接才展开 —— 入口走 _on_anchor_clicked，不新增控件。
+        self.stream_log = str(stream_log or "")
+        self._stream_expanded = False
         self.avatar_path = avatar_path or get_default_avatar_path("user" if is_user else "assistant")
         self.render_markdown = bool(render_markdown)
         self.font_family = font_family
@@ -191,11 +199,18 @@ class ChatMessageWidget(QWidget):
             self.avatar_label.setStyleSheet("")
             self.avatar_label.setPixmap(circular)
 
+    def _display_text(self):
+        """当前该显示哪一段：收起时是最终结果，展开时是完整流式输出。"""
+        if self.stream_log and self._stream_expanded:
+            return self.stream_log
+        return self._text
+
     def set_text(self, text):
         self._text = text
         self._code_blocks = []
-        if self.sources or self.render_markdown:
-            self.message_text.setHtml(self._build_html(text, self.sources))
+        # 有流式日志时也走 HTML —— 底部那行"展开/收起"必须是可点的链接。
+        if self.sources or self.render_markdown or self.stream_log:
+            self.message_text.setHtml(self._build_html(self._display_text(), self.sources))
         else:
             self.message_text.setPlainText(text)
             # setPlainText 不经过富文本引擎，默认样式表的行距不生效，这里补块级行距。
@@ -241,11 +256,37 @@ class ChatMessageWidget(QWidget):
                     f"<div style='font-size: 12px;'><a href='{url}' style='color: #1a73e8; "
                     f"text-decoration: none;'>[{index}] {title}</a></div>"
                 )
+        if self.stream_log:
+            parts.append(self._build_stream_toggle())
         return "".join(parts)
+
+    def _build_stream_toggle(self):
+        """气泡底部的展开/收起入口。
+
+        用链接而不是真按钮：气泡的高度是按文档排版结果算的（_sync_bubble_geometry），
+        塞一个真控件进去要连带重做那套几何计算，代价和风险都不划算。
+        收起时把开头 24 个字露出来 —— 有些回合"第一段才是答案、最后一段只是收尾"，
+        光写"完整流式输出"用户不会想到去点。
+        """
+        if self._stream_expanded:
+            label = "收起完整流式输出"
+        else:
+            head = " ".join(self.stream_log.split())[:24]
+            label = f"完整流式输出（{len(self.stream_log)} 字）· {head}… · 点击展开"
+        return (
+            "<div style='margin-top: 8px; padding-top: 6px; border-top: 1px solid #DDDDDD; "
+            "font-size: 12px;'>"
+            "<a href='stream-log:toggle' style='color: #1a73e8; text-decoration: none;'>"
+            f"{html.escape(label)}</a></div>"
+        )
 
     def _on_anchor_clicked(self, url):
         if url.scheme() in {"http", "https"}:
             webbrowser.open(url.toString())
+            return
+        if url.scheme() == "stream-log":
+            self._stream_expanded = not self._stream_expanded
+            self.set_text(self._text)
             return
         if url.scheme() != "codex-copy":
             return
@@ -267,7 +308,7 @@ class ChatMessageWidget(QWidget):
         viewport_width = list_widget.viewport().width() if list_widget else -1
         if not force and viewport_width == self._last_layout_viewport_width:
             return
-        target_width = self._calculate_bubble_width(self._text)
+        target_width = self._calculate_bubble_width(self._display_text())
         content_width = max(40, target_width - self.BUBBLE_HORIZONTAL_PADDING)
         self.message_text.setFixedWidth(target_width)
         doc = self.message_text.document()
@@ -275,7 +316,15 @@ class ChatMessageWidget(QWidget):
         # 先按最终宽度完成排版，再读取布局后的实际高度；浮点高度向上取整，避免末行或圆角被列表项裁掉。
         doc_height = math.ceil(doc.documentLayout().documentSize().height())
         total_height = doc_height + self.BUBBLE_VERTICAL_PADDING + self.HEIGHT_SAFETY
-        self.message_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if (
+            self.stream_log
+            and self._stream_expanded
+            and total_height > self.EXPANDED_STREAM_MAX_HEIGHT
+        ):
+            total_height = self.EXPANDED_STREAM_MAX_HEIGHT
+            self.message_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.message_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.message_text.setFixedHeight(total_height)
         self._last_layout_viewport_width = viewport_width
 

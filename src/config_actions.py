@@ -64,12 +64,14 @@ def show_config_dialog(self):
 
 
 def show_prompt_dialog(self):
+    # 可编辑的是**用户自己写的那段**，不是整个 runtime_system_prompt ——
+    # 角色卡和硬规则在界面里只读展示，改它们要去角色卡对话框或代码里。
     dialog = ConfigDialog(
         self.config,
         self,
-        self.runtime_system_prompt,
+        self.config.get_custom_system_prompt(),
         section="prompt",
-        default_system_prompt_text=self._get_default_system_prompt(),
+        builtin_system_prompt_text=self._get_default_system_prompt(),
     )
     if dialog.exec() == QDialog.DialogCode.Accepted:
         self.runtime_system_prompt = self._get_effective_system_prompt()

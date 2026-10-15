@@ -59,7 +59,7 @@ class ConfigDialog(QDialog):
     voices_loaded = pyqtSignal(list)   # 信号用于传递声音列表
     embedding_probe_finished = pyqtSignal(bool, str)  # (是否可用, 说明文字)
 
-    def __init__(self, config, parent=None, system_prompt_text=None, section="config", default_system_prompt_text=None):
+    def __init__(self, config, parent=None, system_prompt_text=None, section="config", builtin_system_prompt_text=None):
         super().__init__(parent)
         self.config = config
         self.section = section
@@ -250,21 +250,44 @@ class ConfigDialog(QDialog):
             self._apply_dsh_bridge_state(self.dsh_bridge_checkbox.isChecked())
 
         elif section == "prompt":
-            displayed_system_prompt = system_prompt_text if system_prompt_text is not None else config.get_system_prompt()
-            self.initial_system_prompt_text = str(displayed_system_prompt or "")
-            self.default_system_prompt_text = str(
-                default_system_prompt_text if default_system_prompt_text is not None else config.get_system_prompt() or ""
+            # 这一页分两块：上面**只读**的内置部分（角色卡 + 工具/安全规则），
+            # 下面**可编辑**的附加提示词。分开的理由是所有权：
+            # 内置部分由程序维护、用户删不掉；附加提示词是用户自己的，随便写。
+            self.initial_system_prompt_text = str(
+                (
+                    system_prompt_text
+                    if system_prompt_text is not None
+                    else config.get_system_prompt()
+                )
+                or ""
             )
+            self.builtin_system_prompt_text = str(builtin_system_prompt_text or "")
             self._prompt_reset_requested = False
+
+            layout.addRow(QLabel("内置部分（角色卡 + 工具/安全规则；只读，程序维护）:"))
+            self.builtin_prompt_view = QTextEdit()
+            self.builtin_prompt_view.setPlainText(self.builtin_system_prompt_text)
+            self.builtin_prompt_view.setReadOnly(True)
+            self.builtin_prompt_view.setMinimumHeight(200)
+            layout.addRow(self.builtin_prompt_view)
+
+            layout.addRow(QLabel("附加提示词（可编辑；插在角色卡之后、工具规则之前）:"))
             self.system_prompt_edit = QTextEdit()
             self.system_prompt_edit.setPlainText(self.initial_system_prompt_text)
-            self.system_prompt_edit.setMinimumHeight(260)
-            self.system_prompt_edit.setPlaceholderText("留空表示不使用系统提示词；点击“恢复默认提示词”可启用内置提示词")
+            self.system_prompt_edit.setMinimumHeight(160)
+            self.system_prompt_edit.setPlaceholderText(
+                "留空即可。这里适合放这一段时间的临时情境 —— 例如角色扮演的剧本、"
+                "本次合作的特别约定。长期偏好请写进「常驻块 → 用户自定义」。"
+            )
             self.system_prompt_edit.textChanged.connect(self._on_prompt_text_changed)
-            layout.addRow("系统提示词:", self.system_prompt_edit)
-            self.restore_prompt_button = QPushButton("恢复默认提示词")
+            layout.addRow(self.system_prompt_edit)
+
+            self.restore_prompt_button = QPushButton("清空附加提示词")
             self.restore_prompt_button.clicked.connect(self._restore_default_system_prompt)
             layout.addRow("", self.restore_prompt_button)
+            layout.addRow(
+                QLabel("清空它不影响角色卡和上面的内置规则 —— 那些每一轮都会下发，删不掉。")
+            )
 
         elif section == "voice":
             self._secret_initial_values = {
@@ -520,9 +543,13 @@ class ConfigDialog(QDialog):
         self._prompt_reset_requested = False
 
     def _restore_default_system_prompt(self):
+        """清空附加提示词。
+
+        不是"恢复内置提示词"—— 内置部分本来就在，而且删不掉，没有"恢复"这回事。
+        """
         self._prompt_reset_requested = True
         self.system_prompt_edit.blockSignals(True)
-        self.system_prompt_edit.setPlainText(self.default_system_prompt_text)
+        self.system_prompt_edit.setPlainText("")
         self.system_prompt_edit.blockSignals(False)
 
 
@@ -567,7 +594,8 @@ class ConfigDialog(QDialog):
             self._save_dsh_selection()
         elif self.section == "prompt":
             current_prompt = self.system_prompt_edit.toPlainText()
-            if self._prompt_reset_requested:
+            if self._prompt_reset_requested or not current_prompt.strip():
+                # 清空 → default（角色卡 + 硬规则仍在），**不是** none。
                 self.config.reset_system_prompt()
             elif current_prompt != self.initial_system_prompt_text:
                 self.config.set_system_prompt(current_prompt)

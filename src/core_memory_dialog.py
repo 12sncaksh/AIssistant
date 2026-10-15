@@ -33,13 +33,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core_memory import FIELD_ORDER, FIELD_TITLES, format_core_block, get_core_memory
+from core_memory import (
+    FIELD_ORDER,
+    FIELD_TAB_TITLES,
+    UNLIMITED_BUDGET,
+    format_core_block,
+    get_core_memory,
+)
 
 SUPERSEDED_COLOR = "#999999"
 
 
 class CoreMemoryDialog(QDialog):
-    """列出三个字段的条目，支持新增 / 改写 / 标失效，并预览实际注入的内容。"""
+    """列出四个字段的条目，支持新增 / 改写 / 标失效，并预览实际注入的内容。"""
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -52,6 +58,8 @@ class CoreMemoryDialog(QDialog):
         hint = QLabel(
             "常驻块在每一次提问前都会注入，且**不经过任何相关性打分** —— "
             "没有任何阈值能挡住写歪的一条。\n"
+            "「用户自定义」是你手写的：程序永不改写、永不淘汰，也不限制长度。"
+            "「模型提炼」由后台滚动维护（合并重复 + 淘汰过时），默认上限 600 字符。\n"
             "「改写」和「标失效」都会保留原文、来源与时间（不删除），方便事后追溯。"
         )
         hint.setWordWrap(True)
@@ -62,7 +70,7 @@ class CoreMemoryDialog(QDialog):
         self.lists = {}
         self.budget_labels = {}
         for field in FIELD_ORDER:
-            self.tabs.addTab(self._build_field_page(field), FIELD_TITLES.get(field, field))
+            self.tabs.addTab(self._build_field_page(field), FIELD_TAB_TITLES.get(field, field))
         root.addWidget(self.tabs, 1)
 
         root.addWidget(QLabel("实际注入的内容："))
@@ -145,9 +153,15 @@ class CoreMemoryDialog(QDialog):
                 if not active:
                     entry.setForeground(QColor(SUPERSEDED_COLOR))
                 listing.addItem(entry)
-            self.budget_labels[field].setText(
-                f"生效中 {used} / {store.field_budget(field)} 字符（超出部分注入时会被截断）"
-            )
+            budget = store.field_budget(field)
+            if budget == UNLIMITED_BUDGET:
+                self.budget_labels[field].setText(
+                    f"生效中 {used} 字符（不限制长度，写多少注入多少）"
+                )
+            else:
+                self.budget_labels[field].setText(
+                    f"生效中 {used} / {budget} 字符（超出会在下次提炼时合并压缩）"
+                )
         try:
             self.preview.setPlainText(format_core_block(store) or "")
         except Exception as error:
@@ -169,8 +183,13 @@ class CoreMemoryDialog(QDialog):
         if not ok or not str(text or "").strip():
             return
         # source_session 记成 manual：一眼能看出这条是人写的、不是提炼来的。
-        if self._store().add_item(field, text, source_session="manual", confidence=1.0) is None:
-            QMessageBox.warning(self, "没写进去", "内容为空、字段不合法，或超长被截没了。")
+        # locked=True：**人写的条目优先级最高** —— 模型提炼出来的猜测不该有权覆盖或淘汰它，
+        # 条目内部也不截断（用户写的话不该被程序砍掉半句）。
+        written = self._store().add_item(
+            field, text, source_session="manual", confidence=1.0, locked=True
+        )
+        if written is None:
+            QMessageBox.warning(self, "没写进去", "内容为空或字段不合法。")
         self._reload()
 
     def _edit(self, field):
@@ -187,11 +206,18 @@ class CoreMemoryDialog(QDialog):
         if not ok or not str(text or "").strip() or str(text).strip() == old_text.strip():
             return
         store = self._store()
-        new_item = store.add_item(field, text, source_session="manual", confidence=1.0)
+        new_item = store.add_item(
+            field, text, source_session="manual", confidence=1.0, locked=True
+        )
         if new_item and str(new_item.get("id")) != str(item.get("id")):
             # 老条目留着（不删），只是不再注入 —— 审计线索比省几十字符值钱。
+            # allow_locked=True：这是**用户自己**在改自己的条目，不是模型在覆盖它。
             store.supersede_item(
-                field, item.get("id"), new_item_id=new_item.get("id"), reason="manual-edit"
+                field,
+                item.get("id"),
+                new_item_id=new_item.get("id"),
+                reason="manual-edit",
+                allow_locked=True,
             )
         self._reload()
 
@@ -208,7 +234,10 @@ class CoreMemoryDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self._store().supersede_item(field, item.get("id"), reason="manual-retire")
+        # allow_locked=True：用户手动标失效，包括标自己的手写条目。
+        self._store().supersede_item(
+            field, item.get("id"), reason="manual-retire", allow_locked=True
+        )
         self._reload()
 
 

@@ -12,12 +12,12 @@ from text_protocol import sanitize_reply_text
 
 
 
-def _generate_dynamic_system_prompt(self):
-    """生成以工具调用为核心的系统提示词。"""
-    apps_list = ActionHandler.get_available_apps()
-    apps_str = "、".join(apps_list) if apps_list else "无"
+def _role_prompt(self):
+    """角色卡层：角色是谁 + 表达风格 + 颜文字格式。
 
-    # 角色基本设定
+    和硬规则分开，是因为**所有权不同**：这一段由用户在角色卡对话框里编辑，
+    硬规则写在代码里、用户看不见也删不掉。
+    """
     roleplay_mode = self.config.get_roleplay_mode()
     if roleplay_mode:
         expression_rule = (
@@ -25,7 +25,6 @@ def _generate_dynamic_system_prompt(self):
             "禁止使用 Markdown、列表、标题、表格和代码块等复杂排版格式。"
             "你可以自然地在对话里称呼用户，但称呼不要过于频繁，保持自然即可。"
         )
-        final_format_rule = "最终答复使用自然的中文纯文本，不要输出 Markdown 格式符号。"
     else:
         expression_rule = (
             "回答保持自然、清楚，不要暴露自己是模型。"
@@ -33,20 +32,43 @@ def _generate_dynamic_system_prompt(self):
             "但不要为了排版而堆砌标题、列表或表格。"
             "你可以自然地在对话里称呼用户，但称呼不要过于频繁，保持自然即可。"
         )
-        final_format_rule = (
-            "最终答复可按需使用 Markdown、表格或带语言名称的围栏代码块，"
-            "代码内容不得声称已经执行，除非确实调用过工具。"
-        )
     role_description = self.roles.get(
         self.current_role_name,
         "你是一个AI助手，性格友好，乐于助人。",
     ) + "\n\n" + expression_rule
-    prompt = role_description + """
+    # 用户提示词里可以指定临时情境（扮演剧本之类）。没有这一句，角色卡的"必须长期保持"
+    # 会把它直接压死 —— 而用户想要的恰恰是"不破坏本角色的前提下玩一局扮演"。
+    role_description += (
+        "\n用户在提示词里明确指定的临时情境或扮演设定除外："
+        "此时保留本角色的自称与语气风格，情境按其指定执行。"
+    )
+    return role_description + """
     【颜文字输出】
     所有的颜文字，应当使用以下格式输出：<kaomoji>标签</kaomoji>
     例如：“今天的阳光真好呀，心情都变好了～ <kaomoji>(｡•̀ᴗ•́｡)</kaomoji>”
     """
-    prompt += f"""
+
+
+def _hard_rules_prompt(self):
+    """硬规则层：工具规则 + 桌宠规则 + 安全规则。**写在代码里，用户删不掉。**
+
+    以前这些和角色卡一起拼进"动态提示词"，而动态提示词只在 default 模式生效 ——
+    用户一旦自定义提示词，安全规则 13 条就整段消失。`app_prompts.py` 的注释里写着
+    "自定义或关闭模式不会自动追加"，是明知故犯。于是"硬规则"一点都不硬：
+    随手清空提示词框，它们就全没了。
+
+    现在这一层**任何模式都追加**，`none` 最多只能关掉角色卡和用户提示词。
+    """
+    apps_list = ActionHandler.get_available_apps()
+    apps_str = "、".join(apps_list) if apps_list else "无"
+    if self.config.get_roleplay_mode():
+        final_format_rule = "最终答复使用自然的中文纯文本，不要输出 Markdown 格式符号。"
+    else:
+        final_format_rule = (
+            "最终答复可按需使用 Markdown、表格或带语言名称的围栏代码块，"
+            "代码内容不得声称已经执行，除非确实调用过工具。"
+        )
+    prompt = f"""
 
     【工具使用规则】
     - 你可以通过系统提供的工具执行真实操作或联网查询，不要伪造已经执行过的结果。
@@ -74,7 +96,21 @@ def _generate_dynamic_system_prompt(self):
     - 需要更精细或模型专属的表现时，可用 set_live2d_param 直接设置参数；不确定参数名时先用 list_live2d_params 查询当前模型支持的参数，数值越界会被自动裁剪，到期后表情会自动回落。
     - 这些工具只影响桌宠外观，不会修改系统；不要因为调用它们而在回复里解释技术细节，保持自然即可。
     """
-    return prompt
+    return prompt.strip() + "\n\n" + SYSTEM_SAFETY_RULES
+
+
+def _builtin_system_prompt(self):
+    """程序自带的两层：角色卡 + 硬规则。不含用户自己写的那段。
+
+    **注意这里是模块内直接调用，不走 `self.`**：main.py 只把旧名字挂到 MainWindow 上，
+    `self._role_prompt` 在实例上根本不存在。
+    """
+    return _role_prompt(self) + "\n\n" + _hard_rules_prompt(self)
+
+
+def _generate_dynamic_system_prompt(self):
+    """旧名字保留：main.py 会把它挂到 MainWindow 上，改名会打断那条挂载。"""
+    return _builtin_system_prompt(self)
 
 
 def _format_assistant_text(self, text):
@@ -84,7 +120,8 @@ def _format_assistant_text(self, text):
 
 
 def _get_default_system_prompt(self):
-    return self._generate_dynamic_system_prompt() + "\n\n" + SYSTEM_SAFETY_RULES
+    """旧名字保留（同上）。现在它等于「内置部分」，不再含用户自己写的那段。"""
+    return _builtin_system_prompt(self)
 
 
 def _get_permission_mode_notice(self):
@@ -98,21 +135,26 @@ def _get_permission_mode_notice(self):
 
 
 def _get_effective_system_prompt(self):
+    """最终下发的系统提示词 = 角色卡 → 用户提示词 → 硬规则 → 权限提示。
+
+    顺序是有意的：
+      · 角色卡在前、用户提示词紧随其后 —— 用户想演一局别的，改写对象就是紧邻的那段；
+      · 硬规则压在最后，**任何模式都追加**，用户删不掉。
+
+    旧行为是"自定义模式直接用用户文本，安全规则整段不追加"，所以清空提示词框
+    等于把安全规则一起关掉 —— 那正是"硬规则一点都不硬"的来源。
+    """
     mode = self.config.get_system_prompt_mode()
-    if mode == "none":
-        return ""
-    if mode == "custom":
-        prompt = self.config.get_custom_system_prompt()
-    else:
-        prompt = self._get_default_system_prompt()
+    parts = []
+    if mode != "none":
+        parts.append(_role_prompt(self))
+        if mode == "custom":
+            parts.append(self.config.get_custom_system_prompt())
+    parts.append(_hard_rules_prompt(self))
     notice = self._get_permission_mode_notice()
-    if not notice:
-        return prompt
-    if not str(prompt or "").strip():
-        return notice
-    if notice in prompt:
-        return prompt
-    return prompt.rstrip() + "\n\n" + notice
+    if notice:
+        parts.append(notice)
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
 
 def _build_system_prompt_messages(self):

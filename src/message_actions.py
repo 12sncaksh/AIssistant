@@ -20,7 +20,7 @@ import logging
 
 
 
-def _create_message_widget(self, message, is_user, sources=None):
+def _create_message_widget(self, message, is_user, sources=None, stream_log=None):
     """构建一个消息气泡控件（不加入列表），供正常追加与历史置顶复用。"""
     display_text = self._compact_user_message(message) if is_user else message
     avatar_path = self.config.get_avatar_path("user" if is_user else "assistant")
@@ -39,6 +39,7 @@ def _create_message_widget(self, message, is_user, sources=None):
         font_size=self.chat_font_size,
         code_font_family=self.code_font_family,
         code_font_size=self.code_font_size,
+        stream_log=stream_log,
     )
     widget.avatar_clicked.connect(self.show_avatar_dialog)
     item = QListWidgetItem()
@@ -68,12 +69,14 @@ def add_message(
     sources=None,
     follow=True,
     insert_at_top=False,
+    stream_log=None,
+    store_text=None,
 ):
     # 发消息必然想看到回复；助手消息只在「本来就在底部」时才继续跟随，
     # 用户正在翻历史时不抢他的位置（生成结束时占位气泡换成正式回复属于前者）。
     if is_user or self._is_chat_at_bottom():
         self._set_auto_follow_output(True)
-    item, widget = self._create_message_widget(message, is_user, sources)
+    item, widget = self._create_message_widget(message, is_user, sources, stream_log=stream_log)
     if insert_at_top:
         self.chat_list.insertItem(0, item)
     else:
@@ -84,12 +87,16 @@ def add_message(
         self._follow_latest_output()
     if store:
         role = "user" if is_user else "assistant"
-        history_content = message if is_user else attach_sources_to_text(message, sources)
+        # 显示的和存的不一定是同一份：气泡里放"最终结果"，存储放全量。
+        stored_body = store_text if (store_text and not is_user) else message
+        history_content = stored_body if is_user else attach_sources_to_text(stored_body, sources)
         self.conversation_history.append({"role": role, "content": history_content})
         if role == "user" or self.session_is_persisted:
-            message_id = self.db.save_message(self.current_session_id, role, message, sources=sources)
+            message_id = self.db.save_message(
+                self.current_session_id, role, stored_body, sources=sources
+            )
             self.session_is_persisted = True
-            self._track_history_row(role, message, sources, message_id)
+            self._track_history_row(role, stored_body, sources, message_id)
             self.refresh_session_list()
             memory = getattr(self, "_memory", None)
             if memory is not None:
@@ -387,6 +394,9 @@ def _stop_generation(self):
 def on_generation_stopped(self, sid=None):
     sid = sid or self.current_session_id
     self._set_session_notice(sid, "")
+    # 先取再 pop：桥接路径的内容全在 process 里（stream_chunk 只在兜底时才发），
+    # 只看 stream_display_buffer 的话，中途停止会把整轮已经生成的内容丢掉。
+    stopped_state = self.session_stream.get(sid) or {}
     self.session_stream.pop(sid, None)
     if sid != self.current_session_id:
         return
@@ -394,7 +404,11 @@ def on_generation_stopped(self, sid=None):
         self.pet_window.clear_pending_expression()
         self.pet_window.set_pet_activity("idle")
     stopped_thread = self.current_api_thread
-    partial = (self.stream_display_buffer + self.chat_stream_filter.feed("", final=True)).strip()
+    partial = (
+        (stopped_state.get("process") or "")
+        + self.stream_display_buffer
+        + self.chat_stream_filter.feed("", final=True)
+    ).strip()
     if self.pet_window:
         self.pet_window.finish_speech_stream(
             partial,
@@ -445,6 +459,14 @@ def on_response_complete(self, full_response, sid=None):
 
     clean_response = self._format_assistant_text(clean_response)
     final_reply = clean_response
+
+    # 2. 本轮被折叠起来的那几段（DSH 一个回合可能发多条 agent message）。
+    #    过滤必须放在**存储之前**：折叠只是收起，用户点开就看得见 ——
+    #    内部推理不能靠"折起来"兜底，那是硬规则。
+    stream_log = str(task_state.get("stream_log") or "").strip()
+    if stream_log:
+        _, stream_log = extract_kaomoji_tag(stream_log)
+        stream_log = self._format_assistant_text(stream_log).strip()
     body, sources_block = split_reply_and_sources(final_reply)
     sources = parse_sources_block(sources_block)
     spoken_reply = markdown_to_plain_text(body)
@@ -465,8 +487,16 @@ def on_response_complete(self, full_response, sid=None):
     self.chat_list.takeItem(row)
     self.placeholder_item = None
 
-    # 添加最终回复
-    self.add_message(body, is_user=False, sources=sources)
+    # 添加最终回复。气泡里只放"最终结果"，被折叠的那几段挂成 stream_log；
+    # 而**存储用全量** —— 分开是因为"给人看的"和"给记忆用的"不是一回事：
+    # 只存最终结果的话，摘要和 search_memory 永远看不到前面那几段。
+    self.add_message(
+        body,
+        is_user=False,
+        sources=sources,
+        stream_log=stream_log or None,
+        store_text=f"{stream_log}\n\n{body}" if stream_log else None,
+    )
     print(f"[DEBUG] AI回复原文: {clean_response}")
 
     # 更新颜文字：优先使用 AI 输出的标签
