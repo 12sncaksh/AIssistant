@@ -12,7 +12,7 @@
   （push）」之间一键切换，见「长期记忆」一节
 - MCP（Model Context Protocol）扩展：支持 stdio 本地 server 与远程 HTTP/SSE server，工具自动并入工具表；
   程序自身的系统/电源/桌宠能力也以自带 MCP server 的形式提供
-- 语音：sherpa-onnx 唤醒「小柚」、讯飞语音听写、edge-tts 语音回复
+- 语音：sherpa-onnx 唤醒「小柚小柚」、讯飞语音听写、edge-tts 语音回复
 - Live2D 桌宠：无边框置顶、拖拽、系统托盘、模型切换、大模型可调的表情/参数层
 - 聊天界面：用户与 AI 全局头像更换、Markdown 排版、代码块复制；可通过“视图 → 聊天外观...”统一设置背景、气泡配色与透明度、代码块配色与字体、聊天正文字体
 - 电脑管家：健康体检、磁盘只读扫描
@@ -119,10 +119,10 @@ curl -L -o kws.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/k
 tar xf kws.tar.bz2
 ```
 
-`keywords.txt` 是 sherpa-onnx 的关键词格式（拼音音素 + `@显示词`），唤醒词「小柚」是：
+`keywords.txt` 是 sherpa-onnx 的关键词格式（拼音音素 + `@显示词`），唤醒词「小柚小柚」是：
 
 ```text
-x iǎo y òu @小柚
+x iǎo y òu x iǎo y òu @小柚小柚
 ```
 
 要改唤醒词，先写 `keywords_raw.txt`（每行 `中文 @中文`），再用 sherpa-onnx 的转换工具生成：

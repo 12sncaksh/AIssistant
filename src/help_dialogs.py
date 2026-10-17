@@ -13,7 +13,7 @@ def show_speech_config_help(self):
         "语音听写使用讯飞开放平台「语音听写（流式版）」接口。\n\n"
         "在「设置 → 语音」中填写讯飞配置，或直接在 config/auth.json 中填写：\n"
         "  xfyun_appid\n  xfyun_api_key\n  xfyun_api_secret\n\n"
-        "点击输入框旁的 🎤 开始语音对话；喊「小柚」可唤醒或取消录音。",
+        "点击输入框旁的 🎤 开始语音对话；喊「小柚小柚」可唤醒或取消录音。",
     )
 
 

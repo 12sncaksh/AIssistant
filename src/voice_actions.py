@@ -26,7 +26,7 @@ def _start_wakeword_listener(self):
 
 
 def _on_wakeword_detected(self):
-    # 录音中再喊「小柚」= 取消本次录音
+    # 录音中再喊「小柚小柚」= 取消本次录音
     if self.stt_thread and self.stt_thread.isRunning():
         self.stt_thread.cancel()
         self.status_bar.showMessage("已取消本次录音", 3000)
@@ -104,13 +104,13 @@ def _start_voice_input(self):
     self.stt_thread.recording_started.connect(self._on_stt_started)
     self.wakeword_thread.set_listener(audio_queue)
     self.mic_btn.setText("\u23FA 聆听中…")
-    self.status_bar.showMessage("聆听中…（再喊「小柚」可取消）", 0)
+    self.status_bar.showMessage("聆听中…（再喊「小柚小柚」可取消）", 0)
     self.stt_thread.start()
 
 
 def _on_stt_started(self):
     self.mic_btn.setText("\u23FA 聆听中…")
-    self.status_bar.showMessage("聆听中…（再喊「小柚」可取消）", 0)
+    self.status_bar.showMessage("聆听中…（再喊「小柚小柚」可取消）", 0)
 
 
 def _on_stt_partial(self, text):
