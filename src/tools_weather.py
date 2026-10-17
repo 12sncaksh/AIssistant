@@ -5,7 +5,7 @@ import http_client
 
 
 
-def _city_to_adcode(city, api_key):
+def _city_to_adcode(cls, city, api_key):
     # 将城市名转换为高德 adcode：先地理编码，失败则查内置城市表。
     try:
         geo_url = f"https://restapi.amap.com/v3/geocode/geo?address={city}&output=json&key={api_key}"
@@ -19,7 +19,7 @@ def _city_to_adcode(city, api_key):
     return cls._CITY_ADCODE.get(key, "")
 
 
-def _get_weather(city):
+def _get_weather(cls, city):
     import requests
     api_key = cls._get_amap_api_key()
     if not api_key:
@@ -46,7 +46,7 @@ def _get_weather(city):
         return False, f"查询天气出错：{str(e)}"
 
 
-def _get_forecast(city, days=4):
+def _get_forecast(cls, city, days=4):
     import requests
     api_key = cls._get_amap_api_key()
     if not api_key:
@@ -80,7 +80,7 @@ def _get_forecast(city, days=4):
         return False, f"查询预报出错：{str(e)}"
 
 
-def _geocode(address):
+def _geocode(cls, address):
     """调用高德地理编码API，返回 (经度, 纬度)"""
     api_key = cls._get_amap_api_key()
     if not api_key:
@@ -117,7 +117,7 @@ def _format_duration(seconds):
         return f"{minutes}分钟"
 
 
-def _get_route(origin, destination, mode="drive"):
+def _get_route(cls, origin, destination, mode="drive"):
     import requests
     api_key = cls._get_amap_api_key()
     if not api_key:

@@ -14,6 +14,13 @@ from __future__ import annotations
 import inspect
 import json
 import os
+
+# 限制 OpenBLAS 线程数，必须在任何会 import numpy 的模块（action_control / memory_*）之前设置：
+# numpy 默认按 CPU 核心数（本机 20）预留线程缓冲，实测每个进程多占约 610MB 提交内存
+# （private 641MB → 31MB），本项目的 numpy 只用于向量打分，单线程足够。
+# 放在这里而不是只放启动脚本里，是为了让被其它外壳（如 DSH）拉起的 server 也生效。
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import sys
 from typing import Annotated, Any, Literal
 

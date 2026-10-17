@@ -7,6 +7,15 @@ import os
 import psutil
 import sys
 
+# 这几个名字原先在 action_control 的模块命名空间里（那里 star-import 了 pynvml）。
+# _get_gpu_status / _get_system_status / _get_health_check 搬到本模块后必须自带，
+# 否则运行期会 NameError: name 'NVML_AVAILABLE' is not defined。
+try:
+    from pynvml import *
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
+
 
 
 def _lock_screen():
@@ -76,7 +85,7 @@ def _get_gpu_status():
         return "未检测到 NVIDIA GPU 或驱动异常。"
 
 
-def _get_system_status():
+def _get_system_status(cls):
     """返回包含 CPU、内存、磁盘、GPU 的完整性能信息"""
     try:
         # CPU 型号
@@ -152,7 +161,7 @@ def _get_startup_items():
     return unique
 
 
-def _get_health_check():
+def _get_health_check(cls):
     """电脑体检：汇总 CPU/内存/磁盘/GPU/网络/开机启动项/电量，返回可读报告。"""
     lines = []
     try:

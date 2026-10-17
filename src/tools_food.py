@@ -5,7 +5,7 @@ import http_client
 
 
 
-def _search_food(city=None, keyword="美食", limit=5, location=None, radius=2000):
+def _search_food(cls, city=None, keyword="美食", limit=5, location=None, radius=2000):
     """
     搜索美食餐厅（支持城市级或周边搜索）
     :param city: 城市名（可选，如果传了 location 可以不传城市，但最好仍传城市作为 fallback）

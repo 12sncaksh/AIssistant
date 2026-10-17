@@ -10,7 +10,7 @@ import http_client
 
 
 
-def _search_web(query: str, max_results: int = 5, user_intent: str | None = None) -> dict[str, Any]:
+def _search_web(cls, query: str, max_results: int = 5, user_intent: str | None = None) -> dict[str, Any]:
     """联网搜索：Tavily Search 优先（结果自带正文），SearXNG 兜底补充，合并去重后统一打分排序。"""
     effective_query, search_profile = cls._optimize_search_query(query, user_intent=user_intent)
     sports_mode = search_profile["sports_mode"]
@@ -126,6 +126,7 @@ def _search_web(query: str, max_results: int = 5, user_intent: str | None = None
 
 
 def _search_searxng_results(
+    cls,
     query: str,
     max_results: int = 5,
     sports_mode: bool = False,
@@ -166,7 +167,7 @@ def _search_searxng_results(
     return results
 
 
-def _optimize_search_query(query: str, user_intent: str | None = None) -> tuple[str, dict[str, Any]]:
+def _optimize_search_query(cls, query: str, user_intent: str | None = None) -> tuple[str, dict[str, Any]]:
     normalized_query = " ".join(str(query or "").split())
     normalized_intent = " ".join(str(user_intent or "").split())
 
@@ -301,7 +302,7 @@ def _extract_query_keywords(query: str) -> list[str]:
     return keywords
 
 
-def _score_search_result(item: dict[str, Any], query: str, sports_mode: bool = False, latest_mode: bool = False) -> int:
+def _score_search_result(cls, item: dict[str, Any], query: str, sports_mode: bool = False, latest_mode: bool = False) -> int:
     title = str(item.get("title", "")).lower()
     content = str(item.get("content", "")).lower()
     url = str(item.get("url", "")).lower()
@@ -355,6 +356,7 @@ def _score_search_result(item: dict[str, Any], query: str, sports_mode: bool = F
 
 
 def _rerank_search_results(
+    cls,
     results: list[dict[str, Any]],
     query: str,
     sports_mode: bool = False,

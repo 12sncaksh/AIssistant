@@ -92,7 +92,7 @@ def _speedtest():
     return "所有测速服务器均无法连接，请检查网络或稍后重试"
 
 
-def _network_info():
+def _network_info(cls):
     """组合网络信息：内网IP、公网IP、MAC地址"""
     local_ip = cls._get_local_ip()
     public_ip = cls._get_public_ip()

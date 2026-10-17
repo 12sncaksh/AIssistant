@@ -7,7 +7,7 @@ import http_client
 
 
 
-def _get_tavily_api_key() -> str:
+def _get_tavily_api_key(cls) -> str:
     configured = cls._search_config.get("tavily_api_key", "").strip()
     if configured:
         return configured
@@ -18,7 +18,7 @@ def _get_tavily_api_key() -> str:
     return cls._auth_config.get("tavily_api_key", "").strip()
 
 
-def _tavily_search(query: str, max_results: int = 8, search_depth: str = "advanced") -> tuple[list[dict[str, Any]], str]:
+def _tavily_search(cls, query: str, max_results: int = 8, search_depth: str = "advanced") -> tuple[list[dict[str, Any]], str]:
     """Tavily Search：高质量联网检索，结果自带正文片段，作为搜索主源。失败返回空列表和原因。"""
     api_key = cls._get_tavily_api_key()
     if not api_key:
@@ -50,7 +50,7 @@ def _tavily_search(query: str, max_results: int = 8, search_depth: str = "advanc
     return results, ""
 
 
-def _tavily_extract(urls: list[str], query: str) -> tuple[dict[str, str], str]:
+def _tavily_extract(cls, urls: list[str], query: str) -> tuple[dict[str, str], str]:
     api_key = cls._get_tavily_api_key()
     if not api_key:
         return {}, "未配置 Tavily API Key，已回退为 SearXNG 摘要。"
@@ -132,7 +132,7 @@ def _fetch_page_text(url: str, timeout: int = 10, max_chars: int = 3000) -> str:
         return ""
 
 
-def _direct_fetch_pages(urls: list[str], max_chars: int = 1200) -> tuple[dict[str, str], str]:
+def _direct_fetch_pages(cls, urls: list[str], max_chars: int = 1200) -> tuple[dict[str, str], str]:
     """Tavily 不可用时的免费兜底：直接抓取前几条链接正文。"""
     if not urls:
         return {}, "没有可抓取的网址。"

@@ -29,7 +29,7 @@ def _confirm_continue_waiting(cls, command, elapsed, timeout):
         return False
 
 
-def _run_command(command: str, timeout: int = COMMAND_TIMEOUT_SECONDS, cwd: str | None = None):
+def _run_command(cls, command: str, timeout: int = COMMAND_TIMEOUT_SECONDS, cwd: str | None = None):
     """执行 PowerShell 命令，返回 (成功, 消息, 数据)。带超时和输出截断。
 
     破坏性命令黑名单在任何权限模式下都生效：这些命令正常干活基本用不到，只会用来搞破坏，
