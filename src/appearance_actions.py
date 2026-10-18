@@ -226,6 +226,7 @@ def _read_chat_appearance_state(self):
         "bubble_assistant_color": self.bubble_assistant_color,
         "bubble_opacity": self.bubble_opacity,
         "background_opacity": self.background_opacity,
+        "composer_opacity": self.composer_opacity,
         "code_block_color": self.code_block_color,
         "code_opacity": self.code_opacity,
         "chat_font_family": self.chat_font_family,
@@ -253,6 +254,7 @@ def _apply_chat_appearance_state(self, values):
     )
     self.code_opacity = clamp_opacity(values.get("code_opacity"), 0.85)
     self.background_opacity = clamp_opacity(values.get("background_opacity"), 1.0)
+    self.composer_opacity = clamp_opacity(values.get("composer_opacity"), 0.92)
     self.chat_font_family = str(
         values.get("chat_font_family") or "Microsoft YaHei UI"
     )
@@ -269,6 +271,7 @@ def _apply_chat_appearance_state(self, values):
     self.update_all_bubbles_opacity(self.bubble_opacity)
     self.update_all_code_opacity(self.code_opacity)
     self.update_all_text_font_widgets()
+    self._apply_ui_theme()
 
 
 def preview_chat_appearance(self, values):
@@ -284,6 +287,7 @@ def _save_chat_appearance_state(self, values):
     self.config.set_code_opacity(self.code_opacity)
     self.config.set_chat_background_mode(self.chat_background_mode)
     self.config.set_chat_background_opacity(self.background_opacity)
+    self.config.set_composer_opacity(self.composer_opacity)
     self.config.set_chat_font(QFont(self.chat_font_family, self.chat_font_size))
     self.config.set_code_font(QFont(self.code_font_family, self.code_font_size))
     background_path = str(values.get("background_path") or "")

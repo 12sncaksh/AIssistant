@@ -295,7 +295,7 @@ class SimpleFontDialog(QDialog):
 
 
 class ChatAppearanceDialog(QDialog):
-    """统一预览并保存聊天背景、气泡、代码块和字体外观。"""
+    """统一预览并保存聊天背景、气泡、输入框底、代码块和字体外观。"""
 
     BACKGROUND_MODES = (
         ("fill", "填充（保持比例，可能裁剪）"),
@@ -320,6 +320,7 @@ class ChatAppearanceDialog(QDialog):
 
         root.addWidget(self._build_background_group())
         root.addWidget(self._build_bubble_group())
+        root.addWidget(self._build_composer_group())
         root.addWidget(self._build_code_group())
         root.addWidget(self._build_text_group())
 
@@ -410,6 +411,25 @@ class ChatAppearanceDialog(QDialog):
             self._on_bubble_opacity_changed
         )
         form.addRow("气泡透明度", bubble_opacity_row)
+        return group
+
+    def _build_composer_group(self):
+        group = QGroupBox("输入框")
+        form = QFormLayout(group)
+
+        self.composer_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.composer_opacity_slider.setRange(0, 100)
+        self.composer_opacity_slider.setValue(
+            round(self.values["composer_opacity"] * 100)
+        )
+        self.composer_opacity_label = QLabel(f'{self.values["composer_opacity"]:.2f}')
+        composer_opacity_row = QHBoxLayout()
+        composer_opacity_row.addWidget(self.composer_opacity_slider, 1)
+        composer_opacity_row.addWidget(self.composer_opacity_label)
+        self.composer_opacity_slider.valueChanged.connect(
+            self._on_composer_opacity_changed
+        )
+        form.addRow("输入框底透明度", composer_opacity_row)
         return group
 
     def _build_code_group(self):
@@ -548,6 +568,13 @@ class ChatAppearanceDialog(QDialog):
     def _on_code_opacity_changed(self, value):
         self.values["code_opacity"] = value / 100.0
         self.code_opacity_label.setText(f'{self.values["code_opacity"]:.2f}')
+        self._preview()
+
+    def _on_composer_opacity_changed(self, value):
+        self.values["composer_opacity"] = value / 100.0
+        self.composer_opacity_label.setText(
+            f'{self.values["composer_opacity"]:.2f}'
+        )
         self._preview()
 
     def _choose_font(self, kind, title):

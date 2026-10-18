@@ -8,6 +8,7 @@ from app_theme import build_scrollbar_stylesheet
 from app_theme import build_ui_palette
 from app_theme import get_ui_theme_palette
 from app_theme import normalize_ui_theme
+from chat_style import color_to_rgba
 
 
 
@@ -76,6 +77,9 @@ def _apply_ui_theme(self):
         "#contentPanel { border: 1px solid %s; border-radius: 16px; background: transparent; }"
         % palette["content_border"]
     )
+    # 输入框底透明度：首次从配置读入，之后由「聊天外观」的实时预览改写
+    if not hasattr(self, "composer_opacity"):
+        self.composer_opacity = self.config.get_composer_opacity()
     self.composer.setStyleSheet(
         "#composer { background: %s; border: 1px solid %s; border-radius: 12px; }"
         "QTextEdit { background: transparent; border: none; color: %s; "
@@ -86,7 +90,7 @@ def _apply_ui_theme(self):
         "QComboBox { background: %s; color: %s; border: 1px solid %s; "
         "border-radius: 5px; padding: 4px 8px; }"
         % (
-            palette["composer_bg"],
+            color_to_rgba(palette["composer_base"], self.composer_opacity),
             palette["composer_border"],
             palette["composer_text"],
             palette["placeholder"],

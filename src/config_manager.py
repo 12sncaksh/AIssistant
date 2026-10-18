@@ -557,6 +557,13 @@ class ConfigManager(CredentialConfigMixin):
     def set_code_opacity(self, value):
         self.settings.setValue("code_opacity", clamp_opacity(value))
 
+    # --- 输入框底  ---
+    def get_composer_opacity(self):
+        return clamp_opacity(self.settings.value("composer_opacity", 0.92))
+
+    def set_composer_opacity(self, value):
+        self.settings.setValue("composer_opacity", clamp_opacity(value))
+
     def get_bubble_user_color(self):
         return normalize_hex_color(
             self.settings.value("bubble_user_color", DEFAULT_BUBBLE_USER_COLOR),
