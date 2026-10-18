@@ -29,6 +29,8 @@ def _on_pet_page_loaded(self, ok):
     self._install_pet_activity()
     self._install_pet_params()
     self._install_pet_gaze()
+    self._install_pet_motion()
+    self._install_pet_music()
     self._install_pet_write()
     if not ok:
         return

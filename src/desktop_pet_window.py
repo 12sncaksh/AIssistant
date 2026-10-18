@@ -118,6 +118,14 @@ from pet_gaze import (  # noqa: F401
     _push_pet_gaze,
     _tick_pet_gaze,
 )
+from pet_motion import (  # noqa: F401
+    _install_pet_motion,
+)
+from pet_music import (  # noqa: F401
+    install_pet_music,
+    _install_pet_music,
+    _on_pet_music_level,
+)
 from pet_write import (  # noqa: F401
     _install_pet_write,
     _verify_pet_write,
@@ -220,6 +228,7 @@ class DesktopPetWindow(QWidget):
         self.interaction_overlay = PetInteractionOverlay(self, self.webview)
         self.interaction_overlay.raise_()
         install_pet_gaze(self)
+        install_pet_music(self)
 
         self._place_default_position()
         self._pet_model_loaded = False
@@ -235,6 +244,7 @@ class DesktopPetWindow(QWidget):
             event.ignore()
             return
         self.speech_bubble.close()
+        self._music_reader.stop()
         event.accept()
 
     def resizeEvent(self, event):
@@ -337,6 +347,10 @@ DesktopPetWindow._advance_pet_stage = _advance_pet_stage
 DesktopPetWindow._install_pet_gaze = _install_pet_gaze
 DesktopPetWindow._push_pet_gaze = _push_pet_gaze
 DesktopPetWindow._tick_pet_gaze = _tick_pet_gaze
+DesktopPetWindow._install_pet_motion = _install_pet_motion
+DesktopPetWindow.install_pet_music = install_pet_music
+DesktopPetWindow._install_pet_music = _install_pet_music
+DesktopPetWindow._on_pet_music_level = _on_pet_music_level
 DesktopPetWindow._install_pet_write = _install_pet_write
 DesktopPetWindow._verify_pet_write = _verify_pet_write
 DesktopPetWindow._on_pet_write_probe = _on_pet_write_probe

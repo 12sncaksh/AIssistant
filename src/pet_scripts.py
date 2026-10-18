@@ -66,6 +66,8 @@ PET_DRAG_STAGE_SCRIPT = r"""
     mouth.jitter = clamp(Number(jitter) || 0, 0, 1);
     mouth.at = performance.now();
   };
+  // 口型状态也挂出去：音乐律动层（pet_music.py）靠它判断「在说话」，好让位。
+  window.__petMouthState = mouth;
   let fadeModel = null;
   let fadeList = null;
   let propK = 1;
@@ -126,11 +128,20 @@ PET_DRAG_STAGE_SCRIPT = r"""
     }
   }
 
+  // 点击互动（框架的 TapBody 动作）不在这里处理。框架的动作一旦起播就停不下来 ——
+  // 队列挂在 LAppModel 上，而帧钩子拿到的是 CubismModel；bundle 里也没有任何全局入口。
+  // 所以改成整个接管：拦掉框架的 onTap + 自己按 motion3.json 播曲线，见 pet_motion.py。
+  // 这里只管拖拽演出，以及它之后的各层。
+
   window.__petStageProbe = function () {
     const model = paramModel;
     const map = paramIndex;
     const info = { hook: true, phase: stage.phase, err: window.__petStageErr || null, index: {}, value: {}, mouth: { open: mouth.open, jitter: mouth.jitter, age: performance.now() - mouth.at } };
     if (!model || !map) { info.model = false; return info; }
+    // 点击互动层（pet_motion.py）的状态：曲线加载好了没、正在播哪个、拖拽有没有把它停掉。
+    info.motion = window.__petMotionProbe ? window.__petMotionProbe() : { missing: true };
+    // 音乐律动层（pet_music.py）：哪道闸门挡着、包络多大、正在响的是谁。
+    info.music = window.__petMusicProbe ? window.__petMusicProbe() : { missing: true };
     const keys = ["ParamEyeLOpen", "ParamCheek77", "ParamMouthOpenY", "ParamAngleZ", "ParamBodyAngleZ"];
     for (let i = 0; i < keys.length; i++) {
       const index = map[keys[i]];
@@ -144,7 +155,14 @@ PET_DRAG_STAGE_SCRIPT = r"""
     const now = performance.now();
     dt = clamp((now - lastTick) / 1000, 0.001, 0.05);
     lastTick = now;
-    if (stage.phase !== lastPhase) { lastPhase = stage.phase; phaseAt = now; }
+    // 点击互动层：框架那一份已经被 pet_motion.py 拦掉（松手坐标丢画布外），这里只驱动我们
+    // 自己播的那条线。它会在阶段离开 idle 的第一帧把自己停掉 —— 所以拖拽一进入，道具和姿势
+    // 立刻回落到框架的基线：没有藏着的动作，也没有优先级死窗口。
+    window.__petMotionPre && window.__petMotionPre(model, dt);
+    if (stage.phase !== lastPhase) {
+      lastPhase = stage.phase;
+      phaseAt = now;
+    }
     if (now - stage.at > IDLE_MS) {
       stage.vx *= 0.82;
       stage.vy *= 0.82;
@@ -227,6 +245,8 @@ PET_DRAG_STAGE_SCRIPT = r"""
     // 唯一真正把 headExtra 写进 ParamAngleY 的地方，得让它读到最新值。
     window.__petWritePre && window.__petWritePre(model, dt);
     window.__petGazePre && window.__petGazePre(model, dt);
+    // 音乐律动层放最后：它也是加算（见 pet_music.py），跟注视层自然叠在一起。
+    window.__petMusicPre && window.__petMusicPre(model, dt);
     } catch (err) { stageError("pre", err); }
   };
 
@@ -294,8 +314,6 @@ PET_ACTIVITY_SCRIPT = r"""
     state.name = next;
     state.at = performance.now();
   };
-
-  // 点击桌宠不再暂停动作层：原生 TapBody 动作与眼神/问号轻微叠加可以接受
 
   const PARAM_IDS = ["ParamEyeBallX", "ParamEyeBallY", "ParamEyeLOpen", "ParamEyeROpen",
                      "ParamBrowLForm", "ParamBrowRForm", "ParamCheek74", "ParamCheek16",
