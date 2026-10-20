@@ -28,6 +28,7 @@ from memory_embeddings import StaticEmbeddingConfig
 import asyncio
 import edge_tts
 import thread_registry
+import voice_setup
 
 from permission_modes import DEFAULT_PERMISSION_MODE, FULL_ACCESS_MODE, PERMISSION_MODE_CHOICES, PERMISSION_MODE_DESCRIPTIONS, READ_ONLY_MODE
 from reasoning_options import DSH_REASONING_CHOICES, REASONING_EFFORT_CHOICES
@@ -321,7 +322,27 @@ class ConfigDialog(QDialog):
                 key: str(config.settings.value(key, "") or "").strip()
                 for key in ("xfyun_appid", "xfyun_api_key", "xfyun_api_secret")
             }
-            xfyun_group = QGroupBox("语音识别（讯飞）")
+            # ① 让它说话：合成只有 edge-tts（见 tts_thread.py），没有讯飞合成实现
+            def _note(text):
+                label = QLabel(text)
+                label.setWordWrap(True)
+                return label
+
+            tts_group = QGroupBox("① 让它说话（合成）")
+            tts_layout = QFormLayout(tts_group)
+            self.tts_checkbox = QCheckBox("启用语音回复")
+            self.tts_checkbox.setChecked(config.get_tts_enabled())
+            tts_layout.addRow(self.tts_checkbox)
+
+            self.voice_combo = QComboBox()
+            self.voice_combo.setEnabled(config.get_tts_enabled())
+            self.tts_checkbox.toggled.connect(self.voice_combo.setEnabled)
+            tts_layout.addRow("AI音色:", self.voice_combo)
+            tts_layout.addRow("", _note(voice_setup.VOICE_ENGINE_HINT))
+            layout.addRow(tts_group)
+
+            # ② 让它听话：听写只有讯飞；这三个值与合成无关
+            xfyun_group = QGroupBox("② " + voice_setup.XFYUN_GROUP_TITLE)
             xfyun_layout = QFormLayout(xfyun_group)
 
             self.xfyun_appid_edit = QLineEdit(config.get_xfyun_appid())
@@ -333,29 +354,15 @@ class ConfigDialog(QDialog):
 
             self.xfyun_api_secret_edit = self._make_secret_edit(config.get_xfyun_api_secret(), "讯飞开放平台 APISecret")
             xfyun_layout.addRow("API Secret:", self.xfyun_api_secret_edit)
+            xfyun_layout.addRow("", _note(voice_setup.XFYUN_HINT))
+            xfyun_layout.addRow("", _note(voice_setup.VOICE_INPUT_HINT))
+            xfyun_layout.addRow("", _note(voice_setup.WAKE_WORD_HINT))
             layout.addRow(xfyun_group)
-
-            tts_group = QGroupBox("语音合成")
-            tts_layout = QFormLayout(tts_group)
-            self.tts_checkbox = QCheckBox("启用语音回复")
-            self.tts_checkbox.setChecked(config.get_tts_enabled())
-            tts_layout.addRow(self.tts_checkbox)
-
-            self.voice_combo = QComboBox()
-            self.voice_combo.setEnabled(config.get_tts_enabled())
-            self.tts_checkbox.toggled.connect(self.voice_combo.setEnabled)
-            tts_layout.addRow("AI音色:", self.voice_combo)
-            layout.addRow(tts_group)
 
         # ========== 按钮 ==========
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        self.restart_first_run_button = buttons.addButton(
-            "重新走一遍首次引导", QDialogButtonBox.ButtonRole.ActionRole
-        )
-        self.restart_first_run_button.setToolTip("先保存当前改动，再弹出首次使用向导")
-        self.restart_first_run_button.clicked.connect(self._restart_first_run)
         layout.addRow(buttons)
 
         # ========== 连接信号 ==========
@@ -680,16 +687,3 @@ ConfigDialog._save_dsh_selection = _save_dsh_selection
 ConfigDialog._run_dsh_preflight = _run_dsh_preflight
 ConfigDialog.build_core_memory_tab = build_core_memory_tab
 ConfigDialog.open_core_memory_dialog = open_core_memory_dialog
-
-
-def _restart_first_run(self):
-    """先存下当前改动，再弹一次首次引导（父窗口用原来的调用者）。"""
-    from first_run import reset_first_run, show_first_run_if_needed
-
-    parent = self.parent() or self
-    self.accept()
-    reset_first_run(self.config)
-    QTimer.singleShot(0, lambda: show_first_run_if_needed(parent, self.config))
-
-
-ConfigDialog._restart_first_run = _restart_first_run

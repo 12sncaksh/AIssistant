@@ -993,6 +993,22 @@ class MainWindow(QMainWindow):
         model_menu.addAction("模型与 API").triggered.connect(self.show_config_dialog)
         model_menu.addAction("提示词").triggered.connect(self.show_prompt_dialog)
 
+        def _restart_first_run_setup(_checked=False):
+            """重新初始化用户配置：清掉首启标记，立刻再走一遍引导。"""
+            from first_run import restart_first_run
+
+            try:
+                restart_first_run(self, self.config)
+            except Exception:  # noqa: BLE001 - 打不开向导不能让菜单卡死
+                logging.exception("重新初始化用户配置失败")
+                QMessageBox.warning(
+                    self, "重新初始化失败", "向导没能打开，详见 logs/app.log。"
+                )
+
+        restart_action = settings_menu.addAction("重新初始化用户配置")
+        restart_action.setToolTip("重新走一遍首次使用向导，把模型、检索、语音重新过一遍")
+        restart_action.triggered.connect(_restart_first_run_setup)
+
         interaction_menu = settings_menu.addMenu("交互与身份")
         interaction_menu.addAction("语音").triggered.connect(
             self.show_voice_config_dialog

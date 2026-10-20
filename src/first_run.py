@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
 )
 
 import dsh_preflight
+import voice_setup
 
 # 完成标记。QSettings 在不同后端上可能返回 bool / str / int，统一按字符串比较。
 FIRST_RUN_FLAG = "first_run_completed"
@@ -86,7 +87,7 @@ def mark_first_run_done(config, done: bool = True) -> None:
 
 
 def reset_first_run(config) -> None:
-    """供设置页的「重新走一遍引导」调用。"""
+    """供「重新初始化用户配置」调用。"""
     mark_first_run_done(config, False)
 
 
@@ -259,7 +260,7 @@ class WelcomePage(QWizardPage):
         layout.addWidget(
             _hint(
                 "两条路都能随时改：设置 → DSH 桥接里可以再切换茅；"
-                "本向导也能在设置里重新走一遍。"
+                "想再走一遍：设置 →「重新初始化用户配置」。"
             )
         )
         layout.addStretch(1)
@@ -299,32 +300,8 @@ class LocalPage(QWizardPage):
         probe_row.addWidget(self.probe_button)
         probe_row.addWidget(self.probe_status, 1)
 
-        # ---- 可选：语音
-        voice = QGroupBox("② 语音：让本鱼开口念（可以跳过）")
-        voice_form = QFormLayout(voice)
-        self.voice_combo = QComboBox()
-        self.voice_combo.addItem("不启用（只出文字）", "off")
-        self.voice_combo.addItem("edge-tts（微软语音，免费免 Key）", "edge")
-        self.voice_combo.addItem("讯飞（音色更自然，要另外申请 Key）", "xfyun")
-        self.voice_combo.currentIndexChanged.connect(wizard.update_voice_fields)
-        voice_form.addRow("语音引擎", self.voice_combo)
-
-        self.xfyun_fields = QGroupBox()
-        xfyun_form = QFormLayout(self.xfyun_fields)
-        self.xfyun_appid = QLineEdit(wizard.config.get_xfyun_appid())
-        self.xfyun_key = QLineEdit(wizard.config.get_xfyun_api_key())
-        self.xfyun_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.xfyun_secret = QLineEdit(wizard.config.get_xfyun_api_secret())
-        self.xfyun_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        xfyun_form.addRow("AppID", self.xfyun_appid)
-        xfyun_form.addRow("API Key", self.xfyun_key)
-        xfyun_form.addRow("API Secret", self.xfyun_secret)
-        self.xfyun_fields.setVisible(False)
-        voice_form.addRow("", self.xfyun_fields)
-        voice_form.addRow("", _hint("edge-tts 只要网络通就能用；讯飞要在讯飞开放平台单独开通语音合成。"))
-
         # ---- 可选：搜索
-        search = QGroupBox("③ 联网搜索：让本鱼能查最新消息（可以跳过）")
+        search = QGroupBox("② 联网搜索：让本鱼能查最新消息（可以跳过）")
         search_form = QFormLayout(search)
         self.tavily_edit = QLineEdit(wizard.config.get_tavily_api_key())
         self.tavily_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -335,7 +312,6 @@ class LocalPage(QWizardPage):
         layout = QVBoxLayout(self)
         layout.addWidget(required)
         layout.addLayout(probe_row)
-        layout.addWidget(voice)
         layout.addWidget(search)
         layout.addStretch(1)
 
@@ -396,7 +372,7 @@ class RetrievalPage(QWizardPage):
     def __init__(self, wizard):
         super().__init__(wizard)
         self.wizard_ref = wizard
-        self.setTitle("检索方式")
+        self.setTitle("检索（记忆）")
         self.setSubTitle("这一步决定本鱼能不能记住你说过的事。聊天不依赖它，但记忆力差很多。")
 
         self.ollama_radio = QRadioButton("Ollama 本地（推荐：免费、离线、不用另外申请 Key）")
@@ -465,6 +441,48 @@ class RetrievalPage(QWizardPage):
         self.wizard_ref.update_retrieval_fields()
 
     def nextId(self):
+        return VoicePage.PAGE_ID
+
+
+class VoicePage(QWizardPage):
+    PAGE_ID = 35
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
+        self.wizard_ref = wizard
+        self.setTitle("语音（都可以跳过）")
+        self.setSubTitle("跟走哪条路无关，两条路共用这一份；不配就只出文字、只用键盘。")
+
+        speak_group = QGroupBox("① 让它说话（合成）")
+        speak_form = QFormLayout(speak_group)
+        self.voice_combo = QComboBox()
+        for text, value in voice_setup.VOICE_ENGINE_ITEMS:
+            self.voice_combo.addItem(text, value)
+        self.voice_combo.setCurrentIndex(1 if wizard.config.get_tts_enabled() else 0)
+        speak_form.addRow("引擎", self.voice_combo)
+        speak_form.addRow("", _hint(voice_setup.VOICE_ENGINE_HINT))
+
+        input_group = QGroupBox("② " + voice_setup.XFYUN_GROUP_TITLE)
+        input_form = QFormLayout(input_group)
+        self.xfyun_appid = QLineEdit(wizard.config.get_xfyun_appid())
+        self.xfyun_appid.setPlaceholderText("6 位 APPID")
+        self.xfyun_key = QLineEdit(wizard.config.get_xfyun_api_key())
+        self.xfyun_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.xfyun_secret = QLineEdit(wizard.config.get_xfyun_api_secret())
+        self.xfyun_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        input_form.addRow("AppID", self.xfyun_appid)
+        input_form.addRow("API Key", self.xfyun_key)
+        input_form.addRow("API Secret", self.xfyun_secret)
+        input_form.addRow("", _hint(voice_setup.XFYUN_HINT))
+        input_form.addRow("", _hint(voice_setup.VOICE_INPUT_HINT))
+        input_form.addRow("", _hint(voice_setup.WAKE_WORD_HINT))
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(speak_group)
+        layout.addWidget(input_group)
+        layout.addStretch(1)
+
+    def nextId(self):
         return DonePage.PAGE_ID
 
 
@@ -482,7 +500,7 @@ class DonePage(QWizardPage):
         layout.addWidget(self.summary)
         layout.addWidget(
             _hint(
-                "想再来一遍：设置 →「重新走一遍引导」。"
+                "想再走一遍：设置 →「重新初始化用户配置」。"
                 "本向导不会替你装任何软件，也不会悄悄改你的配置。"
             )
         )
@@ -516,15 +534,16 @@ class FirstRunWizard(QWizard):
         self.local_page = LocalPage(self)
         self.dsh_page = DshPage(self)
         self.retrieval_page = RetrievalPage(self)
+        self.voice_page = VoicePage(self)
         self.done_page = DonePage(self)
         # 页号必须显式注册，否则 nextId() 的返回值无处可去。
         self.setPage(WelcomePage.PAGE_ID, self.welcome)
         self.setPage(LocalPage.PAGE_ID, self.local_page)
         self.setPage(DshPage.PAGE_ID, self.dsh_page)
         self.setPage(RetrievalPage.PAGE_ID, self.retrieval_page)
+        self.setPage(VoicePage.PAGE_ID, self.voice_page)
         self.setPage(DonePage.PAGE_ID, self.done_page)
 
-        self.update_voice_fields()
         self.update_retrieval_fields()
 
     # ---- 页面切换
@@ -534,12 +553,6 @@ class FirstRunWizard(QWizard):
         self.welcome.local_radio.setChecked(True)
         self.welcome.dsh_radio.setChecked(False)
         self.setCurrentId(LocalPage.PAGE_ID)
-
-    # ---- 语音
-
-    def update_voice_fields(self):
-        voice = self.local_page.voice_combo.currentData()
-        self.local_page.xfyun_fields.setVisible(voice == "xfyun")
 
     # ---- 检索
 
@@ -640,12 +653,21 @@ class FirstRunWizard(QWizard):
         self.config.set_api_key(page.api_key_edit.text().strip())
         self.config.set_tavily_api_key(page.tavily_edit.text().strip())
 
-        voice = page.voice_combo.currentData()
-        self.config.set_tts_enabled(voice in ("edge", "xfyun"))
-        if voice == "xfyun":
-            self.config.set_xfyun_appid(page.xfyun_appid.text().strip())
-            self.config.set_xfyun_api_key(page.xfyun_key.text().strip())
-            self.config.set_xfyun_api_secret(page.xfyun_secret.text().strip())
+    def _apply_voice_to_config(self):
+        """语音是两条路共用的，所以不放 local / dsh 分支里。
+
+        空值不覆盖已有配置：用户没填，就不该把原来的密钥清掉。
+        """
+        page = self.voice_page
+        self.config.set_tts_enabled(page.voice_combo.currentData() != "off")
+        for setter, edit in (
+            (self.config.set_xfyun_appid, page.xfyun_appid),
+            (self.config.set_xfyun_api_key, page.xfyun_key),
+            (self.config.set_xfyun_api_secret, page.xfyun_secret),
+        ):
+            value = edit.text().strip()
+            if value:
+                setter(value)
 
     def summary_text(self) -> str:
         lines = []
@@ -658,9 +680,9 @@ class FirstRunWizard(QWizard):
             lines.append("路径：本地模型")
             lines.append(f"  · Base URL：{base}")
             lines.append(f"  · 模型：{self.local_page.model_edit.text().strip() or '(未填)'}")
-            lines.append(f"  · 语音：{self.local_page.voice_combo.currentText()}")
             has_tavily = bool(self.local_page.tavily_edit.text().strip())
             lines.append(f"  · 联网搜索：{'已填 Tavily Key' if has_tavily else '未启用'}")
+        lines.append(f"语音：{self._voice_summary()}")
         if self.retrieval_page.skip_radio.isChecked():
             lines.append("检索：先跳过（记忆检索会很弱）")
         elif self.retrieval_page.ollama_radio.isChecked():
@@ -668,6 +690,17 @@ class FirstRunWizard(QWizard):
         else:
             lines.append("检索：专用 Embedding Key")
         return "\n".join(lines)
+
+    def _voice_summary(self) -> str:
+        """摘要看控件当前值，不看已保存的配置（用户还没点保存）。"""
+        page = self.voice_page
+        tts = "开（edge-tts）" if page.voice_combo.currentData() != "off" else "关"
+        ready = all(
+            edit.text().strip()
+            for edit in (page.xfyun_appid, page.xfyun_key, page.xfyun_secret)
+        )
+        asr = "已配讯飞听写" if ready else "未配（麦克风会提示缺密钥）"
+        return f"语音回复 {tts}；语音输入 {asr}"
 
     def accept(self):
         """用户点「保存并开始」：先落盘，再关闭。"""
@@ -679,6 +712,7 @@ class FirstRunWizard(QWizard):
             else:
                 self.config.set_dsh_bridge_enabled(False)
                 self._apply_local_to_config()
+            self._apply_voice_to_config()
             self._apply_retrieval_to_config()
         except Exception:  # noqa: BLE001 - 保存失败不该让窗口卡死，但要让用户知道
             import logging
@@ -705,6 +739,15 @@ def show_first_run_if_needed(parent, config) -> bool:
     if wizard.result() == QWizard.DialogCode.Accepted:
         mark_first_run_done(config)
     return True
+
+
+def restart_first_run(parent, config) -> bool:
+    """「重新初始化用户配置」：清掉标记后立刻重走一遍引导。
+
+    全程序只有这一个入口（主窗口 设置 → 重新初始化用户配置）。
+    """
+    reset_first_run(config)
+    return show_first_run_if_needed(parent, config)
 
 
 def main(argv: list[str] | None = None) -> int:
