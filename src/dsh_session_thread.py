@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from dsh_acp_client import DshAcpError, HISTORY_SEED_CHARS, HISTORY_SEED_TURNS, PERMISSION_TIMEOUT_SECONDS, _message_text, _tool_arguments, _tool_title, build_prompt_blocks, get_connection, is_context_overflow_error, is_invalid_session_error
+from dsh_preflight import translate_error
 from memory_retriever import format_memory_block
 from context_builder import SUMMARY_FOOTER, SUMMARY_HEADER
 import recall_intent
@@ -181,11 +182,20 @@ class DSHSessionThread(QThread):
                 self.stream_chunk.emit(content)
             self.response_received.emit(content)
         except DshAcpError as exc:
-            self._fail(str(exc))
-            self.error_occurred.emit(f"DSH 桥接失败：{exc}")
+            self._report_bridge_error("DSH 桥接失败", exc)
         except Exception as exc:  # noqa: BLE001 - 兜底，避免线程静默退出
-            self._fail(str(exc))
-            self.error_occurred.emit(f"DSH 桥接异常：{exc}")
+            self._report_bridge_error("DSH 桥接异常", exc)
+
+    def _report_bridge_error(self, prefix, exc):
+        """把桥接异常换成「用户下一步做什么」，认不出来才保留原文。
+
+        翻译表命中时不再加前缀：译文本身就是完整的一句话，再盖一层"DSH 桥接失败："
+        反而把重点埋了。没命中的错误必须原样透出 —— 排查时原始信息不能丢。
+        """
+        diagnosis = translate_error(exc)
+        detail = diagnosis.as_message() if diagnosis is not None else f"{prefix}：{exc}"
+        self._fail(detail)
+        self.error_occurred.emit(detail)
 
     def _fail(self, detail):
         self.task_state["last_error"] = detail

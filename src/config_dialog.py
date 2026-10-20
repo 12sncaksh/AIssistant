@@ -48,7 +48,9 @@ from dsh_settings_ui import (  # noqa: F401
     _restore_cached_dsh_options,
     _apply_dsh_options,
     _apply_dsh_bridge_state,
+    _auto_run_dsh_preflight,
     _save_dsh_selection,
+    _run_dsh_preflight,
 )
 from core_memory_dialog import (  # noqa: F401
     build_core_memory_tab,
@@ -112,6 +114,31 @@ class ConfigDialog(QDialog):
             )
             self.dsh_bridge_hint.setVisible(config.get_dsh_bridge_enabled())
             dsh_layout.addRow("", self.dsh_bridge_hint)
+
+            # 环境自检放在勾选框下面：让用户在勾之前就看见"缺什么"，
+            # 而不是勾完等一句技术报错。
+            self.dsh_preflight_button = QPushButton("检查 DSH 环境（五项）")
+            self.dsh_preflight_button.setToolTip(
+                "只读检查：dsh 命令 / Node 版本 / ~/.dsh 可写 / acp profile / 权限补丁。\n"
+                "不修改文件，不联网。"
+            )
+            self.dsh_preflight_button.clicked.connect(self._run_dsh_preflight)
+            dsh_layout.addRow("", self.dsh_preflight_button)
+
+            self.dsh_preflight_status = QLabel("")
+            self.dsh_preflight_status.setWordWrap(True)
+            self.dsh_preflight_status.setTextFormat(Qt.TextFormat.PlainText)
+            self.dsh_preflight_status.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.dsh_preflight_status.setStyleSheet(
+                "font-family: Consolas, monospace; background-color: #1e1e1e;"
+                " color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 6px;"
+                " padding: 6px 8px;"
+            )
+            self.dsh_preflight_status.setVisible(False)
+            dsh_layout.addRow("", self.dsh_preflight_status)
+            self.dsh_bridge_checkbox.toggled.connect(self._auto_run_dsh_preflight)
 
             # DSH 桥接专属：模型与推理档位。候选项由 DSH 的 ACP 会话公布，用「探测」拉取；
             # 探测失败也能手填，桥接侧只在 DSH 确实提供该模型 / 档位时才下发。
@@ -324,6 +351,11 @@ class ConfigDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        self.restart_first_run_button = buttons.addButton(
+            "重新走一遍首次引导", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.restart_first_run_button.setToolTip("先保存当前改动，再弹出首次使用向导")
+        self.restart_first_run_button.clicked.connect(self._restart_first_run)
         layout.addRow(buttons)
 
         # ========== 连接信号 ==========
@@ -643,6 +675,21 @@ ConfigDialog._on_dsh_options_probed = _on_dsh_options_probed
 ConfigDialog._restore_cached_dsh_options = _restore_cached_dsh_options
 ConfigDialog._apply_dsh_options = _apply_dsh_options
 ConfigDialog._apply_dsh_bridge_state = _apply_dsh_bridge_state
+ConfigDialog._auto_run_dsh_preflight = _auto_run_dsh_preflight
 ConfigDialog._save_dsh_selection = _save_dsh_selection
+ConfigDialog._run_dsh_preflight = _run_dsh_preflight
 ConfigDialog.build_core_memory_tab = build_core_memory_tab
 ConfigDialog.open_core_memory_dialog = open_core_memory_dialog
+
+
+def _restart_first_run(self):
+    """先存下当前改动，再弹一次首次引导（父窗口用原来的调用者）。"""
+    from first_run import reset_first_run, show_first_run_if_needed
+
+    parent = self.parent() or self
+    self.accept()
+    reset_first_run(self.config)
+    QTimer.singleShot(0, lambda: show_first_run_if_needed(parent, self.config))
+
+
+ConfigDialog._restart_first_run = _restart_first_run

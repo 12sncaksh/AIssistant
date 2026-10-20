@@ -1256,6 +1256,19 @@ def main():
     pet_window.show()
     window.show_chat_window()
     logging.info("桌宠与聊天窗口已显示，进入主循环")
+    # 首次启动向导：等主窗口画完再弹，免得用户先看到一屏空白再被表单糊住。
+    # 引导本身出错也不能让程序起不来，所以整段兜住异常。
+    def _maybe_show_first_run():
+        try:
+            from first_run import show_first_run_if_needed
+
+            show_first_run_if_needed(window, window.config)
+        except Exception:
+            logging.exception("首次启动向导异常，已跳过")
+
+    # 冒烟测试只跑主循环，弹一个模态向导会把它堵在里面，所以跳过。
+    if not os.environ.get("AISSISTANT_SMOKE_EXIT_MS", "").strip():
+        QTimer.singleShot(300, _maybe_show_first_run)
     # 自动化冒烟测试用：设了就进入事件循环后自动退出，因此走的是**正常关闭路径**
     # （closeEvent → MCP 关闭 → 线程回收），而不是被强杀。不设则完全无副作用。
     smoke_exit_ms = os.environ.get("AISSISTANT_SMOKE_EXIT_MS", "").strip()

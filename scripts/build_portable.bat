@@ -52,7 +52,10 @@ if exist "dist\Aissistant\assets\web_resources\dist\chat_history.db" goto packag
 if not exist "dist\Aissistant\assets\web_resources\dist\pet.html" goto packaged_assets_missing
 if not exist "dist\Aissistant\generated\kws\encoder-epoch-12-avg-2-chunk-16-left-64.onnx" goto packaged_assets_missing
 
-echo [5/6] Adding user documentation and configuration templates...
+echo [5/7] Adding user documentation and configuration templates...
+rem config\ must not rely on being created as a side effect of config\templates:
+rem config_storage never calls makedirs itself, so a missing dir breaks the first save.
+if not exist "dist\Aissistant\config" mkdir "dist\Aissistant\config"
 if not exist "dist\Aissistant\config\templates" mkdir "dist\Aissistant\config\templates"
 rem docs\ is not published in this repository: prefer the end-user portable notes,
 rem otherwise fall back to the repository README.md, and never fail silently.
@@ -78,11 +81,36 @@ if errorlevel 1 goto templates_missing
 copy /y "config\templates\dsh_acp_overlay.example.yml" "dist\Aissistant\config\templates\dsh_acp_overlay.example.yml" >nul
 if errorlevel 1 goto templates_missing
 
-echo [6/6] Creating ZIP package...
-where tar.exe >nul 2>nul
-if errorlevel 1 goto tar_missing
+rem The packaged exe must actually start and reach its main loop - ZIP checks cannot
+rem catch a missing module. Do NOT gate on the OS exit code: this app's shutdown path
+rem ends with 0xC0000409 in BOTH the source run and the packaged run (pre-existing),
+rem so judge by what the app itself wrote instead.
+echo [6/7] Smoke-testing the packaged executable...
+if exist "dist\Aissistant\logs\app.log" del /q "dist\Aissistant\logs\app.log"
+if exist "dist\Aissistant\logs\crash.log" del /q "dist\Aissistant\logs\crash.log"
+set "AISSISTANT_SMOKE_EXIT_MS=5000"
+pushd "dist\Aissistant"
+start "" /wait "Aissistant.exe"
+popd
+set "AISSISTANT_SMOKE_EXIT_MS="
+if not exist "dist\Aissistant\logs\app.log" goto smoke_failed
+for %%A in ("dist\Aissistant\logs\app.log") do if %%~zA LSS 500 goto smoke_failed
+if exist "dist\Aissistant\logs\crash.log" for %%A in ("dist\Aissistant\logs\crash.log") do if %%~zA GTR 0 goto smoke_failed
+echo Smoke test OK: the packaged app started and wrote its own log.
+rem The smoke run just made the app write its own runtime state into the package.
+rem data\ (chat_history.db, runtime_endpoint.json) and logs\ must not ship, and a
+rem chat history database in there would leak whatever was typed into the app.
+if exist "dist\Aissistant\data" rmdir /s /q "dist\Aissistant\data"
+if exist "dist\Aissistant\logs" rmdir /s /q "dist\Aissistant\logs"
+
+echo [7/7] Creating ZIP package...
+rem Use Windows' bundled bsdtar by absolute path. A GNU tar found earlier on PATH
+rem (e.g. Git for Windows) has no zip output format: it silently writes a plain tar
+rem with a .zip name, which then fails the ZIP check below.
+set "WINTAR=%SystemRoot%\System32\tar.exe"
+if not exist "%WINTAR%" goto tar_missing
 if exist %PKG% del /q %PKG%
-tar.exe -a -c -f "%PKG%" -C "dist" "Aissistant"
+"%WINTAR%" -a -c -f "%PKG%" -C "dist" "Aissistant"
 if errorlevel 1 goto package_failed
 if not exist "%PKG%" goto package_failed
 rem verify the archive can be opened and is free of local chat history
@@ -117,6 +145,14 @@ exit /b 1
 
 :templates_missing
 echo Failed to copy config\templates into the package. Check config\templates\*.example.*
+pause
+exit /b 1
+
+:smoke_failed
+echo Smoke test failed: the packaged Aissistant.exe could not start, or did not exit cleanly.
+echo Reproduce it by hand inside the package folder:
+echo   set AISSISTANT_SMOKE_EXIT_MS=5000 ^&^& Aissistant.exe
+echo Then read logs\app.log in the package for the traceback.
 pause
 exit /b 1
 

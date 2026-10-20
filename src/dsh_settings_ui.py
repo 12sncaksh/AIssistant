@@ -9,6 +9,7 @@ from dsh_acp_client import parse_model_selection_value
 from dsh_options_probe import DshOptionsProbeThread
 from reasoning_options import DSH_REASONING_CHOICES
 from role_dialog import _track_probe_thread
+import dsh_preflight
 
 
 
@@ -217,6 +218,44 @@ def _apply_dsh_options(self, options):
         f"已读取 DSH：{len(self._dsh_model_values)} 个模型。当前模型没有声明 "
         "reasoningEfforts，DSH 不提供推理档位（可在 DSH 的 settings.yaml 里给该模型补上）。"
     )
+
+
+def _run_dsh_preflight(self):
+    """跑五项环境自检，把结果原样贴到设置页（可选中复制）。
+
+    只读检查：不写文件、不联网、不动任何配置。自检自己出问题也只影响这一块
+    提示，不能把整个设置窗带崩。
+    """
+    try:
+        checks = dsh_preflight.run_checks()
+    except Exception as exc:  # noqa: BLE001 - 自检失败只该影响这块提示
+        self.dsh_preflight_status.setText(f"自检没能跑完：{exc}")
+        self.dsh_preflight_status.setVisible(True)
+        return
+    marks = {
+        dsh_preflight.OK: "[ OK ]",
+        dsh_preflight.WARN: "[WARN]",
+        dsh_preflight.FAIL: "[FAIL]",
+    }
+    lines = []
+    for item in checks:
+        lines.append(f"{marks.get(item.level, '[????]')} {item.title}")
+        if item.fix:
+            lines.append(f"         $ {item.fix}")
+    blocking = dsh_preflight.blocking_checks(checks)
+    lines.append("")
+    if blocking:
+        lines.append(f"结论：有 {len(blocking)} 项挡住桥接。按上面的命令处理完，点按钮重跑一次。")
+    else:
+        lines.append("结论：可以开 DSH 桥接。")
+    self.dsh_preflight_status.setText("\n".join(lines))
+    self.dsh_preflight_status.setVisible(True)
+
+
+def _auto_run_dsh_preflight(self, enabled):
+    """勾上桥接时顺手自检一次；已经显示过就不再打扰。"""
+    if enabled and not self.dsh_preflight_status.isVisible():
+        self._run_dsh_preflight()
 
 
 def _apply_dsh_bridge_state(self, enabled):

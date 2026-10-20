@@ -37,6 +37,10 @@ hiddenimports = [
     "typing_inspection",
     "annotated_types",
     "win32job",
+    # 首次引导：main.py 里同样是函数内导入（与上面 mcp 一类写法），显式列上保险，
+    # 免得打包后一启动就 ModuleNotFoundError。
+    "first_run",
+    "dsh_preflight",
 ]
 
 for package_name in ("uiautomation", "comtypes"):

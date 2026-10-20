@@ -30,6 +30,12 @@ PROTOCOL_VERSION = 1
 DEFAULT_COMMAND = "dsh"
 DEFAULT_PROFILE = "acp"
 PROMPT_TIMEOUT_SECONDS = 1800
+# 单轮 prompt 的等待策略：不再拿"总时长"当超时——长任务（深度调研、大范围改代码）
+# 常常要跑几十分钟，按总时长计时会把正常推进的任务当成卡死杀掉。改成两条线：
+# - 空闲超时：期间只要还收到任何事件/消息就重置计时，只有彻底静默这么久才判卡死；
+# - 硬上限：兜底，防止协议层面真的无限挂住。
+PROMPT_IDLE_TIMEOUT_SECONDS = 300
+PROMPT_HARD_TIMEOUT_SECONDS = 4 * 3600
 PERMISSION_TIMEOUT_SECONDS = 300
 CONTEXT_OVERFLOW_MARKERS = (
     "context overflow",
@@ -612,6 +618,9 @@ class DshAcpConnection:
             self._notify_status(f"DSH 事件处理异常：{exc}")
 
     def _dispatch(self, message):
+        # 任何入站消息（事件、反向请求、响应）都算"连接还在推进"，
+        # 供 request() 的空闲超时判断使用：只有彻底静默才算卡死。
+        self._last_activity = time.monotonic()
         if "id" not in message:
             if message.get("method") == "session/update":
                 self._notify_update(message.get("params") or {})
@@ -680,14 +689,37 @@ class DshAcpConnection:
             proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
             proc.stdin.flush()
 
-    def request(self, method, params, timeout=PROMPT_TIMEOUT_SECONDS):
+    def request(self, method, params, timeout=PROMPT_TIMEOUT_SECONDS, idle_timeout=None):
+        """发一个 JSON-RPC 请求并等待结果。
+
+        idle_timeout 不为空时按"空闲"计时：等待期间每收到一条入站消息（事件 / 反向请求 /
+        响应）就重置计时，只有连续静默 idle_timeout 秒才判定卡死；此时 timeout 降级为硬上限，
+        只作兜底。这样"跑了很久但一直在推进"的长任务不会被误杀。
+        """
         self._next_id += 1
         request_id = self._next_id
         waiter = queue.Queue()
         self._pending[request_id] = waiter
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        self._last_activity = time.monotonic()
+        deadline = time.monotonic() + timeout if timeout else None
         try:
-            message = waiter.get(timeout=timeout)
+            while True:
+                try:
+                    message = waiter.get(timeout=idle_timeout or timeout)
+                    break
+                except queue.Empty:
+                    if not idle_timeout:
+                        raise
+                    silent = time.monotonic() - self._last_activity
+                    if silent < idle_timeout and (deadline is None or time.monotonic() < deadline):
+                        continue
+                    self._pending.pop(request_id, None)
+                    if silent >= idle_timeout:
+                        raise DshAcpError(
+                            f"{method} 超时（已静默 {silent:.0f}s，没有任何事件）"
+                        ) from None
+                    raise DshAcpError(f"{method} 超时（超过硬上限 {timeout}s）") from None
         except queue.Empty:
             self._pending.pop(request_id, None)
             raise DshAcpError(f"{method} 超时（{timeout}s 无响应）") from None
@@ -1024,6 +1056,15 @@ class DshAcpConnection:
                 timeout=30,
             )
         except DshAcpError as exc:
+            # 回合执行中（prompt in flight）DSH 不允许改权限——这是正常的时序竞争，
+            # 不该当成桥接故障把整轮打断：记警告、跳过本次下发，等空闲后自然会重新同步。
+            if "in flight" in str(exc):
+                logging.warning(
+                    "DSH 会话 %s 正在执行回合，本次权限暂不下发（保持原权限）：%s",
+                    session_id,
+                    exc,
+                )
+                return False
             raise DshAcpError(f"设置 DSH 会话权限失败：{exc}") from exc
         actual = result.get("permissionPreset") if isinstance(result, dict) else None
         if actual != self.permission_mode:
@@ -1126,11 +1167,19 @@ class DshAcpConnection:
 
     def prompt(self, blocks, session_key=None):
         session_id = self.ensure_session(session_key)
-        return self.request(
-            "session/prompt",
-            {"sessionId": session_id, "prompt": blocks},
-            timeout=PROMPT_TIMEOUT_SECONDS,
-        )
+        try:
+            return self.request(
+                "session/prompt",
+                {"sessionId": session_id, "prompt": blocks},
+                timeout=PROMPT_HARD_TIMEOUT_SECONDS,
+                idle_timeout=PROMPT_IDLE_TIMEOUT_SECONDS,
+            )
+        except DshAcpError:
+            # 超时 / 失败后必须真的让服务端停下：否则那一轮 prompt 仍在跑，
+            # 会话会卡在 "prompt in flight"，之后所有权限切换都会失败。
+            # cancel() 内部吞掉自身异常，这里只负责发出取消，再把原错误抛回去。
+            self.cancel(session_id)
+            raise
 
     def cancel(self, session_key=None):
         """中断某个会话正在跑的回合。
