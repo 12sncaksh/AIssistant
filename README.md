@@ -4,8 +4,9 @@
 
 ## 功能
 
-- 大模型流式对话（OpenAI 兼容接口）；也可把整轮对话交给本机 DSH 运行时处理，
-  模型与推理深度可在设置里选（一键探测 DSH 可用档位），见「DSH 桥接」
+- 大模型流式对话（OpenAI 兼容接口）；也可把整轮对话交给本机 DSH 运行时处理。
+  DSH 桥接使用 Aissistant 独立维护的 ACP Provider（名称、API URL、API Key、模型），与 DSH Web 配置完全隔离；
+  设置页的「读取 Web 配置并导入 ACP」只执行一次性复制，之后 Web 修改不会影响 ACP。
 - 结构化工具调用（function calling）：联网搜索、天气/路线、系统状态、磁盘只读扫描、文件读写、锁屏/关机等
 - 长期记忆：结构化「常驻块」（用户偏好 / 能力 / 任务，可从对话自动提炼，条目标失效而不删除）+ 本地历史
   语义检索（向量 + 中文 BM25 词法 + RRF 融合），检索方式可在「模型按需查询（pull）」与「每轮自动注入
@@ -64,7 +65,8 @@ scripts\run.bat            :: 隐藏启动
 | `config/mcp.json` | MCP server 配置（自带 server 由程序自动写入） | 否（已忽略） |
 | `config/live2d_emotions.json` | Live2D 语义情绪 → 表情/参数映射 | 否（程序可生成模板） |
 | `config/dsh_sessions.json` | 聊天会话 ↔ DSH 会话映射 | 否（运行时自动生成） |
-| `config/dsh_acp_overlay.yml` | DSH 路由覆盖补丁，模板见 `config/templates/dsh_acp_overlay.example.yml` | 否（填了 `dsh_provider` 时自动生成） |
+| `config/dsh_acp_overlay.yml` | ACP 独立 Provider 的运行时覆盖补丁，模板见 `config/templates/dsh_acp_overlay.example.yml` | 否（运行时自动生成） |
+| `QSettings: dsh_acp_providers` | ACP Provider 名称、URL、模型与本地凭据 | 不入库 |
 
 优先级：设置窗口中已保存的值 → 对应 JSON 文件 → 程序默认值。头像文件保存在运行时 `data/avatars/`，QSettings 仅保存路径。
 
@@ -74,9 +76,8 @@ AI 生成的聊天背景 `generated/chat_backgrounds/`、DSH 工作区 `agent_wo
 由主程序在启动时发布给 `aissistant-pet` server）。
 
 `config/config.json` 除上表字段外还支持这些可选键（不填即关闭）：
-`permission_mode`（权限模式，默认 `workspace-write`）、
-`dsh_bridge_enabled`、`dsh_command`、`dsh_profile`、`dsh_provider`、`dsh_model`、
-`dsh_reasoning_effort`（DSH 推理档位，空串表示跟随 DSH / 模型默认），
+`permission_mode`（权限模式，默认 `workspace-write`）、`dsh_bridge_enabled`、`dsh_command`、`dsh_profile`、
+`dsh_reasoning_effort`（ACP 推理档位，空串表示跟随模型默认）。ACP Provider 需在设置页单独维护。
 完整模板见 `config/templates/config.example.json`。
 
 ## 仓库不包含的资源（重要）

@@ -146,6 +146,8 @@ def _advance_speech_page(self):
     self._speech_stream_received = False
     if self._activity_hint_text and self.speech_bubble._message == self._activity_hint_text:
         return
+    if getattr(self, "_music_bubble_on", False) and self.speech_bubble._message == "🎶":
+        return
     self.speech_bubble.hide()
 
 
@@ -350,6 +352,11 @@ def set_kaomoji(self, text, style=None):
         color_match = re.search(r"color:\s*([^;]+)", style)
         if color_match:
             self._bubble_accent = color_match.group(1).strip()
+    if (
+        getattr(self, "_music_bubble_on", False)
+        and self.speech_bubble._message == "🎶"
+    ):
+        return
     if (
         not self._tts_speech_active
         and not self._speech_playing

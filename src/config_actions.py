@@ -41,9 +41,10 @@ def show_config_dialog(self):
                 connection.set_permission_mode(self.config.get_permission_mode())
                 # 模型 / 推理档位同理：空闲时立刻补写到活着的 ACP 会话，
                 # 有回合在跑就只记下来，等下一次提问复用会话时生效。
+                acp_provider = self.config.get_acp_provider() or {}
                 changed = connection.set_model_selection(
-                    self.config.get_dsh_provider(),
-                    self.config.get_dsh_model(),
+                    acp_provider.get("name", ""),
+                    acp_provider.get("model", ""),
                     self.config.get_dsh_reasoning_effort(),
                 )
                 if changed and not self._is_turn_running():

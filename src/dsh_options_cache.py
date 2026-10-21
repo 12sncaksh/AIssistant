@@ -21,9 +21,9 @@ def default_options_cache_path():
     return os.path.join(PROJECT_ROOT, "config", OPTIONS_CACHE_FILENAME)
 
 
-def options_cache_key(provider="", model=""):
-    """缓存键：provider + model。两者任一不同就是不同的候选项集合。"""
-    return f"{str(provider or '').strip()}|{str(model or '').strip()}"
+def options_cache_key(provider="", model="", base_url=""):
+    """缓存键：Provider、URL、模型共同决定候选项集合。"""
+    return f"{str(provider or '').strip()}|{str(base_url or '').strip().rstrip('/')}|{str(model or '').strip()}"
 
 
 def dsh_options_cache_scope(config):

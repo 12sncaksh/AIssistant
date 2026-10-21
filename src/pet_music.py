@@ -720,6 +720,7 @@ def _set_music_bubble(self, on):
         return
     self._music_bubble_on = on
     if on:
+        self.speech_timer.stop()
         self._show_bubble(PET_MUSIC_BUBBLE_TEXT)
     elif self.speech_bubble._message == PET_MUSIC_BUBBLE_TEXT:
         self.speech_bubble.hide()

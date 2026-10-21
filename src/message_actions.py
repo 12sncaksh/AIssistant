@@ -265,7 +265,12 @@ def send_message(self):
         task_state = clarification_result["task_state"]
 
     dsh_bridge_enabled = self.config.get_dsh_bridge_enabled()
-    if not dsh_bridge_enabled and not self.config.get_api_key():
+    if dsh_bridge_enabled:
+        acp_provider = self.config.get_acp_provider() or {}
+        if not acp_provider.get("name") or not acp_provider.get("base_url") or not acp_provider.get("api_key"):
+            QMessageBox.warning(self, "缺少 ACP 配置", "请先在 设置 → DSH 桥接 中填写 ACP Provider、API URL 和 API Key")
+            return
+    elif not self.config.get_api_key():
         QMessageBox.warning(self, "缺少配置", "请先在 设置->API配置 中设置API Key")
         return
 

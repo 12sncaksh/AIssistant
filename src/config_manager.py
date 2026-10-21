@@ -16,6 +16,14 @@ from dsh_options_cache import OptionsCacheStore
 from dsh_options_cache import default_options_cache_path
 from dsh_options_cache import dsh_options_cache_scope
 from dsh_options_cache import options_cache_key
+from acp_provider_config import (
+    load_acp_providers,
+    merge_acp_provider,
+    remove_acp_provider,
+    save_acp_providers,
+    selected_acp_provider,
+    set_selected_acp_provider,
+)
 import copy
 import json
 import logging
@@ -398,26 +406,44 @@ class ConfigManager(CredentialConfigMixin):
             self._dsh_options_cache_store = store
         return store
 
-    def get_cached_dsh_options(self, provider="", model=""):
-        """按 (provider, model) 取缓存的 configOptions；未命中/过期返回 None。"""
+    def get_cached_dsh_options(self, provider="", model="", base_url=""):
+        """按 ACP Provider、URL、模型取缓存的 configOptions。"""
         try:
             return self._dsh_options_store().get(
-                options_cache_key(provider, model), scope=dsh_options_cache_scope(self)
+                options_cache_key(provider, model, base_url), scope=dsh_options_cache_scope(self)
             )
         except Exception:
             logging.warning("读取 DSH 探测缓存失败", exc_info=True)
             return None
 
-    def set_cached_dsh_options(self, provider, model, options):
-        """写入探测缓存；options 为空时不动旧缓存。"""
+    def set_cached_dsh_options(self, provider, model, options, base_url=""):
+        """写入 ACP Provider 缓存；options 为空时不动旧缓存。"""
         try:
             self._dsh_options_store().set(
-                options_cache_key(provider, model),
+                options_cache_key(provider, model, base_url),
                 list(options or []),
                 scope=dsh_options_cache_scope(self),
             )
         except Exception:
             logging.warning("写入 DSH 探测缓存失败", exc_info=True)
+
+    def get_acp_providers(self):
+        return load_acp_providers(self.settings)
+
+    def get_acp_provider(self):
+        return selected_acp_provider(self.settings)
+
+    def set_acp_provider(self, provider):
+        return merge_acp_provider(self.settings, provider)
+
+    def remove_acp_provider(self, name):
+        return remove_acp_provider(self.settings, name)
+
+    def set_acp_selected_provider(self, name):
+        set_selected_acp_provider(self.settings, name)
+
+    def save_acp_providers(self, providers):
+        return save_acp_providers(self.settings, providers)
 
     def get_searxng_url(self):
         return str(self._get_setting_or_file("searxng_url", "http://localhost:18080")).strip()

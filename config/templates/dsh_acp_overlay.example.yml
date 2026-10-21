@@ -4,16 +4,9 @@
 # 本文件只作字段说明与手写起点，程序不会读取它。
 #
 # 用途
-#   DSH 桥接启动 `dsh --profile acp` 时，如果配置了 dsh_provider，就会额外带上
-#   `--patch config/dsh_acp_overlay.yml`，在 profile 自带的 patch 之上再覆盖一次 ACP 路由，
-#   让桥接会话使用你选择的 provider / model，而不是 profile 里钉死的那一个。
-#   （否则内网网关的 Key 会被拿去请求公网 API，表现为认证失败。）
-#
-# 何时需要它
-#   一般不需要：在「设置 → 配置 → DSH 桥接」里填了 dsh_provider（和可选的 dsh_model）后，
-#   程序会自动生成这份 overlay；不填 provider 则不生成，也不给 dsh 传 --patch。
-#   只有想在路由之外追加其它 ACP 配置项时，才需要参照本模板手写——
-#   注意程序下一次同步路由时会重写 config/dsh_acp_overlay.yml。
+#   ACP 桥接只使用 Aissistant 设置页中保存的独立 Provider，不读取 DSH Web 的 provider、URL 或 Key。
+#   config/dsh_acp_overlay.yml 由程序自动生成；本模板只作字段说明，程序不会读取它。
+#   API Key 不写入此文件，而是在启动 ACP 子进程时通过 apiKeyEnv 对应的环境变量注入。
 #
 # 格式
 #   与 DSH 的 patch 文件一致：一个列表，每项用 id 指定目标模块，config 里写要覆盖的键值。

@@ -18,8 +18,10 @@ def _update_model_indicator(self):
     if not hasattr(self, "model_indicator"):
         return
     if self.config.get_dsh_bridge_enabled():
-        dsh_model = self.config.get_dsh_model() or "模型由 DSH 选择"
-        label = f"DSH 桥接 · {dsh_model}"
+        acp_provider = self.config.get_acp_provider() or {}
+        dsh_model = acp_provider.get("model") or "模型由 ACP 选择"
+        provider_name = acp_provider.get("name") or "未配置 Provider"
+        label = f"ACP · {provider_name}/{dsh_model}"
         self.model_indicator.setText(label if len(label) <= 30 else label[:27] + "…")
         self.model_indicator.setToolTip(
             "当前处于 DSH 桥接模式：消息交给本机 DSH 运行时（Agent + 工具）处理。\n"

@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QDialogButtonBox
 from PyQt6.QtWidgets import QFormLayout
 from PyQt6.QtWidgets import QFrame
 from PyQt6.QtWidgets import QGroupBox
+from PyQt6.QtWidgets import QHBoxLayout
 from PyQt6.QtWidgets import QLabel
 from PyQt6.QtWidgets import QLineEdit
 from PyQt6.QtWidgets import QPushButton
@@ -39,6 +40,7 @@ from role_dialog import _track_probe_thread
 # ---- method groups moved into their own modules ----
 from dsh_settings_ui import (  # noqa: F401
     _fill_dsh_reasoning_combo,
+    _fill_reasoning_levels,
     _current_dsh_reasoning_choice,
     _sync_dsh_provider_from_model,
     _selected_dsh_model,
@@ -47,11 +49,20 @@ from dsh_settings_ui import (  # noqa: F401
     _on_dsh_probe_thread_finished,
     _on_dsh_options_probed,
     _restore_cached_dsh_options,
-    _apply_dsh_options,
+    _apply_dsh_reasoning,
     _apply_dsh_bridge_state,
     _auto_run_dsh_preflight,
     _save_dsh_selection,
+    _provider_form_data,
+    _refresh_acp_provider_combo,
+    _new_acp_provider,
+    _edit_acp_provider,
+    _delete_acp_provider,
+    _save_acp_provider,
+    _import_web_acp_providers,
+    _select_acp_provider,
     _run_dsh_preflight,
+    AcpProviderDialog,
 )
 from core_memory_dialog import (  # noqa: F401
     build_core_memory_tab,
@@ -82,9 +93,11 @@ class ConfigDialog(QDialog):
             base_tab, base_layout = self._make_tab_page()
             dsh_tab, dsh_layout = self._make_tab_page()
             tools_tab, tools_layout = self._make_tab_page()
+            memory_tab, memory_layout = self._make_tab_page()
             self.tabs.addTab(base_tab, "基础模型")
             self.tabs.addTab(dsh_tab, "DSH 桥接")
             self.tabs.addTab(tools_tab, "工具与权限")
+            self.tabs.addTab(memory_tab, "记忆")
             # 常驻块：每轮都注入、且不过任何阈值，所以"能改"是它唯一的安全阀。
             # 之前唯一的改法是手工编辑 data/core_memory.json。
             self.tabs.addTab(self.build_core_memory_tab(), "常驻块")
@@ -98,15 +111,15 @@ class ConfigDialog(QDialog):
             self.dsh_bridge_checkbox = QCheckBox("启用 DSH 桥接（交给本机 DSH 运行时）")
             self.dsh_bridge_checkbox.setChecked(config.get_dsh_bridge_enabled())
             self.dsh_bridge_checkbox.setToolTip(
-                "勾选后：消息转交本机 DSH（dsh --profile acp）处理，模型与 API Key 由 DSH 自己管理；\n"
+                "勾选后：消息转交本机 DSH（dsh --profile acp）处理；ACP Provider、API URL、API Key 和模型由 Aissistant 独立管理。\n"
                 "下面的 Base URL / API Key / 模型 / 推理强度将不再生效。\n"
                 "取消勾选：回到本地直连模型。"
             )
             dsh_layout.addRow(self.dsh_bridge_checkbox)
             self.dsh_bridge_hint = QLabel(
-                "DSH 桥接已启用：请先在 DSH 网页端配置 Provider，再用本页探测并选择模型。"
-                "对话与工具执行全部交给本机 DSH 运行时。"
-                "「基础模型」页的本地 API 设置此时不生效。"
+                "ACP 桥接已启用：Provider、API URL、API Key 和模型由 Aissistant 独立保存。"
+                "如需复制 DSH Web 配置，请主动点击「读取 Web 配置并导入 ACP」。"
+                "对话与工具执行交给本机 DSH ACP 运行时。"
             )
             self.dsh_bridge_hint.setWordWrap(True)
             self.dsh_bridge_hint.setStyleSheet(
@@ -141,43 +154,68 @@ class ConfigDialog(QDialog):
             dsh_layout.addRow("", self.dsh_preflight_status)
             self.dsh_bridge_checkbox.toggled.connect(self._auto_run_dsh_preflight)
 
-            # DSH 桥接专属：模型与推理档位。候选项由 DSH 的 ACP 会话公布，用「探测」拉取；
-            # 探测失败也能手填，桥接侧只在 DSH 确实提供该模型 / 档位时才下发。
-            self.dsh_provider_edit = QLineEdit(config.get_dsh_provider())
-            self.dsh_provider_edit.setPlaceholderText("DSH provider id，例如 opencode-ds")
-            self.dsh_provider_edit.setToolTip(
-                "对应 config/dsh_acp_overlay.yml 里的 provider；留空表示不改动 DSH 原有路由。"
-            )
-            dsh_layout.addRow("DSH Provider:", self.dsh_provider_edit)
+            # ACP Provider 是 Aissistant 本地资源；Web 只作为一次性导入源。
+            current_acp = config.get_acp_provider() or {}
+            self.dsh_saved_provider_combo = QComboBox()
+            saved_providers = config.get_acp_providers()
+            for saved in saved_providers:
+                self.dsh_saved_provider_combo.addItem(saved.get("name", ""), saved.get("name", ""))
+            if current_acp.get("name"):
+                index = self.dsh_saved_provider_combo.findData(current_acp.get("name"))
+                if index >= 0:
+                    self.dsh_saved_provider_combo.setCurrentIndex(index)
+            dsh_layout.addRow("本地 ACP Provider:", self.dsh_saved_provider_combo)
 
-            self._dsh_model_values = {}
+            self.dsh_provider_edit = QLineEdit(str(current_acp.get("name") or ""))
+            self.dsh_url_edit = QLineEdit(str(current_acp.get("base_url") or ""))
+            self.dsh_api_key_edit = self._make_secret_edit(str(current_acp.get("api_key") or ""), "API Key")
+            for widget in (self.dsh_provider_edit, self.dsh_url_edit, self.dsh_api_key_edit):
+                widget.setVisible(False)
             self.dsh_model_combo = QComboBox()
-            self.dsh_model_combo.setEditable(True)
-            self.dsh_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-            current_dsh_model = config.get_dsh_model()
-            self.dsh_model_combo.addItem(current_dsh_model or "", current_dsh_model or "")
-            self.dsh_model_combo.setToolTip(
-                "点下面的「探测」可从 DSH 拉取真实模型列表（按 provider 分组）；也可直接填模型 id。"
-            )
-            dsh_layout.addRow("DSH 模型:", self.dsh_model_combo)
+            self.dsh_model_combo.setEditable(False)
+            current_acp_model = str(current_acp.get("model") or "")
+            for item in current_acp.get("models") or []:
+                self.dsh_model_combo.addItem(str(item), str(item))
+            if current_acp_model and self.dsh_model_combo.findData(current_acp_model) < 0:
+                self.dsh_model_combo.addItem(current_acp_model, current_acp_model)
+            self.dsh_model_combo.setCurrentIndex(max(0, self.dsh_model_combo.findData(current_acp_model)))
+            self.dsh_model_combo.setToolTip("选择当前 Provider 已探测并保存的模型。新增 Provider 请点击「新增」。")
+            dsh_layout.addRow("模型:", self.dsh_model_combo)
+
+            provider_actions = QHBoxLayout()
+            self.dsh_new_provider_button = QPushButton("新增")
+            self.dsh_edit_provider_button = QPushButton("编辑")
+            self.dsh_delete_provider_button = QPushButton("删除")
+            provider_actions.addWidget(self.dsh_new_provider_button)
+            provider_actions.addWidget(self.dsh_edit_provider_button)
+            provider_actions.addWidget(self.dsh_delete_provider_button)
+            provider_actions.addStretch(1)
+            dsh_layout.addRow("已配置 Provider:", provider_actions)
+
+            self.dsh_import_web_button = QPushButton("从 Web 导入已配置 Provider")
+            self.dsh_import_web_button.setToolTip("读取 DSH Web 本地配置，并把已有模型一起导入本地列表。")
+            dsh_layout.addRow("外部配置:", self.dsh_import_web_button)
+            self.dsh_new_provider_button.clicked.connect(self._new_acp_provider)
+            self.dsh_edit_provider_button.clicked.connect(self._edit_acp_provider)
+            self.dsh_delete_provider_button.clicked.connect(self._delete_acp_provider)
+            self.dsh_import_web_button.clicked.connect(self._import_web_acp_providers)
 
             self.dsh_reasoning_combo = QComboBox()
             self.dsh_reasoning_combo.setEditable(True)
             self.dsh_reasoning_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
             self._fill_dsh_reasoning_combo(config.get_dsh_reasoning_effort())
             self.dsh_reasoning_combo.setToolTip(
-                "ACP 的 reasoning_effort 档位，与 DSH 网页端 composer 的推理强度同源；\n"
-                "只有所选模型声明了 reasoningEfforts 时 DSH 才会公布档位，否则本项会被忽略。"
+                "ACP 会话的 reasoning_effort 档位；不会读取或修改 DSH Web 配置。"
             )
-            dsh_layout.addRow("DSH 推理深度:", self.dsh_reasoning_combo)
+            dsh_layout.addRow("ACP 推理深度:", self.dsh_reasoning_combo)
 
-            self.dsh_probe_button = QPushButton("探测 DSH 可用模型 / 推理档位")
+            self.dsh_probe_button = QPushButton("探测 DSH 推理档位")
+            self.dsh_probe_button.setVisible(False)
             self.dsh_probe_button.clicked.connect(self._probe_dsh_options)
             dsh_layout.addRow("", self.dsh_probe_button)
 
             self.dsh_probe_status = QLabel(
-                "模型列表与推理档位由 DSH 的 ACP 会话公布，点上面的按钮读取；"
-                "探测会临时启动一次 dsh --profile acp，不发送任何消息。"
+                "选择模型后会自动读取该模型可用的推理档位；首次读取需要启动一次本机 DSH。"
             )
             self.dsh_probe_status.setWordWrap(True)
             dsh_layout.addRow("", self.dsh_probe_status)
@@ -187,13 +225,15 @@ class ConfigDialog(QDialog):
             self._dsh_probe_timer.setSingleShot(True)
             self._dsh_probe_timer.timeout.connect(self._probe_dsh_options)
 
-            # 缓存回填必须在接线之前：_apply_dsh_options 会重建下拉项，
-            # 若此时已连上 _schedule_dsh_options_probe，回填本身就会触发一次探测，
-            # 缓存也就白做了。
+            # 缓存回填必须在接线之前：推理回填只更新推理下拉框，
+            # 不应因回填缓存触发新的模型探测。
             self._restore_cached_dsh_options()
+            self.dsh_saved_provider_combo.currentIndexChanged.connect(self._select_acp_provider)
+            self.dsh_saved_provider_combo.currentIndexChanged.connect(self._schedule_dsh_options_probe)
             self.dsh_model_combo.currentIndexChanged.connect(self._sync_dsh_provider_from_model)
             self.dsh_model_combo.currentIndexChanged.connect(self._schedule_dsh_options_probe)
-            self.dsh_model_combo.lineEdit().textEdited.connect(self._schedule_dsh_options_probe)
+            self._select_acp_provider(self.dsh_saved_provider_combo.currentIndex())
+            self._schedule_dsh_options_probe()
 
             # 权限模式：与 DSH 网页端的权限预设选择器同源（沙箱边界 + 审批策略捆绑）
             self.permission_combo = QComboBox()
@@ -217,22 +257,6 @@ class ConfigDialog(QDialog):
             tools_layout.addRow("", self.permission_hint)
             self.permission_combo.currentIndexChanged.connect(self._on_permission_mode_changed)
             self._on_permission_mode_changed(self.permission_combo.currentIndex())
-
-            self.llm_summary_checkbox = QCheckBox("允许使用 LLM 生成会话摘要")
-            self.llm_summary_checkbox.setChecked(config.get_memory_summary_llm_enabled())
-            self.llm_summary_checkbox.setToolTip(
-                "开启后，会话摘要每滚动更新一次（默认每 12 轮）才调用一次基础模型 API，"
-                "输入只是「旧摘要 + 新增轮次」，成本很低。关闭、未配置或调用失败时使用本地摘要。"
-            )
-            tools_layout.addRow(self.llm_summary_checkbox)
-            self.llm_summary_hint = QLabel(
-                "摘要是一份「话题目录」（默认 1000 字以内），每轮都会附在上下文里，"
-                "让模型知道此前聊过什么；需要细节时它自己用 search_memory 检索。"
-                "仅影响长期记忆摘要，不会发送完整历史；摘要接口失败时自动回退到本地摘要。"
-            )
-            self.llm_summary_hint.setWordWrap(True)
-            self.llm_summary_hint.setStyleSheet("color: #9aa0a6;")
-            tools_layout.addRow("", self.llm_summary_hint)
 
             self.api_key_edit = self._make_secret_edit(config.get_api_key(), "sk-...")
             base_layout.addRow("API Key:", self.api_key_edit)
@@ -272,7 +296,23 @@ class ConfigDialog(QDialog):
             self.amap_api_key_edit = self._make_secret_edit(config.get_amap_api_key(), "高德开放平台 Web服务 Key")
             tools_layout.addRow("高德 Key:", self.amap_api_key_edit)
 
-            tools_layout.addRow(self._make_embedding_group(config))
+            memory_layout.addRow(self._make_embedding_group(config))
+
+            self.llm_summary_checkbox = QCheckBox("允许使用 LLM 生成会话摘要")
+            self.llm_summary_checkbox.setChecked(config.get_memory_summary_llm_enabled())
+            self.llm_summary_checkbox.setToolTip(
+                "开启后，会话摘要每滚动更新一次（默认每 12 轮）才调用一次基础模型 API，"
+                "输入只是「旧摘要 + 新增轮次」，成本很低。关闭、未配置或调用失败时使用本地摘要。"
+            )
+            memory_layout.addRow(self.llm_summary_checkbox)
+            self.llm_summary_hint = QLabel(
+                "摘要是一份「话题目录」（默认 1000 字以内），每轮都会附在上下文里，"
+                "让模型知道此前聊过什么；需要细节时它自己用 search_memory 检索。"
+                "仅影响长期记忆摘要，不会发送完整历史；摘要接口失败时自动回退到本地摘要。"
+            )
+            self.llm_summary_hint.setWordWrap(True)
+            self.llm_summary_hint.setStyleSheet("color: #9aa0a6;")
+            memory_layout.addRow("", self.llm_summary_hint)
 
             self.dsh_bridge_checkbox.toggled.connect(self._apply_dsh_bridge_state)
             self._apply_dsh_bridge_state(self.dsh_bridge_checkbox.isChecked())
@@ -672,6 +712,7 @@ class ConfigDialog(QDialog):
 
 # Bind the moved methods back (identical descriptor semantics).
 ConfigDialog._fill_dsh_reasoning_combo = _fill_dsh_reasoning_combo
+ConfigDialog._fill_reasoning_levels = _fill_reasoning_levels
 ConfigDialog._current_dsh_reasoning_choice = _current_dsh_reasoning_choice
 ConfigDialog._sync_dsh_provider_from_model = _sync_dsh_provider_from_model
 ConfigDialog._selected_dsh_model = _selected_dsh_model
@@ -680,10 +721,18 @@ ConfigDialog._probe_dsh_options = _probe_dsh_options
 ConfigDialog._on_dsh_probe_thread_finished = _on_dsh_probe_thread_finished
 ConfigDialog._on_dsh_options_probed = _on_dsh_options_probed
 ConfigDialog._restore_cached_dsh_options = _restore_cached_dsh_options
-ConfigDialog._apply_dsh_options = _apply_dsh_options
+ConfigDialog._apply_dsh_reasoning = _apply_dsh_reasoning
 ConfigDialog._apply_dsh_bridge_state = _apply_dsh_bridge_state
 ConfigDialog._auto_run_dsh_preflight = _auto_run_dsh_preflight
 ConfigDialog._save_dsh_selection = _save_dsh_selection
+ConfigDialog._provider_form_data = _provider_form_data
+ConfigDialog._refresh_acp_provider_combo = _refresh_acp_provider_combo
+ConfigDialog._new_acp_provider = _new_acp_provider
+ConfigDialog._edit_acp_provider = _edit_acp_provider
+ConfigDialog._delete_acp_provider = _delete_acp_provider
+ConfigDialog._save_acp_provider = _save_acp_provider
+ConfigDialog._import_web_acp_providers = _import_web_acp_providers
+ConfigDialog._select_acp_provider = _select_acp_provider
 ConfigDialog._run_dsh_preflight = _run_dsh_preflight
 ConfigDialog.build_core_memory_tab = build_core_memory_tab
 ConfigDialog.open_core_memory_dialog = open_core_memory_dialog

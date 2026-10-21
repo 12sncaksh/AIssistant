@@ -8,7 +8,5 @@
   "dsh_bridge_enabled": false,
   "dsh_command": "dsh",
   "dsh_profile": "acp",
-  "dsh_provider": "",
-  "dsh_model": "",
   "dsh_reasoning_effort": ""
 }

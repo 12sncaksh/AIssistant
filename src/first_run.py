@@ -6,7 +6,7 @@
 
     欢迎（选路径）
       ├─ 本地模型 → 聊天配置（3 必填 + 2 可选，每项写清用途）
-      └─ 已有 DSH → 五项环境检测（红项给可复制命令，失败也有出口）
+      └─ ACP 桥接 → 逐项环境检测（进度受控）→ 手填 Provider 或 Web 本地配置导入
     检索方式（两条路径都会经过；Ollama 能自动填好）
     完成
 
@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
@@ -49,6 +50,7 @@ from PyQt6.QtWidgets import (
 
 import dsh_preflight
 import voice_setup
+from acp_provider_config import read_web_provider_config
 
 # 完成标记。QSettings 在不同后端上可能返回 bool / str / int，统一按字符串比较。
 FIRST_RUN_FLAG = "first_run_completed"
@@ -73,7 +75,7 @@ def _flag_done(config) -> bool:
 def needs_first_run(config) -> bool:
     """要不要弹向导。
 
-    只看完成标记：用户哪怕一路跳过，也算"走过了"，不会每次启动都拦他。
+    只看完成标记：用户点「保存并开始」后才算走过；取消或未完成 ACP 配置都会保留首次引导。
     """
     return not _flag_done(config)
 
@@ -209,7 +211,7 @@ class ChatProbeThread(QThread):
 
 
 class RetrievalProbeThread(QThread):
-    """复用 memory_embeddings 的 probe_api()：只测 API，不被本地兜底掩盖。"""
+    """在后台探测当前配置的 Embedding API，避免首次引导界面被网络请求卡住。"""
 
     finished_with = pyqtSignal(object)
 
@@ -222,12 +224,42 @@ class RetrievalProbeThread(QThread):
             from memory_embeddings import EmbeddingService
 
             result = EmbeddingService(self._config).probe_api()
-        except Exception as exc:  # noqa: BLE001 - 探测失败照原样报
-            result = {"ok": False, "message": f"探测没能跑完：{exc}"}
-        self.finished_with.emit(result if isinstance(result, dict) else {"ok": False, "message": str(result)})
+            if result.get("ok"):
+                self.finished_with.emit(result)
+                return
+            self.finished_with.emit(result)
+        except Exception as exc:  # noqa: BLE001 - 原因要原样交给向导显示
+            self.finished_with.emit({"ok": False, "message": f"API 探测失败：{exc}"})
 
 
-# ---------------------------------------------------------------- 页面
+class DshPreflightThread(QThread):
+    """逐项执行 DSH 预检，避免同步检查冻结首次启动向导。"""
+
+    check_finished = pyqtSignal(int, object)
+    all_finished = pyqtSignal(object)
+
+    def run(self):
+        checks = []
+        checkers = (
+            dsh_preflight.check_dsh_command,
+            dsh_preflight.check_node,
+            dsh_preflight.check_home_writable,
+            dsh_preflight.check_profile,
+            dsh_preflight.check_patch,
+        )
+        for index, checker in enumerate(checkers, 1):
+            try:
+                result = checker()
+            except Exception as exc:  # noqa: BLE001 - 自检结果必须回到界面
+                result = dsh_preflight.Check(
+                    f"preflight_{index}", dsh_preflight.FAIL,
+                    "自检项目执行失败", str(exc), "", ""
+                )
+            checks.append(result)
+            self.check_finished.emit(index, result)
+        self.all_finished.emit(checks)
+
+
 
 
 class WelcomePage(QWizardPage):
@@ -325,14 +357,59 @@ class DshPage(QWizardPage):
     def __init__(self, wizard):
         super().__init__(wizard)
         self.wizard_ref = wizard
-        self.setTitle("先检查一下这台机器")
-        self.setSubTitle("五项只读检查：dsh 命令 / Node 版本 / ~/.dsh 可写 / acp profile / 权限补丁。")
+        self.setTitle("配置 ACP 桥接")
+        self.setSubTitle("先完成环境自检；下面两种 Provider 配置方式并列，任选一种导入到独立 ACP 配置。")
+        self._checks = []
+        self._check_thread = None
+        self._check_finished = False
+        self._web_providers = []
 
-        self.result_box = _mono_box("正在检查……")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 5)
+        self.progress.setValue(0)
+        self.progress.setFormat("等待开始自检")
+        self.result_box = _mono_box("准备检查 dsh、Node、目录、profile 和权限补丁……")
         self.recheck_button = QPushButton("重新检查")
         self.recheck_button.clicked.connect(self.run_checks)
         self.switch_local_button = QPushButton("改用本地模型")
         self.switch_local_button.clicked.connect(self.switch_to_local)
+
+        manual = QGroupBox("方式一：手动填写 ACP Provider")
+        manual_form = QFormLayout(manual)
+        current = wizard.config.get_acp_provider() or {}
+        self.provider_edit = QLineEdit(current.get("name", ""))
+        self.url_edit = QLineEdit(current.get("base_url", ""))
+        self.url_edit.setPlaceholderText("例如 https://example.com/v1")
+        self.api_key_edit = QLineEdit(current.get("api_key", ""))
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.setPlaceholderText("ACP 专用 API Key")
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        for model in current.get("models") or []:
+            self.model_combo.addItem(model, model)
+        self.model_combo.setCurrentText(current.get("model", ""))
+        manual_form.addRow("Provider 名称", self.provider_edit)
+        manual_form.addRow("API URL", self.url_edit)
+        manual_form.addRow("API Key", self.api_key_edit)
+        manual_form.addRow("模型（可稍后探测）", self.model_combo)
+        manual_form.addRow("", _hint("这份配置只属于 Aissistant 的 ACP，不会写回 DSH Web。"))
+
+        web = QGroupBox("方式二：读取 DSH Web 本地配置并导入")
+        web_form = QFormLayout(web)
+        self.web_provider_combo = QComboBox()
+        self.web_provider_combo.setEnabled(False)
+        self.web_read_button = QPushButton("读取 Web 配置")
+        self.web_import_button = QPushButton("导入选中的 Provider")
+        self.web_import_button.setEnabled(False)
+        self.web_read_button.clicked.connect(self.read_web_config)
+        self.web_import_button.clicked.connect(self.import_selected_web_provider)
+        web_buttons = QHBoxLayout()
+        web_buttons.addWidget(self.web_read_button)
+        web_buttons.addWidget(self.web_import_button)
+        web_form.addRow("Web Provider", self.web_provider_combo)
+        web_form.addRow("", web_buttons)
+        self.web_status = _hint("不会自动读取；请点击按钮后选择要导入的 Provider。")
+        web_form.addRow("", self.web_status)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.recheck_button)
@@ -340,24 +417,108 @@ class DshPage(QWizardPage):
         buttons.addStretch(1)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(_hint("环境自检完成前不能点下一步；存在红色阻塞项时，请修复后重新检查，或改用本地模型。"))
+        layout.addWidget(self.progress)
         layout.addWidget(self.result_box, 1)
         layout.addLayout(buttons)
-        layout.addWidget(
-            _hint(
-                "绿色表示可以直接用；红色项上面都给了能复制的命令。"
-                "红着也能继续，但桥接大概率起不来；"
-                "实在搞不定就点「改用本地模型」，那条路不依赖 DSH。"
-            )
-        )
-        self._passed = False
+        layout.addWidget(manual)
+        layout.addWidget(web)
+        self._provider_widgets = (self.provider_edit, self.url_edit, self.api_key_edit, self.model_combo)
+        for edit in (self.provider_edit, self.url_edit, self.api_key_edit):
+            edit.textChanged.connect(lambda _text: self._emit_complete())
 
     def initializePage(self):
-        self.run_checks()
+        if not self._check_finished:
+            self.run_checks()
+
+    def isComplete(self):
+        return (
+            self._check_finished
+            and not dsh_preflight.blocking_checks(self._checks)
+            and bool(self.provider_edit.text().strip())
+            and bool(self.url_edit.text().strip())
+            and bool(self.api_key_edit.text().strip())
+        )
+
+    def _emit_complete(self):
+        self.completeChanged.emit()
 
     def run_checks(self):
-        checks = dsh_preflight.run_checks()
-        self.result_box.setPlainText(dsh_preflight.format_report(checks))
-        self._passed = not dsh_preflight.blocking_checks(checks)
+        if self._check_thread is not None and self._check_thread.isRunning():
+            return
+        self._checks = []
+        self._check_finished = False
+        self.progress.setValue(0)
+        self.progress.setFormat("正在准备自检…")
+        self.result_box.setPlainText("正在启动逐项检查……")
+        self.recheck_button.setEnabled(False)
+        self._emit_complete()
+        self._check_thread = DshPreflightThread(self)
+        self._check_thread.check_finished.connect(self._on_check_finished)
+        self._check_thread.all_finished.connect(self._on_checks_finished)
+        self._check_thread.finished.connect(self._on_check_thread_finished)
+        self._check_thread.start()
+
+    def _on_check_finished(self, index, result):
+        while len(self._checks) < index:
+            self._checks.append(None)
+        self._checks[index - 1] = result
+        self.progress.setValue(index)
+        self.progress.setFormat(f"已完成 {index}/5：{result.title}")
+        self.result_box.setPlainText(dsh_preflight.format_report([item for item in self._checks if item is not None]))
+
+    def _on_checks_finished(self, checks):
+        self._checks = list(checks or [])
+        self._check_finished = True
+        self.recheck_button.setEnabled(True)
+        self.progress.setValue(5)
+        self.progress.setFormat("自检完成")
+        self.result_box.setPlainText(dsh_preflight.format_report(self._checks))
+        self._emit_complete()
+
+    def _on_check_thread_finished(self):
+        self._check_thread = None
+
+    def read_web_config(self):
+        try:
+            self._web_providers = read_web_provider_config()
+        except Exception as exc:  # noqa: BLE001 - 原因直接展示给用户
+            self.web_status.setText(f"读取失败：{exc}")
+            self.web_status.setStyleSheet("color: #e06c75;")
+            return
+        self.web_provider_combo.blockSignals(True)
+        self.web_provider_combo.clear()
+        for provider in self._web_providers:
+            self.web_provider_combo.addItem(provider.get("name", ""), provider.get("name", ""))
+        self.web_provider_combo.blockSignals(False)
+        enabled = bool(self._web_providers)
+        self.web_provider_combo.setEnabled(enabled)
+        self.web_import_button.setEnabled(enabled)
+        self.web_status.setText(
+            f"已读取 {len(self._web_providers)} 个 Web Provider，请选择后点击导入。"
+            if enabled else "Web 本地配置中没有可导入的 Provider。"
+        )
+        self.web_status.setStyleSheet("color: #4caf50;" if enabled else "color: #e06c75;")
+
+    def import_selected_web_provider(self):
+        index = self.web_provider_combo.currentIndex()
+        if index < 0 or index >= len(self._web_providers):
+            return
+        provider = self._web_providers[index]
+        self.provider_edit.setText(provider.get("name", ""))
+        self.url_edit.setText(provider.get("base_url", ""))
+        self.api_key_edit.setText(provider.get("api_key", ""))
+        self.model_combo.clear()
+        for model in provider.get("models") or []:
+            self.model_combo.addItem(model, model)
+        if provider.get("models"):
+            self.model_combo.setCurrentIndex(0)
+        env_hint = provider.get("api_key_env") or "未声明环境变量"
+        self.web_status.setText(
+            f"已将「{provider.get('name', '')}」填入 ACP 表单；"
+            + ("Key 已从环境变量读取。" if provider.get("api_key") else f"未读取到 {env_hint}，请手动填写 Key。")
+        )
+        self._emit_complete()
 
     def switch_to_local(self):
         self.wizard_ref.switch_to_local()
@@ -643,7 +804,21 @@ class FirstRunWizard(QWizard):
         self.config.set_memory_embedding_model(page.emb_model_edit.text().strip())
         self.config.set_memory_embedding_api_key(page.emb_key_edit.text().strip())
 
-    def _apply_local_to_config(self):
+    def _apply_dsh_to_config(self):
+        page = self.dsh_page
+        models = []
+        for index in range(page.model_combo.count()):
+            value = str(page.model_combo.itemData(index) or page.model_combo.itemText(index)).strip()
+            if value and value not in models:
+                models.append(value)
+        self.config.set_acp_provider({
+            "name": page.provider_edit.text().strip(),
+            "base_url": page.url_edit.text().strip(),
+            "api_key": page.api_key_edit.text().strip(),
+            "model": page.model_combo.currentText().strip(),
+            "models": models,
+        })
+
         page = self.local_page
         base_url = page.base_url_edit.text().strip()
         if base_url:
@@ -672,9 +847,12 @@ class FirstRunWizard(QWizard):
     def summary_text(self) -> str:
         lines = []
         if self.welcome.dsh_radio.isChecked():
-            lines.append("路径：DSH 桥接")
-            lines.append("  · 已勾选「启用 DSH 桥接」，模型与 Key 由 DSH 自己管理")
-            lines.append("  · 请在「设置 → DSH 桥接」里点一次「探测」，选出具体模型")
+            provider = self.dsh_page.provider_edit.text().strip() or "(未填)"
+            model = self.dsh_page.model_combo.currentText().strip() or "(稍后探测)"
+            lines.append("路径：ACP 桥接")
+            lines.append(f"  · Provider：{provider}")
+            lines.append(f"  · 模型：{model}")
+            lines.append("  · URL / API Key：由 Aissistant 独立保存并注入 ACP")
         else:
             base = self.local_page.base_url_edit.text().strip() or "(未填)"
             lines.append("路径：本地模型")
@@ -706,8 +884,10 @@ class FirstRunWizard(QWizard):
         """用户点「保存并开始」：先落盘，再关闭。"""
         try:
             if self.welcome.dsh_radio.isChecked():
-                # 检测没过也允许勾：老手可能环境特殊，红项已经在页面上写清楚了。
-                # 这里绝不顺手改权限模式——用户在向导里没做的决定，不能替他做。
+                if not self.dsh_page.isComplete():
+                    self.dsh_page._emit_complete()
+                    return
+                self._apply_dsh_to_config()
                 self.config.set_dsh_bridge_enabled(True)
             else:
                 self.config.set_dsh_bridge_enabled(False)
